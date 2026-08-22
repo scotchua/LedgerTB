@@ -668,3 +668,38 @@ def test_import_history_reverses_batch_into_review_queue(
     )
     reports.checkbox(key="gl_hide_reversed_imports").uncheck().run()
     assert not reports.exception
+
+
+def test_editing_a_second_account_does_not_inherit_the_first_ones_grouping(
+    client_id, accounts, monkeypatch
+):
+    """grouping_picker's selectbox key was "edit_grouping" for every account,
+    unqualified by which one was open. Editing account A (grouped), then
+    clicking Edit on account B (ungrouped) without an intervening Cancel kept
+    the widget alive under the same key, so it ignored B's real value and
+    kept showing A's -- and a Save with no changes to that field would have
+    silently written A's grouping onto B.
+    """
+    _select_client(monkeypatch, client_id)
+    cash = Account.get_by_id(accounts["cash"], client_id=client_id)
+    cash.account_grouping = "Cash and equivalents"
+    cash.save()
+    revenue = Account.get_by_id(accounts["revenue"], client_id=client_id)
+    revenue.account_grouping = None
+    revenue.save()
+
+    page = AppTest.from_file(
+        page_path("pages/3_Chart_of_Accounts.py"), default_timeout=30
+    )
+    page.run()
+    page.button(key=f"edit_{cash.id}").click().run()
+    page.button(key=f"edit_{revenue.id}").click().run()
+
+    grouping = next(
+        s for s in page.selectbox if s.key == f"edit_{revenue.id}_grouping"
+    )
+    assert grouping.value == "None (own line)"
+
+    next(b for b in page.button if b.label == "Save Changes").click().run()
+    assert not page.exception
+    assert Account.get_by_id(revenue.id, client_id=client_id).account_grouping is None

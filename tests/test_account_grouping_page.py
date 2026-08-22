@@ -65,7 +65,8 @@ def test_an_account_can_join_an_existing_grouping(client_id, accounts, monkeypat
 
     page = _page(monkeypatch, client_id)
     next(b for b in page.button if b.key == f"edit_{joiner.id}").click().run()
-    next(s for s in page.selectbox if s.key == "edit_grouping").set_value(PPE)
+    grouping_key = f"edit_{joiner.id}_grouping"
+    next(s for s in page.selectbox if s.key == grouping_key).set_value(PPE)
     next(b for b in page.button if "Save Changes" in b.label).click().run()
 
     assert not page.exception
@@ -77,7 +78,8 @@ def test_an_account_can_be_put_back_on_its_own_line(client_id, accounts, monkeyp
 
     page = _page(monkeypatch, client_id)
     next(b for b in page.button if b.key == f"edit_{leaver.id}").click().run()
-    picker = next(s for s in page.selectbox if s.key == "edit_grouping")
+    grouping_key = f"edit_{leaver.id}_grouping"
+    picker = next(s for s in page.selectbox if s.key == grouping_key)
     picker.set_value(next(o for o in picker.options if o.startswith("None")))
     next(b for b in page.button if "Save Changes" in b.label).click().run()
 
@@ -91,7 +93,8 @@ def test_the_current_grouping_is_preselected_when_editing(client_id, accounts, m
     page = _page(monkeypatch, client_id)
     next(b for b in page.button if b.key == f"edit_{account.id}").click().run()
 
-    assert next(s for s in page.selectbox if s.key == "edit_grouping").value == PPE
+    grouping_key = f"edit_{account.id}_grouping"
+    assert next(s for s in page.selectbox if s.key == grouping_key).value == PPE
 
 
 def test_edit_opens_without_error_for_every_account(client_id, accounts, monkeypatch):
@@ -102,10 +105,13 @@ def test_edit_opens_without_error_for_every_account(client_id, accounts, monkeyp
     edit_buttons = [b for b in page.button if (b.key or "").startswith("edit_")]
     assert edit_buttons
 
+    edited_id = edit_buttons[0].key.removeprefix("edit_")
     edit_buttons[0].click().run()
 
     assert not page.exception
-    assert any(s.key == "edit_grouping" for s in page.selectbox)
+    assert any(
+        s.key == f"edit_{edited_id}_grouping" for s in page.selectbox
+    )
     assert any(b.label == "Save Changes" for b in page.button)
 
 

@@ -23,6 +23,15 @@ CASH_FLOW_SECTIONS = [None, "operating", "investing", "financing"]
 
 
 def grouping_picker(client_id, current, key_prefix):
+    """key_prefix must be unique per edited entity, not per form.
+
+    A keyed selectbox ignores a new ``index=`` once its key already exists in
+    session state. A caller editing one account after another must therefore
+    pass a key_prefix that includes the account id (as the type and subtype
+    selectboxes above already do) or the picker keeps showing the previous
+    account's grouping -- and a blind Save silently writes it onto the new
+    account.
+    """
     in_use = Account.groupings_in_use(client_id)
     options = [GROUP_NONE] + in_use + [GROUP_NEW]
     chosen = st.selectbox(
@@ -270,7 +279,7 @@ with tab1:
                         ),
                     )
                     new_account_grouping = grouping_picker(
-                        client_id, account.account_grouping, "edit"
+                        client_id, account.account_grouping, f"edit_{account.id}"
                     )
                     new_active = st.checkbox("Active", value=account.is_active)
 
