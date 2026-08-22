@@ -1,7 +1,11 @@
 from datetime import date
 
+import pytest
+
 from constants import AccountSubtype
+from database.connection import get_cursor
 from models.account import Account
+from models.audit_log import AuditLog
 from models.reports import ReportGenerator
 from tests.conftest import post_entry
 
@@ -424,3 +428,128 @@ def test_offsetting_unclassified_entries_remain_visible_in_exports(
     assert comparison_export.set_index("Item").loc["STATUS", "Current"] == (
         "REVIEW WARNINGS"
     )
+
+
+def test_long_term_debt_override_to_operating_reconciles(client_id, accounts):
+    debt = Account(
+        client_id=client_id, account_number="2500", name="Term Loan",
+        type="Liability", subtype=AccountSubtype.LONG_TERM_LIABILITY,
+        cash_flow_section="operating",
+    )
+    debt.save()
+    post_entry(client_id, START, [
+        (accounts["cash"], 500, 0), (debt.id, 0, 500),
+    ], entry_type="Beginning Balance")
+    post_entry(client_id, date(2026, 5, 1), [
+        (debt.id, 100, 0), (accounts["cash"], 0, 100),
+    ])
+
+    report = ReportGenerator.cash_flow_statement(client_id, START, END)
+    assert report["operating"]["total"] == -100
+    assert report["financing"]["total"] == 0
+    assert report["ties"] is True
+    assert report["operating_reconciled"] is True
+    assert report["ready"] is True
+    assert not any(
+        line["key"] == "unresolved_operating_reconciliation"
+        for line in report["operating"]["lines"]
+    )
+
+
+def test_working_capital_override_away_from_operating_reconciles(
+    client_id, accounts
+):
+    deposit = Account(
+        client_id=client_id, account_number="2200", name="Customer Deposits",
+        type="Liability", subtype=AccountSubtype.OTHER_CURRENT_LIABILITY,
+        cash_flow_section="financing",
+    )
+    deposit.save()
+    post_entry(client_id, date(2026, 4, 1), [
+        (accounts["cash"], 125, 0), (deposit.id, 0, 125),
+    ])
+
+    report = ReportGenerator.cash_flow_statement(client_id, START, END)
+    assert not any(
+        line["key"] == "other_current_liabilities"
+        for line in report["operating"]["lines"]
+    )
+    assert report["financing"]["total"] == 125
+    assert report["ties"] is True
+    assert report["operating_reconciled"] is True
+    assert report["ready"] is True
+
+
+def test_other_asset_override_into_operating_adds_indirect_line(
+    client_id, accounts
+):
+    note = Account(
+        client_id=client_id, account_number="1800", name="Operating Note",
+        type="Asset", subtype=AccountSubtype.OTHER_ASSET,
+        cash_flow_section="operating",
+    )
+    note.save()
+    post_entry(client_id, date(2026, 3, 1), [
+        (note.id, 90, 0), (accounts["cash"], 0, 90),
+    ])
+
+    report = ReportGenerator.cash_flow_statement(client_id, START, END)
+    line = next(
+        line for line in report["operating"]["lines"]
+        if line["name"] == "Change in Operating Note"
+    )
+    assert line["amount"] == -90
+    assert report["operating"]["total"] == -90
+    assert report["ties"] is True
+    assert report["operating_reconciled"] is True
+    assert report["ready"] is True
+
+
+@pytest.mark.parametrize("subtype,name", [
+    (AccountSubtype.CASH, "Petty Cash"),
+    (None, "Legacy Checking Account"),
+])
+def test_cash_accounts_refuse_cash_flow_override(client_id, subtype, name):
+    account = Account(
+        client_id=client_id, account_number="1010", name=name,
+        type="Asset", subtype=subtype, cash_flow_section="investing",
+    )
+    with pytest.raises(ValueError, match="Cash accounts cannot"):
+        account.save()
+
+
+def test_null_override_is_identical_when_key_is_absent(client_id, accounts):
+    revenue = _account(
+        client_id, "4100", "Service Revenue", "Revenue",
+        AccountSubtype.OPERATING_REVENUE,
+    )
+    post_entry(client_id, date(2026, 2, 1), [
+        (accounts["cash"], 75, 0), (revenue, 0, 75),
+    ])
+    original = ReportGenerator.cash_flow_statement(client_id, START, END)
+
+    class LegacyDict(dict):
+        def get(self, key, default=None):
+            if key == "cash_flow_section":
+                return default
+            return super().get(key, default)
+
+    with get_cursor() as cursor:
+        cursor.execute("SELECT * FROM accounts WHERE client_id = ?", (client_id,))
+        rows = [LegacyDict(dict(row)) for row in cursor.fetchall()]
+    assert all(row.get("cash_flow_section") is None for row in rows)
+    assert ReportGenerator.cash_flow_statement(client_id, START, END) == original
+
+
+def test_cash_flow_override_is_audited(client_id):
+    account = Account(
+        client_id=client_id, account_number="1800", name="Note Receivable",
+        type="Asset", subtype=AccountSubtype.OTHER_ASSET,
+    )
+    account.save()
+    account.cash_flow_section = "operating"
+    account.save()
+
+    event = AuditLog.get_history("accounts", account.id)[0]
+    assert event.old_values["cash_flow_section"] is None
+    assert event.new_values["cash_flow_section"] == "operating"

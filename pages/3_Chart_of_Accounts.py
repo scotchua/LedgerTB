@@ -19,6 +19,7 @@ from services.coa_import import assign_missing_numbers, parse_coa_csv
 
 GROUP_NONE = "None (own line)"
 GROUP_NEW = "Add new account grouping…"
+CASH_FLOW_SECTIONS = [None, "operating", "investing", "financing"]
 
 
 def grouping_picker(client_id, current, key_prefix):
@@ -256,6 +257,18 @@ with tab1:
                         placeholder="e.g., Chase Business Checking ****1234",
                         help="Optional notes to help identify this account"
                     )
+                    new_cash_flow_section = st.selectbox(
+                        "Cash flow section",
+                        options=CASH_FLOW_SECTIONS,
+                        index=CASH_FLOW_SECTIONS.index(account.cash_flow_section),
+                        format_func=lambda value: (
+                            value.title() if value else "Derived from subtype"
+                        ),
+                        help=(
+                            "Overrides the section derived from the statement subtype. "
+                            "Cash, Revenue, and Expense accounts cannot be overridden."
+                        ),
+                    )
                     new_account_grouping = grouping_picker(
                         client_id, account.account_grouping, "edit"
                     )
@@ -278,6 +291,7 @@ with tab1:
                             else:
                                 account.subtype = new_subtype
                             account.description = new_description if new_description else None
+                            account.cash_flow_section = new_cash_flow_section
                             account.account_grouping = new_account_grouping
                             account.is_active = new_active
 

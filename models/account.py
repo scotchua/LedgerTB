@@ -17,6 +17,7 @@ class Account:
     description: Optional[str] = None  # Memo/notes to identify the account
     is_active: bool = True
     account_grouping: Optional[str] = None
+    cash_flow_section: Optional[str] = None
 
     @staticmethod
     def _from_row(row) -> 'Account':
@@ -33,7 +34,27 @@ class Account:
             account_grouping=(
                 row['account_grouping'] if 'account_grouping' in row.keys() else None
             ),
+            cash_flow_section=(
+                row['cash_flow_section'] if 'cash_flow_section' in row.keys() else None
+            ),
         )
+
+    def _validate_cash_flow_section(self):
+        if self.cash_flow_section is None:
+            return
+        if self.cash_flow_section not in ('operating', 'investing', 'financing'):
+            raise ValueError(
+                "Cash flow section must be operating, investing, or financing."
+            )
+        if self.type in (AccountType.REVENUE, AccountType.EXPENSE):
+            raise ValueError(
+                "Revenue and Expense accounts cannot have a cash flow section "
+                "override."
+            )
+        if AccountSubtype.is_cash_like(self.type, self.subtype, self.name):
+            raise ValueError(
+                "Cash accounts cannot have a cash flow section override."
+            )
 
     @staticmethod
     def groupings_in_use(client_id: int) -> List[str]:
@@ -235,6 +256,7 @@ class Account:
 
         is_new = self.id is None
         old_values = None
+        self._validate_cash_flow_section()
         with get_cursor(commit=True) as cursor:
             if is_new:
                 self.subtype = AccountSubtype.normalize_for_storage(
@@ -242,17 +264,20 @@ class Account:
                 )
                 cursor.execute(
                     """
-                    INSERT INTO accounts (client_id, account_number, name, type, subtype, description, is_active, account_grouping)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO accounts
+                        (client_id, account_number, name, type, subtype,
+                         description, is_active, account_grouping, cash_flow_section)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (self.client_id, self.account_number, self.name, self.type,
                      self.subtype, self.description, int(self.is_active),
-                     self.account_grouping)
+                     self.account_grouping, self.cash_flow_section)
                 )
                 self.id = cursor.lastrowid
             else:
                 cursor.execute(
-                    "SELECT account_number, name, type, subtype, description, is_active, account_grouping "
+                    "SELECT account_number, name, type, subtype, description, "
+                    "is_active, account_grouping, cash_flow_section "
                     "FROM accounts WHERE id = ? AND client_id = ?",
                     (self.id, self.client_id),
                 )
@@ -267,15 +292,19 @@ class Account:
                     'description': prev['description'],
                     'is_active': bool(prev['is_active']),
                     'account_grouping': prev['account_grouping'],
+                    'cash_flow_section': prev['cash_flow_section'],
                 }
                 cursor.execute(
                     """
                     UPDATE accounts
-                    SET account_number = ?, name = ?, type = ?, subtype = ?, description = ?, is_active = ?, account_grouping = ?
+                    SET account_number = ?, name = ?, type = ?, subtype = ?,
+                        description = ?, is_active = ?, account_grouping = ?,
+                        cash_flow_section = ?
                     WHERE id = ? AND client_id = ?
                     """,
                     (self.account_number, self.name, self.type, self.subtype,
                      self.description, int(self.is_active), self.account_grouping,
+                     self.cash_flow_section,
                      self.id, self.client_id)
                 )
 
@@ -287,6 +316,7 @@ class Account:
                 'description': self.description,
                 'is_active': self.is_active,
                 'account_grouping': self.account_grouping,
+                'cash_flow_section': self.cash_flow_section,
             }
             AuditLog.write(
                 cursor, self.client_id, 'accounts', self.id,

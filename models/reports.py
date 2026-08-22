@@ -1223,7 +1223,7 @@ class ReportGenerator:
             cursor.execute(
                 """
                 SELECT a.id AS account_id, a.account_number, a.name,
-                       a.type AS account_type, a.subtype,
+                       a.type AS account_type, a.subtype, a.cash_flow_section,
                        COALESCE(SUM(CASE
                            WHEN je.entry_date < ?
                              OR (je.entry_type = 'Beginning Balance'
@@ -1249,6 +1249,7 @@ class ReportGenerator:
                 SELECT je.id AS entry_id, je.entry_date, je.entry_type,
                        je.description, a.id AS account_id, a.account_number,
                        a.name, a.type AS account_type, a.subtype,
+                       a.cash_flow_section,
                        jel.debit, jel.credit
                 FROM journal_entries je
                 JOIN journal_entry_lines jel ON jel.journal_entry_id = je.id
@@ -1319,7 +1320,10 @@ class ReportGenerator:
         balance_by_subtype = {}
         for row in balance_rows:
             subtype = resolved(row)
-            if not subtype:
+            if (
+                not subtype
+                or row.get('cash_flow_section') not in (None, 'operating')
+            ):
                 continue
             multiplier = (
                 1 if row['account_type'] in AccountType.DEBIT_NORMAL else -1
@@ -1383,6 +1387,31 @@ class ReportGenerator:
                     'account_ids': values['account_ids'],
                 })
 
+        working_capital_subtypes = {item[0] for item in working_capital}
+        for row in balance_rows:
+            if (
+                row.get('cash_flow_section') != 'operating'
+                or resolved(row) in working_capital_subtypes
+                or row['account_type'] not in (
+                    AccountType.ASSET, AccountType.LIABILITY, AccountType.EQUITY
+                )
+            ):
+                continue
+            multiplier = (
+                1 if row['account_type'] in AccountType.DEBIT_NORMAL else -1
+            )
+            direction = -1 if row['account_type'] == AccountType.ASSET else 1
+            adjustment = direction * multiplier * (
+                row['ending_debit_balance'] - row['opening_debit_balance']
+            )
+            if adjustment:
+                operating_lines.append({
+                    'key': f"cash_flow_override:{row['account_id']}",
+                    'name': f"Change in {row['name']}",
+                    'amount': adjustment,
+                    'account_ids': [row['account_id']],
+                })
+
         entries = {}
         for row in activity_rows:
             entries.setdefault(row['entry_id'], []).append(row)
@@ -1396,6 +1425,10 @@ class ReportGenerator:
         operating_reconciliation_context = []
 
         def counterpart_section(row):
+            if row.get('cash_flow_section') in (
+                'operating', 'investing', 'financing'
+            ):
+                return row['cash_flow_section']
             subtype = resolved(row)
             account_type = row['account_type']
             if account_type in (AccountType.REVENUE, AccountType.EXPENSE):
