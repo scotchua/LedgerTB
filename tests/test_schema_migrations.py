@@ -151,3 +151,52 @@ def test_migration_failure_is_atomic(tmp_path, monkeypatch):
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='will_rollback'")
     assert cur.fetchone() is None  # partial DDL rolled back
     conn.close()
+
+
+def test_a_migration_renumbered_after_a_book_applied_it_heals_instead_of_crashing(db):
+    """Reproduces a real failure: account_grouping shipped as
+    020_account_grouping.sql, then that file was renamed to
+    022_account_grouping.sql before release. A book that already ran it
+    under the old name has the column but no tracking row for the new
+    filename, so create_tables tried to add the column again and crashed
+    every launch with "duplicate column name: account_grouping".
+    """
+    conn = get_connection()
+    conn.execute(
+        "DELETE FROM schema_migrations WHERE version = '022_account_grouping'"
+    )
+    conn.commit()
+
+    create_tables(conn)  # must not raise
+
+    cur = conn.execute(
+        "SELECT version FROM schema_migrations WHERE version = '022_account_grouping'"
+    )
+    assert cur.fetchone() is not None
+    cur = conn.execute("PRAGMA table_info(accounts)")
+    assert "account_grouping" in {row[1] for row in cur.fetchall()}
+    conn.close()
+
+
+def test_a_multi_statement_migration_never_gets_the_healing_treatment(db):
+    """The narrow fix applies only to a lone ALTER TABLE ADD COLUMN. A
+    migration with more than one statement could be partially applied in a
+    way indistinguishable from fully applied, so a duplicate-column error
+    from one of its statements must still crash rather than be marked done.
+    """
+    from database.schema import _added_column_if_sole_statement
+
+    assert _added_column_if_sole_statement(
+        "ALTER TABLE accounts ADD COLUMN account_grouping TEXT;"
+    ) == "account_grouping"
+    assert _added_column_if_sole_statement(
+        "ALTER TABLE accounts ADD COLUMN cash_flow_section TEXT\n"
+        "    CHECK (cash_flow_section IN ('operating', 'investing'));"
+    ) == "cash_flow_section"
+    assert _added_column_if_sole_statement(
+        "ALTER TABLE accounts ADD COLUMN a TEXT;\n"
+        "ALTER TABLE accounts ADD COLUMN b TEXT;"
+    ) is None
+    assert _added_column_if_sole_statement(
+        "CREATE TABLE t (id INTEGER);"
+    ) is None

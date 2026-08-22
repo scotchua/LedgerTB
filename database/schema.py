@@ -1,7 +1,34 @@
+import re
 import sqlite3
 from pathlib import Path
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+
+_SINGLE_ADD_COLUMN = re.compile(
+    r"^ALTER\s+TABLE\s+\w+\s+ADD\s+COLUMN\s+(\w+)\b", re.IGNORECASE | re.DOTALL
+)
+
+
+def _added_column_if_sole_statement(migration_sql: str):
+    """The column name, if this migration is exactly one ALTER TABLE ADD
+    COLUMN statement; otherwise None.
+
+    A migration file can be renumbered (a later file collides with an
+    upstream release, say) after a book has already applied it under the old
+    filename: the column is really there, but the tracking row is keyed by
+    filename and doesn't recognize it. Recognizing that narrow case lets the
+    tracker heal instead of crashing, but only for a single ADD COLUMN
+    statement -- a multi-statement migration could be partially applied in a
+    way this can't distinguish from fully applied, so it is never eligible.
+    """
+    body = "\n".join(
+        line for line in migration_sql.splitlines()
+        if not line.strip().startswith("--")
+    ).strip()
+    if body.count(";") != 1 or not body.endswith(";"):
+        return None
+    match = _SINGLE_ADD_COLUMN.match(body)
+    return match.group(1) if match else None
 
 
 def create_tables(conn: sqlite3.Connection):
@@ -45,6 +72,25 @@ def create_tables(conn: sqlite3.Connection):
         )
         try:
             conn.executescript(script)
-        except Exception:
+        except Exception as exc:
             conn.rollback()
+            # Match on the message, not the exception type: the connection is
+            # sqlcipher3's driver or the stdlib's depending on whether
+            # SQLCipher is installed (see database/connection.py), and the
+            # two modules' OperationalError classes are not related.
+            added_column = _added_column_if_sole_statement(migration_sql)
+            if (
+                added_column
+                and str(exc) == f"duplicate column name: {added_column}"
+            ):
+                # The column is already there from a run under this
+                # migration's previous filename; only the tracking row is
+                # missing. Record it and move on rather than crash on a
+                # column that already exists correctly.
+                conn.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (?)",
+                    (version,),
+                )
+                conn.commit()
+                continue
             raise
