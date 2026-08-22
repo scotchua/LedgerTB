@@ -218,8 +218,12 @@ elif selected_report == "Income Statement":
         st.error("Income statement start date cannot be after the end date.")
         st.stop()
 
+    group_accounts_is = st.toggle(
+        "Group accounts", key="is_group_accounts",
+        help="Collapse accounts sharing a statement caption.",
+    )
     report = ReportGenerator.comparative_income_statement(
-        client_id, is_start, is_end
+        client_id, is_start, is_end, group_accounts_is
     )
     apply_default_on_change(
         "is_compare_py",
@@ -350,7 +354,9 @@ elif selected_report == "Income Statement":
             report, grouped=group_is
         )
         if compare_py else ReportGenerator.income_statement_to_dataframe(
-            ReportGenerator.income_statement(client_id, is_start, is_end),
+            ReportGenerator.income_statement(
+                client_id, is_start, is_end, group_accounts_is
+            ),
             grouped=group_is,
         )
     )
@@ -378,7 +384,13 @@ elif selected_report == "Balance Sheet":
     with col1:
         bs_date = st.date_input("As of Date", value=date.today(), key="bs_date")
 
-    report = ReportGenerator.comparative_balance_sheet(client_id, bs_date)
+    group_accounts_bs = st.toggle(
+        "Group accounts", key="bs_group_accounts",
+        help="Collapse accounts sharing a statement caption.",
+    )
+    report = ReportGenerator.comparative_balance_sheet(
+        client_id, bs_date, group_accounts_bs
+    )
     apply_default_on_change(
         "bs_compare_py", (client_id, bs_date, report['prior_available']),
         report['prior_available'],
@@ -522,7 +534,9 @@ elif selected_report == "Balance Sheet":
             report, grouped=group_bs
         )
         if compare_py else ReportGenerator.balance_sheet_to_dataframe(
-            ReportGenerator.balance_sheet(client_id, bs_date), grouped=group_bs
+            ReportGenerator.balance_sheet(
+                client_id, bs_date, group_accounts_bs
+            ), grouped=group_bs
         )
     )
 

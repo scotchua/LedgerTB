@@ -1,0 +1,16 @@
+-- Account grouping: the line an account presents under on a financial
+-- statement. Eleven equipment accounts become one "Property and equipment";
+-- the detail stays on the trial balance and the general ledger where it
+-- belongs.
+--
+-- Free text rather than a lookup table. A grouping is wording on a page, it
+-- differs by client and engagement, and the accounts sharing one are the only
+-- thing that defines it. A table here would add a join and a management screen
+-- without making the wording any more correct. The account form offers the
+-- groupings already in use, so the usual way to join one is to pick it rather
+-- than retype it.
+--
+-- NULL means the account presents on its own line, which is what every account
+-- does today, so an existing book reads exactly as it did before anyone sets
+-- a grouping.
+ALTER TABLE accounts ADD COLUMN account_grouping TEXT;

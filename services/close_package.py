@@ -220,14 +220,16 @@ def load_close_package_snapshot(
         transactions=get_period_transactions(client_id, period_start, period_end),
         cash=get_cash_activity(client_id, period_start, period_end),
         income_statement=ReportGenerator.income_statement(
-            client_id, period_start, period_end
+            client_id, period_start, period_end, group_accounts=True
         ),
-        balance_sheet=ReportGenerator.balance_sheet(client_id, period_end),
+        balance_sheet=ReportGenerator.balance_sheet(
+            client_id, period_end, group_accounts=True
+        ),
         comparative_income_statement=ReportGenerator.comparative_income_statement(
-            client_id, period_start, period_end
+            client_id, period_start, period_end, group_accounts=True
         ),
         comparative_balance_sheet=ReportGenerator.comparative_balance_sheet(
-            client_id, period_end
+            client_id, period_end, group_accounts=True
         ),
         cash_flow=cash_flow,
         comparative_cash_flow=comparative_cash_flow,

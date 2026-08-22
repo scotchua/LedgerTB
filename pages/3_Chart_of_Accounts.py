@@ -16,6 +16,30 @@ from utils import icons
 from constants import AccountSubtype, AccountType
 from services.coa_import import assign_missing_numbers, parse_coa_csv
 
+
+GROUP_NONE = "None (own line)"
+GROUP_NEW = "Add new account grouping…"
+
+
+def grouping_picker(client_id, current, key_prefix):
+    in_use = Account.groupings_in_use(client_id)
+    options = [GROUP_NONE] + in_use + [GROUP_NEW]
+    chosen = st.selectbox(
+        "Account grouping", options=options,
+        index=options.index(current) if current in in_use else 0,
+        key=f"{key_prefix}_grouping",
+        help=("Accounts sharing a grouping present as one statement line. "
+              "Trial balance and general ledger detail remain unchanged."),
+    )
+    typed = st.text_input(
+        "New account grouping name", key=f"{key_prefix}_grouping_new",
+        placeholder="e.g., Property and equipment",
+        help=f"Used only when you choose “{GROUP_NEW}” above.",
+    )
+    if chosen == GROUP_NEW:
+        return typed.strip() or None
+    return None if chosen == GROUP_NONE else chosen
+
 # Initialize database
 
 st.set_page_config(page_title="Chart of Accounts", page_icon=icons.CHART_OF_ACCOUNTS, layout="wide")
@@ -39,7 +63,9 @@ client = Client.get_by_id(client_id)
 st.caption(f"Viewing: **{client.name}**")
 
 # Tabs for viewing, adding, and importing accounts
-tab1, tab2, tab3 = st.tabs(["View Accounts", "Add Account", "Import CSV"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["View Accounts", "Add Account", "Import CSV", "Account Groupings"]
+)
 
 with tab1:
     # Filter options
@@ -230,6 +256,9 @@ with tab1:
                         placeholder="e.g., Chase Business Checking ****1234",
                         help="Optional notes to help identify this account"
                     )
+                    new_account_grouping = grouping_picker(
+                        client_id, account.account_grouping, "edit"
+                    )
                     new_active = st.checkbox("Active", value=account.is_active)
 
                     col1, col2, col3 = st.columns(3)
@@ -249,6 +278,7 @@ with tab1:
                             else:
                                 account.subtype = new_subtype
                             account.description = new_description if new_description else None
+                            account.account_grouping = new_account_grouping
                             account.is_active = new_active
 
                             try:
@@ -307,6 +337,7 @@ with tab2:
             placeholder="e.g., Chase Business Checking ****1234",
             help="Optional notes to help identify this account"
         )
+        account_grouping = grouping_picker(client_id, None, "add")
 
         if st.form_submit_button("Add Account", type="primary"):
             if not account_number or not account_name:
@@ -320,6 +351,7 @@ with tab2:
                     subtype=subtype,
                     description=description if description else None
                 )
+                new_account.account_grouping = account_grouping
 
                 try:
                     new_account.save()
@@ -414,3 +446,85 @@ with tab3:
                 if failed:
                     st.error("Some failed: " + "; ".join(failed[:3]))
                 st.rerun()
+
+
+with tab4:
+    st.subheader("Account groupings")
+    st.caption(
+        "Rename or remove statement captions. Removing one puts its accounts "
+        "back on their own lines without changing accounts or balances."
+    )
+    groupings = Account.groupings_in_use(client_id)
+    all_accounts = Account.get_all(client_id, active_only=False)
+    by_id = {account.id: account for account in all_accounts}
+
+    def grouping_account_label(account_id):
+        account = by_id[account_id]
+        return f"{account.account_number} · {account.name}"
+
+    with st.expander("**New grouping**", expanded=False):
+        new_name = st.text_input(
+            "Grouping name", key="new_grouping_name",
+            placeholder="e.g., Property and equipment",
+        )
+        new_members = st.multiselect(
+            "Accounts in this grouping", options=list(by_id),
+            format_func=grouping_account_label, key="new_grouping_members",
+        )
+        if st.button(
+            "Create grouping", key="do_create_grouping", type="primary",
+            disabled=not (new_name.strip() and new_members),
+        ):
+            clash = Account.grouping_exists(client_id, new_name)
+            if clash:
+                st.error(f"“{clash}” already exists.")
+            else:
+                Account.assign_grouping(client_id, new_members, new_name)
+                st.rerun()
+    if not groupings:
+        st.info("No account groupings yet. Assign one while adding or editing an account.")
+    for grouping in groupings:
+        members = Account.accounts_in_grouping(client_id, grouping)
+        with st.expander(
+            f"**{grouping}** · {len(members)} account"
+            f"{'' if len(members) == 1 else 's'}"
+        ):
+            for member in members:
+                st.caption(f"{member.account_number} · {member.name}")
+            candidates = [
+                account.id for account in all_accounts
+                if account.account_grouping != grouping
+            ]
+            additions = st.multiselect(
+                "Add accounts to this grouping", options=candidates,
+                format_func=grouping_account_label, key=f"add_to_{grouping}",
+            )
+            if st.button(
+                "Add to grouping", key=f"do_add_{grouping}",
+                disabled=not additions,
+            ):
+                Account.assign_grouping(client_id, additions, grouping)
+                st.rerun()
+            renamed = st.text_input(
+                "Rename this grouping", value=grouping,
+                key=f"rename_grouping_{grouping}",
+            )
+            rename_col, remove_col = st.columns(2)
+            with rename_col:
+                if st.button(
+                    "Rename", key=f"do_rename_{grouping}",
+                    disabled=renamed.strip() == grouping,
+                ):
+                    clash = Account.grouping_exists(client_id, renamed)
+                    if clash and clash != grouping:
+                        st.error(f"“{clash}” already exists.")
+                    else:
+                        Account.rename_grouping(client_id, grouping, renamed)
+                        st.rerun()
+            with remove_col:
+                if st.button(
+                    "Remove grouping", key=f"do_remove_{grouping}",
+                    type="secondary",
+                ):
+                    Account.remove_grouping(client_id, grouping)
+                    st.rerun()

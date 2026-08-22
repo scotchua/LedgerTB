@@ -16,6 +16,7 @@ class Account:
     subtype: Optional[str] = None
     description: Optional[str] = None  # Memo/notes to identify the account
     is_active: bool = True
+    account_grouping: Optional[str] = None
 
     @staticmethod
     def _from_row(row) -> 'Account':
@@ -28,8 +29,74 @@ class Account:
             type=row['type'],
             subtype=row['subtype'],
             description=row['description'] if 'description' in row.keys() else None,
-            is_active=bool(row['is_active'])
+            is_active=bool(row['is_active']),
+            account_grouping=(
+                row['account_grouping'] if 'account_grouping' in row.keys() else None
+            ),
         )
+
+    @staticmethod
+    def groupings_in_use(client_id: int) -> List[str]:
+        with get_cursor() as cursor:
+            cursor.execute(
+                "SELECT DISTINCT account_grouping FROM accounts "
+                "WHERE client_id = ? AND account_grouping IS NOT NULL "
+                "AND TRIM(account_grouping) != '' ORDER BY account_grouping",
+                (client_id,),
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    @staticmethod
+    def accounts_in_grouping(client_id: int, grouping: str) -> List['Account']:
+        return [
+            account for account in Account.get_all(client_id, active_only=False)
+            if account.account_grouping == grouping
+        ]
+
+    @staticmethod
+    def assign_grouping(client_id: int, account_ids, grouping: str) -> int:
+        grouping = (grouping or "").strip()
+        if not grouping:
+            raise ValueError("The grouping name cannot be empty.")
+        moved = 0
+        for account_id in account_ids:
+            account = Account.get_by_id(account_id, client_id)
+            if account is None or account.account_grouping == grouping:
+                continue
+            account.account_grouping = grouping
+            account.save()
+            moved += 1
+        return moved
+
+    @staticmethod
+    def grouping_exists(client_id: int, name: str) -> Optional[str]:
+        wanted = (name or "").strip().casefold()
+        return next(
+            (name for name in Account.groupings_in_use(client_id)
+             if name.casefold() == wanted),
+            None,
+        )
+
+    @staticmethod
+    def rename_grouping(client_id: int, old: str, new: str) -> int:
+        new = (new or "").strip()
+        if not new:
+            raise ValueError("The new grouping name cannot be empty.")
+        if new == old:
+            return 0
+        members = Account.accounts_in_grouping(client_id, old)
+        for account in members:
+            account.account_grouping = new
+            account.save()
+        return len(members)
+
+    @staticmethod
+    def remove_grouping(client_id: int, grouping: str) -> int:
+        members = Account.accounts_in_grouping(client_id, grouping)
+        for account in members:
+            account.account_grouping = None
+            account.save()
+        return len(members)
 
     @staticmethod
     def count(client_id: int, active_only: bool = True) -> int:
@@ -175,15 +242,17 @@ class Account:
                 )
                 cursor.execute(
                     """
-                    INSERT INTO accounts (client_id, account_number, name, type, subtype, description, is_active)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO accounts (client_id, account_number, name, type, subtype, description, is_active, account_grouping)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (self.client_id, self.account_number, self.name, self.type, self.subtype, self.description, int(self.is_active))
+                    (self.client_id, self.account_number, self.name, self.type,
+                     self.subtype, self.description, int(self.is_active),
+                     self.account_grouping)
                 )
                 self.id = cursor.lastrowid
             else:
                 cursor.execute(
-                    "SELECT account_number, name, type, subtype, description, is_active "
+                    "SELECT account_number, name, type, subtype, description, is_active, account_grouping "
                     "FROM accounts WHERE id = ? AND client_id = ?",
                     (self.id, self.client_id),
                 )
@@ -197,15 +266,17 @@ class Account:
                     'subtype': prev['subtype'],
                     'description': prev['description'],
                     'is_active': bool(prev['is_active']),
+                    'account_grouping': prev['account_grouping'],
                 }
                 cursor.execute(
                     """
                     UPDATE accounts
-                    SET account_number = ?, name = ?, type = ?, subtype = ?, description = ?, is_active = ?
+                    SET account_number = ?, name = ?, type = ?, subtype = ?, description = ?, is_active = ?, account_grouping = ?
                     WHERE id = ? AND client_id = ?
                     """,
                     (self.account_number, self.name, self.type, self.subtype,
-                     self.description, int(self.is_active), self.id, self.client_id)
+                     self.description, int(self.is_active), self.account_grouping,
+                     self.id, self.client_id)
                 )
 
             new_values = {
@@ -215,6 +286,7 @@ class Account:
                 'subtype': self.subtype,
                 'description': self.description,
                 'is_active': self.is_active,
+                'account_grouping': self.account_grouping,
             }
             AuditLog.write(
                 cursor, self.client_id, 'accounts', self.id,

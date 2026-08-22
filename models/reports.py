@@ -19,6 +19,44 @@ def _fiscal_year_start(as_of_date: date, fiscal_year_end_month: int) -> date:
     return fiscal_year_bounds(as_of_date, fiscal_year_end_month)[0]
 
 
+def _collapse_accounts(items: List[Dict], account_type: str,
+                       drop_zero: bool = False) -> List[Dict]:
+    """Collapse captioned lines, bounded by the statement group.
+
+    The boundary is the statement group everywhere, including the flat
+    layout, or the same book answers differently depending on the view: a
+    caption spanning two groups that merged in the flat list would be
+    re-bucketed whole into the first member's group when the comparative
+    path groups the merged lines, silently moving one group's subtotal into
+    another. One boundary, every path, no view-dependent totals.
+    """
+    from constants import AccountSubtype
+    subtype_to_key = {
+        subtype: key
+        for key, _label, subtypes
+        in AccountSubtype.statement_groups_for_type(account_type)
+        for subtype in subtypes
+    }
+    collapsed = []
+    position_of = {}
+    for item in items:
+        caption = item.get('account_grouping')
+        if not caption:
+            collapsed.append(item)
+            continue
+        subtype = ReportGenerator._resolved_statement_subtype(item, account_type)
+        boundary = (subtype_to_key.get(subtype, 'unclassified'), caption)
+        if boundary not in position_of:
+            position_of[boundary] = len(collapsed)
+            collapsed.append({**item, 'account_number': '', 'name': caption})
+        else:
+            collapsed[position_of[boundary]]['balance'] += item['balance']
+    return (
+        [item for item in collapsed if item['balance'] != 0]
+        if drop_zero else collapsed
+    )
+
+
 @dataclass
 class TrialBalanceRow:
     account_number: str
@@ -159,9 +197,21 @@ class ReportGenerator:
     def _merge_statement_lines(
         current: List[Dict], prior: List[Dict], available: bool
     ) -> List[Dict]:
-        """Merge statement lines without dropping accounts unique to a year."""
+        """Merge statement lines without dropping accounts unique to a year.
+
+        The key carries the subtype as well as the number and name. Caption
+        lines share an empty account number, so a caption used in two
+        statement groups produces two lines whose only distinction is the
+        subtype they inherited from their first member; a two-field key
+        silently overwrote one of them and a group's balance disappeared from
+        the comparative view.
+        """
         def key(item):
-            return (item.get('account_number') or '', item['name'])
+            return (
+                item.get('account_number') or '',
+                item['name'],
+                item.get('subtype') or '',
+            )
 
         current_by_key = {key(item): item for item in current}
         prior_by_key = {key(item): item for item in prior}
@@ -209,6 +259,7 @@ class ReportGenerator:
         *,
         comparative: bool = False,
         prior_available: bool = True,
+        collapse_accounts: bool = False,
     ) -> List[Dict]:
         """Group flat statement lines without altering the flat contract."""
         definitions = AccountSubtype.statement_groups_for_type(account_type)
@@ -292,6 +343,11 @@ class ReportGenerator:
         ordered.append(unclassified)
         groups = [group for group in ordered if group['accounts']]
         for group in groups:
+            source_accounts = group['accounts']
+            if collapse_accounts and not comparative:
+                group['accounts'] = _collapse_accounts(
+                    source_accounts, account_type, drop_zero=True
+                )
             if comparative:
                 current_cents = sum(
                     to_cents(item['current']) for item in group['accounts']
@@ -305,7 +361,7 @@ class ReportGenerator:
                 )
             else:
                 group['subtotal'] = sum(
-                    item['balance'] for item in group['accounts']
+                    item['balance'] for item in source_accounts
                 )
         return groups
 
@@ -578,7 +634,8 @@ class ReportGenerator:
     def income_statement(
         client_id: int,
         start_date: date,
-        end_date: date
+        end_date: date,
+        group_accounts: bool = False,
     ) -> Dict:
         """Generate an income statement for a client."""
         require_valid_range(start_date, end_date, "Income statement")
@@ -591,6 +648,7 @@ class ReportGenerator:
                     a.account_number,
                     a.name,
                     a.subtype,
+                    a.account_grouping,
                     COALESCE(SUM(jel.credit), 0) - COALESCE(SUM(jel.debit), 0) as balance
                 FROM accounts a
                 LEFT JOIN (
@@ -610,6 +668,7 @@ class ReportGenerator:
                     'account_number': row['account_number'],
                     'name': row['name'],
                     'subtype': row['subtype'],
+                    'account_grouping': row['account_grouping'],
                     'balance': row['balance']  # cents
                 }
                 for row in cursor.fetchall()
@@ -622,6 +681,7 @@ class ReportGenerator:
                     a.account_number,
                     a.name,
                     a.subtype,
+                    a.account_grouping,
                     COALESCE(SUM(jel.debit), 0) - COALESCE(SUM(jel.credit), 0) as balance
                 FROM accounts a
                 LEFT JOIN (
@@ -641,6 +701,7 @@ class ReportGenerator:
                     'account_number': row['account_number'],
                     'name': row['name'],
                     'subtype': row['subtype'],
+                    'account_grouping': row['account_grouping'],
                     'balance': row['balance']  # cents
                 }
                 for row in cursor.fetchall()
@@ -648,10 +709,10 @@ class ReportGenerator:
             total_expenses = sum(e['balance'] for e in expenses)  # cents, exact
 
         revenue_groups = ReportGenerator._group_statement_lines(
-            revenues, AccountType.REVENUE
+            revenues, AccountType.REVENUE, collapse_accounts=group_accounts
         )
         expense_groups = ReportGenerator._group_statement_lines(
-            expenses, AccountType.EXPENSE
+            expenses, AccountType.EXPENSE, collapse_accounts=group_accounts
         )
         operating_revenue = ReportGenerator._group_subtotal(
             revenue_groups, 'operating_revenue'
@@ -690,6 +751,14 @@ class ReportGenerator:
             gross_profit - operating_expenses - depreciation_amortization
             if multistep_ready else None
         )
+
+        if group_accounts:
+            revenues = _collapse_accounts(
+                revenues, AccountType.REVENUE, drop_zero=True
+            )
+            expenses = _collapse_accounts(
+                expenses, AccountType.EXPENSE, drop_zero=True
+            )
 
         # All aggregation above is in exact integer cents; convert to dollars for output.
         ReportGenerator._groups_to_dollars(revenue_groups)
@@ -730,12 +799,17 @@ class ReportGenerator:
         client_id: int,
         start_date: date,
         end_date: date,
+        group_accounts: bool = False,
     ) -> Dict:
         """Income statement with the same prior-year period alongside it."""
         require_valid_range(start_date, end_date, "Income statement")
         prior_start, prior_end = prior_year_period(start_date, end_date)
-        current = ReportGenerator.income_statement(client_id, start_date, end_date)
-        prior = ReportGenerator.income_statement(client_id, prior_start, prior_end)
+        current = ReportGenerator.income_statement(
+            client_id, start_date, end_date, group_accounts
+        )
+        prior = ReportGenerator.income_statement(
+            client_id, prior_start, prior_end, group_accounts
+        )
         available = ReportGenerator._has_history(client_id, prior_end)
         revenues = ReportGenerator._merge_statement_lines(
             current['revenues'], prior['revenues'], available
@@ -923,7 +997,9 @@ class ReportGenerator:
         return label
 
     @staticmethod
-    def balance_sheet(client_id: int, as_of_date: date) -> Dict:
+    def balance_sheet(
+        client_id: int, as_of_date: date, group_accounts: bool = False
+    ) -> Dict:
         """Generate a balance sheet for a client."""
         with get_cursor() as cursor:
             def get_accounts_by_type(account_type: str, normal_balance: str):
@@ -932,6 +1008,7 @@ class ReportGenerator:
                         a.account_number,
                         a.name,
                         a.subtype,
+                        a.account_grouping,
                         COALESCE(SUM(jel.debit), 0) as total_debits,
                         COALESCE(SUM(jel.credit), 0) as total_credits
                     FROM accounts a
@@ -957,6 +1034,7 @@ class ReportGenerator:
                             'account_number': row['account_number'],
                             'name': row['name'],
                             'subtype': row['subtype'],
+                            'account_grouping': row['account_grouping'],
                             'balance': balance
                         })
                 return accounts
@@ -1016,14 +1094,25 @@ class ReportGenerator:
             total_equity = sum(e['balance'] for e in equity)          # cents
 
         asset_groups = ReportGenerator._group_statement_lines(
-            assets, AccountType.ASSET
+            assets, AccountType.ASSET, collapse_accounts=group_accounts
         )
         liability_groups = ReportGenerator._group_statement_lines(
-            liabilities, AccountType.LIABILITY
+            liabilities, AccountType.LIABILITY, collapse_accounts=group_accounts
         )
         equity_groups = ReportGenerator._group_statement_lines(
-            equity, AccountType.EQUITY
+            equity, AccountType.EQUITY, collapse_accounts=group_accounts
         )
+
+        if group_accounts:
+            assets = _collapse_accounts(
+                assets, AccountType.ASSET, drop_zero=True
+            )
+            liabilities = _collapse_accounts(
+                liabilities, AccountType.LIABILITY, drop_zero=True
+            )
+            equity = _collapse_accounts(
+                equity, AccountType.EQUITY, drop_zero=True
+            )
 
         # All aggregation above is in exact integer cents; convert to dollars for output.
         for statement_groups in (asset_groups, liability_groups, equity_groups):
@@ -1047,11 +1136,17 @@ class ReportGenerator:
         }
 
     @staticmethod
-    def comparative_balance_sheet(client_id: int, as_of_date: date) -> Dict:
+    def comparative_balance_sheet(
+        client_id: int, as_of_date: date, group_accounts: bool = False
+    ) -> Dict:
         """Balance sheet with the same date one year earlier alongside it."""
         prior_as_of = prior_year_date(as_of_date)
-        current = ReportGenerator.balance_sheet(client_id, as_of_date)
-        prior = ReportGenerator.balance_sheet(client_id, prior_as_of)
+        current = ReportGenerator.balance_sheet(
+            client_id, as_of_date, group_accounts
+        )
+        prior = ReportGenerator.balance_sheet(
+            client_id, prior_as_of, group_accounts
+        )
         available = ReportGenerator._has_history(client_id, prior_as_of)
         assets = ReportGenerator._merge_statement_lines(
             current['assets'], prior['assets'], available
