@@ -16,7 +16,7 @@ from models.reports import ReportGenerator
 from database import init_database
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
-from utils.dates import long_date
+from utils.dates import long_date, short_date
 from utils.ui import (
     apply_default_on_change,
     financial_statement,
@@ -28,6 +28,18 @@ from utils.ui import (
 from utils import icons
 from utils.export import sanitize_df
 from utils.fiscal_dates import fiscal_year_bounds
+
+
+def _comparative_headers(current, prior):
+    return [current, prior, "$ Change", "% Change"]
+
+
+def _numbers_toggle(key, grouped):
+    apply_default_on_change(key, grouped, not grouped)
+    return st.toggle(
+        "Show account numbers", key=key,
+        help="Numbers sit in their own column so captions remain aligned.",
+    )
 
 # Initialize database
 
@@ -237,6 +249,7 @@ elif selected_report == "Income Statement":
         help=("Turn this off for the familiar flat statement. Accounts need a "
               "curated subtype before the grouped statement is fully useful."),
     )
+    is_show_numbers = _numbers_toggle("is_show_numbers", group_is)
     if has_unclassified_is and not group_is:
         st.info(
             "This statement is using the classic layout because one or more "
@@ -296,18 +309,25 @@ elif selected_report == "Income Statement":
     for kind, label, value in ReportGenerator.income_statement_rows(
         layout_report, grouped=group_is
     ):
+        number = value.get('account_number') if kind == 'item' else None
         statement_rows.append((
             'subtotal' if kind == 'group_total' else kind,
             label,
             [] if value is None else _amounts(value),
+            None,
+            number,
         ))
 
     financial_statement(
         statement_rows,
-        headers=["Current", "Prior Year", "$ Change", "% Change"]
-        if compare_py else None,
+        headers=_comparative_headers(
+            f"{short_date(is_start)} to {short_date(is_end)}",
+            (f"{short_date(report['prior_period']['start'])} to "
+             f"{short_date(report['prior_period']['end'])}"),
+        ) if compare_py else None,
         formats=["money", "money", "money", "percent"]
         if compare_py else None,
+        show_numbers=is_show_numbers,
     )
     if compare_py:
         st.caption(
@@ -389,6 +409,7 @@ elif selected_report == "Balance Sheet":
         help=("Turn this off for the familiar flat statement. Accounts need a "
               "curated subtype before the grouped statement is fully useful."),
     )
+    bs_show_numbers = _numbers_toggle("bs_show_numbers", group_bs)
     if has_unclassified_bs and not group_bs:
         st.info(
             "This statement is using the classic layout because one or more "
@@ -435,9 +456,8 @@ elif selected_report == "Balance Sheet":
             for group in visible_groups:
                 rows.append(("group", group['group'], []))
                 rows.extend(
-                    ("item", (f"{item['account_number']} - {item['name']}"
-                              if item['account_number'] else item['name']),
-                     _bs_amounts(item))
+                    ("item", item['name'], _bs_amounts(item), None,
+                     item['account_number'])
                     for item in group['accounts']
                 )
                 rows.append((
@@ -447,9 +467,8 @@ elif selected_report == "Balance Sheet":
             has_lines = bool(visible_groups)
         else:
             rows.extend(
-                ("item", (f"{item['account_number']} - {item['name']}"
-                          if item['account_number'] else item['name']),
-                 _bs_amounts(item))
+                ("item", item['name'], _bs_amounts(item), None,
+                 item['account_number'])
                 for item in flat_items
             )
             has_lines = bool(flat_items)
@@ -470,8 +489,11 @@ elif selected_report == "Balance Sheet":
     )
     financial_statement(
         statement_rows,
-        headers=["Current", "Prior Year", "$ Change", "% Change"]
-        if compare_py else None,
+        headers=_comparative_headers(
+            f"As of {short_date(bs_date)}",
+            f"As of {short_date(report['prior_as_of'])}",
+        ) if compare_py else None,
+        show_numbers=bs_show_numbers,
         formats=["money", "money", "money", "percent"]
         if compare_py else None,
     )

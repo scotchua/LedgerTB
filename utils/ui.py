@@ -116,6 +116,9 @@ table.pb-statement td {
     vertical-align: bottom;
 }
 table.pb-statement td.amt { text-align: right; white-space: nowrap; width: 8.5rem; }
+table.pb-statement td.num {
+    width: 4.2rem; white-space: nowrap; color: #6b7280; font-size: 0.9em;
+}
 table.pb-statement td.note-cell { color: #6b7280; font-size: 0.85em; }
 table.pb-statement span.muted { color: #6b7280; font-size: 0.85em; margin-left: 0.5rem; }
 table.pb-statement tr.head td {
@@ -130,77 +133,85 @@ table.pb-statement tr.group td {
     font-weight: 600; padding-top: 0.45rem; color: #374151;
 }
 table.pb-statement tr.item td.lbl { padding-left: 1.3rem; }
-table.pb-statement tr.subtotal td {
-    font-weight: 700; border-top: 1px solid #565d68; padding-bottom: 0.5rem;
+table.pb-statement.numbered tr.item td.lbl { padding-left: 0.25rem; }
+table.pb-statement tr.subtotal td { font-weight: 700; padding-bottom: 0.5rem; }
+table.pb-statement tr.subtotal td.amt { border-top: 1px solid #565d68; }
+table.pb-statement tr.total td { font-weight: 700; font-size: 1.02em; }
+table.pb-statement tr.total td.amt {
+    border-top: 1px solid #565d68; border-bottom: 3px double #565d68;
 }
-table.pb-statement tr.total td {
-    font-weight: 700; font-size: 1.02em; border-top: 1px solid #565d68;
-}
-table.pb-statement tr.total td.amt { border-bottom: 3px double #565d68; }
 </style>
 """
 
+from utils.statement_format import LEAD_DOLLAR, statement_amount as _statement_amount
 
-def _statement_amount(value, lead_dollar, value_format="money"):
-    if value is None:
-        return ""
-    if value_format == "percent":
-        body = f"{abs(value):,.1f}%"
-        return f"({body})" if value < 0 else body
-    body = f"{abs(value):,.2f}"
-    if value < 0:
-        body = f"({body})"
-    return f"${body}" if lead_dollar else body
-
-
-def financial_statement(rows, headers=None, formats=None):
-    """Render rows as an actual financial statement, not a widget pile.
-
-    rows: iterables of (kind, label, amounts, note) — note optional.
-      kind: 'section' (major heading), 'group' (subgroup heading),
-            'item' (indented line),
-            'subtotal' (bold, top rule), 'total' (bold, double-ruled amount),
-            'note' (muted caption line).
-      amounts: list of floats/None, one per amount column (usually one;
-               two for debit/credit layouts). Dollar signs appear on
-               subtotal/total rows, accounting-style; negatives in parens.
-    headers: optional list of amount-column headings.
-    formats: optional per-column formats ("money" or "percent").
-    """
+def statement_html(rows, headers=None, formats=None, show_numbers=False):
+    """Build statement markup without drawing it."""
     import html as _html
 
     columns = max((len(r[2]) for r in rows if len(r) > 2 and r[2]), default=1)
     column_formats = list(formats or []) + ["money"] * columns
+    span = " colspan='2'" if show_numbers else ""
     parts = []
     if headers:
         cells = "".join(f"<td class='amt'>{_html.escape(h)}</td>" for h in headers)
-        parts.append(f"<tr class='head'><td class='lbl'></td>{cells}</tr>")
+        parts.append(f"<tr class='head'><td class='lbl'{span}></td>{cells}</tr>")
+    label_columns = columns + (2 if show_numbers else 1)
     for row in rows:
         kind, label = row[0], row[1]
         amounts = row[2] if len(row) > 2 and row[2] is not None else []
         note = row[3] if len(row) > 3 else None
+        number = row[4] if len(row) > 4 else None
         label_html = _html.escape(str(label))
         if note:
             label_html += f"<span class='muted'>{_html.escape(str(note))}</span>"
         if kind == "note":
             parts.append(
-                f"<tr class='note'><td class='lbl note-cell' colspan='{columns + 1}'>"
+                f"<tr class='note'><td class='lbl note-cell' colspan='{label_columns}'>"
                 f"{label_html}</td></tr>"
             )
             continue
-        lead = kind in ("subtotal", "total")
+        lead = kind in LEAD_DOLLAR
         padded = list(amounts) + [None] * (columns - len(amounts))
         cells = "".join(
             f"<td class='amt'>{_statement_amount(a, lead, column_formats[index])}</td>"
             for index, a in enumerate(padded)
         )
-        parts.append(f"<tr class='{kind}'><td class='lbl'>{label_html}</td>{cells}</tr>")
+        if show_numbers and kind == "item":
+            head_cells = (f"<td class='num'>{_html.escape(str(number or ''))}</td>"
+                          f"<td class='lbl'>{label_html}</td>")
+        else:
+            head_cells = f"<td class='lbl'{span}>{label_html}</td>"
+        parts.append(f"<tr class='{kind}'>{head_cells}{cells}</tr>")
 
     table_class = "pb-statement wide" if columns >= 4 else "pb-statement"
-    st.html(
-        _STATEMENT_CSS
-        + f"<table class='{table_class}'>{''.join(parts)}</table>"
-    )
+    if show_numbers:
+        table_class += " numbered"
+    return _STATEMENT_CSS + f"<table class='{table_class}'>{''.join(parts)}</table>"
+
+
+def financial_statement(rows, headers=None, formats=None, show_numbers=False):
+    """Render rows as an actual financial statement, not a widget pile.
+
+    rows: iterables of (kind, label, amounts, note, number) — note and
+      number optional.
+      kind: 'section' (major heading), 'group' (subgroup heading),
+            'item' (indented line),
+            'subtotal' (bold, ruled amounts), 'total' (bold, double-ruled
+            amount), 'note' (muted caption line).
+      amounts: list of floats/None, one per amount column (usually one;
+               two for debit/credit layouts). Dollar signs appear on
+               subtotal/total rows, accounting-style; negatives in parens,
+               an exact zero as a dash.
+      number: the account number, when ``show_numbers`` is on. It is a column
+              of its own, never glued onto the label: a caption that sometimes
+              begins with a number and sometimes does not cannot line up.
+    headers: optional list of amount-column headings.
+    formats: optional per-column formats ("money" or "percent").
+    show_numbers: draw the account-number column. Independent of grouping;
+      a caller may group and still show numbers, or neither.
+    """
+    st.html(statement_html(rows, headers, formats, show_numbers))
 
 
 _LEDGER_CSS = """

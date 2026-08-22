@@ -812,8 +812,10 @@ class ReportGenerator:
         rows = []
 
         def label(item):
-            number = item.get('account_number') or ''
-            return f"{number} - {item['name']}" if number else item['name']
+            # A statement caption never carries the account number; whoever
+            # renders a number column takes it from the item dict. Numbers
+            # live on the trial balance and the general ledger.
+            return item['name']
 
         def append_group(group):
             rows.append(('group', group['group'], None))

@@ -44,6 +44,7 @@ from services.branding import (
     get_client_branding,
 )
 from utils.dates import long_date, long_datetime
+from utils.statement_format import statement_amount
 from utils.export import set_excel_literal
 
 _HEADER_FONT = Font(bold=True)
@@ -279,8 +280,7 @@ def _write_table(ws, headers, data_rows, money_cols):
 
 def _statement_label(item: dict) -> str:
     """Account label shared by the two financial-statement sheets."""
-    number = item.get("account_number") or ""
-    return f"{number} - {item['name']}" if number else item["name"]
+    return item["name"]
 
 
 def _start_statement_sheet(wb, title: str, client_name: str, period_label: str,
@@ -893,12 +893,11 @@ def _percent(value: Optional[float]) -> str:
 
 
 def _pdf_comparison_values(item: Dict, totals: bool = False) -> list:
-    money = _money_total if totals else _money
     return [
-        money(item['current']),
-        "" if item['prior'] is None else money(item['prior']),
-        "" if item['change'] is None else money(item['change']),
-        _percent(item['change_percent']),
+        statement_amount(item['current'], totals),
+        statement_amount(item['prior'], totals),
+        statement_amount(item['change'], totals),
+        statement_amount(item['change_percent'], value_format="percent"),
     ]
 
 
@@ -913,7 +912,8 @@ def _safe_paragraph(text: str, style: ParagraphStyle) -> Paragraph:
 
 def _pdf_table(headers, data_rows, col_widths, money_from: Optional[int],
                totals_row=None, bold_data_rows=None,
-               ruled_data_rows=None, no_split_data_ranges=None) -> Table:
+               ruled_data_rows=None, no_split_data_ranges=None,
+               statement: bool = False, grand_total: bool = False) -> Table:
     """A report table: bold repeating header, right-aligned money columns."""
     rows = [headers] + data_rows
     if totals_row is not None:
@@ -925,18 +925,23 @@ def _pdf_table(headers, data_rows, col_widths, money_from: Optional[int],
         ("FONTSIZE", (0, 0), (-1, -1), 8),
         ("LINEBELOW", (0, 0), (-1, 0), 0.75, colors.black),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-         [colors.white, colors.HexColor("#F4F4F0")]),
         ("TOPPADDING", (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ]
+    if not statement:
+        style.append(("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                      [colors.white, colors.HexColor("#F4F4F0")]))
     if money_from is not None:
         style.append(("ALIGN", (money_from, 0), (-1, -1), "RIGHT"))
     if totals_row is not None:
+        rule_from = money_from if statement and money_from is not None else 0
         style += [
             ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-            ("LINEABOVE", (0, -1), (-1, -1), 0.75, colors.black),
+            ("LINEABOVE", (rule_from, -1), (-1, -1), 0.75, colors.black),
         ]
+        if grand_total:
+            style.append(("LINEBELOW", (rule_from, -1), (-1, -1), 0.75,
+                          colors.black, None, None, None, 2, 1.2))
     for data_index in bold_data_rows or ():
         table_row = data_index + 1
         style.append((
@@ -944,8 +949,9 @@ def _pdf_table(headers, data_rows, col_widths, money_from: Optional[int],
         ))
     for data_index in ruled_data_rows or ():
         table_row = data_index + 1
+        rule_from = money_from if statement and money_from is not None else 0
         style.append((
-            "LINEABOVE", (0, table_row), (-1, table_row),
+            "LINEABOVE", (rule_from, table_row), (-1, table_row),
             0.5, colors.HexColor("#777777"),
         ))
     for start_index, end_index in no_split_data_ranges or ():
@@ -988,6 +994,8 @@ def _pdf_income_statement_table(report: Dict) -> Table:
         money_from=1,
         bold_data_rows=bold_rows,
         ruled_data_rows=ruled_rows,
+        statement=True,
+        grand_total=True,
     )
 
 
@@ -1025,6 +1033,7 @@ def _pdf_grouped_comparison_table(groups: List[Dict], empty_label: str,
         bold_data_rows=bold_rows,
         ruled_data_rows=ruled_rows,
         no_split_data_ranges=no_split_ranges,
+        statement=True,
     )
 
 
@@ -1230,6 +1239,8 @@ def build_close_package_pdf(
             totals_row=["TOTAL LIABILITIES & EQUITY"] + _pdf_comparison_values(
                 comparative_balance["total_liabilities_equity"], totals=True
             ),
+            statement=True,
+            grand_total=True,
         ),
         Spacer(1, 8),
         Paragraph(
@@ -1284,6 +1295,7 @@ def build_close_package_pdf(
                 totals_row=[total_label] + _pdf_comparison_values(
                     section["total"], totals=True
                 ),
+                statement=True,
             ),
             Spacer(1, 8),
         ]
@@ -1313,6 +1325,7 @@ def build_close_package_pdf(
         money_from=1,
         bold_data_rows=list(range(len(cash_rollforward_rows))),
         ruled_data_rows=[0, len(cash_rollforward_rows) - 1],
+        statement=True,
     )
     cash_quality_block = [cash_rollforward]
     if cash_flow["warnings"]:
