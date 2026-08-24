@@ -36,7 +36,7 @@ def test_groupings_in_use_are_offered_not_retyped(client_id, accounts, monkeypat
     _grouped_account(client_id, "1510", "Shop Equipment", PPE)
 
     page = _page(monkeypatch, client_id)
-    picker = next(s for s in page.selectbox if s.key == "add_grouping")
+    picker = next(s for s in page.selectbox if s.key == "add__chart_of_accounts_g0_grouping")
 
     assert PPE in picker.options
     # Offered once, however many accounts already use it.
@@ -47,8 +47,8 @@ def test_groupings_in_use_are_offered_not_retyped(client_id, accounts, monkeypat
 def test_a_new_grouping_can_be_named(client_id, accounts, monkeypatch):
     page = _page(monkeypatch, client_id)
 
-    page.text_input(key="add_grouping_new").set_value(PPE)
-    next(s for s in page.selectbox if s.key == "add_grouping").set_value(
+    page.text_input(key="add__chart_of_accounts_g0_grouping_new").set_value(PPE)
+    next(s for s in page.selectbox if s.key == "add__chart_of_accounts_g0_grouping").set_value(
         "Add new account grouping…")
     page.text_input[0].set_value("1600")          # Account Number
     page.text_input[1].set_value("Kiln")          # Account Name
@@ -64,8 +64,8 @@ def test_an_account_can_join_an_existing_grouping(client_id, accounts, monkeypat
     joiner = _grouped_account(client_id, "1520", "Office Equipment", None)
 
     page = _page(monkeypatch, client_id)
-    next(b for b in page.button if b.key == f"edit_{joiner.id}").click().run()
-    grouping_key = f"edit_{joiner.id}_grouping"
+    next(b for b in page.button if b.key == f"edit_{joiner.id}__chart_of_accounts_g0").click().run()
+    grouping_key = f"edit_{joiner.id}__chart_of_accounts_g0_grouping"
     next(s for s in page.selectbox if s.key == grouping_key).set_value(PPE)
     next(b for b in page.button if "Save Changes" in b.label).click().run()
 
@@ -77,8 +77,8 @@ def test_an_account_can_be_put_back_on_its_own_line(client_id, accounts, monkeyp
     leaver = _grouped_account(client_id, "1520", "Office Equipment", PPE)
 
     page = _page(monkeypatch, client_id)
-    next(b for b in page.button if b.key == f"edit_{leaver.id}").click().run()
-    grouping_key = f"edit_{leaver.id}_grouping"
+    next(b for b in page.button if b.key == f"edit_{leaver.id}__chart_of_accounts_g0").click().run()
+    grouping_key = f"edit_{leaver.id}__chart_of_accounts_g0_grouping"
     picker = next(s for s in page.selectbox if s.key == grouping_key)
     picker.set_value(next(o for o in picker.options if o.startswith("None")))
     next(b for b in page.button if "Save Changes" in b.label).click().run()
@@ -91,9 +91,9 @@ def test_the_current_grouping_is_preselected_when_editing(client_id, accounts, m
     account = _grouped_account(client_id, "1500", "Vehicles", PPE)
 
     page = _page(monkeypatch, client_id)
-    next(b for b in page.button if b.key == f"edit_{account.id}").click().run()
+    next(b for b in page.button if b.key == f"edit_{account.id}__chart_of_accounts_g0").click().run()
 
-    grouping_key = f"edit_{account.id}_grouping"
+    grouping_key = f"edit_{account.id}__chart_of_accounts_g0_grouping"
     assert next(s for s in page.selectbox if s.key == grouping_key).value == PPE
 
 
@@ -102,15 +102,17 @@ def test_edit_opens_without_error_for_every_account(client_id, accounts, monkeyp
     the button looked dead. It is a dialog now; this at least holds that
     opening one renders its fields."""
     page = _page(monkeypatch, client_id)
-    edit_buttons = [b for b in page.button if (b.key or "").startswith("edit_")]
+    edit_buttons = [b for b in page.button if (b.key or "").startswith("edit_") and (b.key or "").endswith(f"__chart_of_accounts_g0")]
     assert edit_buttons
 
-    edited_id = edit_buttons[0].key.removeprefix("edit_")
+    # The button key is "edit_{id}__chart_of_accounts_g0"; the grouping
+    # picker's key is that same string with "_grouping" appended.
+    edited_id_and_suffix = edit_buttons[0].key.removeprefix("edit_")
     edit_buttons[0].click().run()
 
     assert not page.exception
     assert any(
-        s.key == f"edit_{edited_id}_grouping" for s in page.selectbox
+        s.key == f"edit_{edited_id_and_suffix}_grouping" for s in page.selectbox
     )
     assert any(b.label == "Save Changes" for b in page.button)
 
@@ -178,9 +180,9 @@ def test_the_groupings_tab_lists_and_removes(client_id, accounts, monkeypatch):
     listed = " ".join(str(c.value) for c in page.caption)
     assert "1500 · Vehicles" in listed
     assert "1510 · Shop Equipment" in listed
-    assert any(b.key == f"do_rename_{PPE}" for b in page.button)
+    assert any(b.key == f"do_rename_{PPE}__chart_of_accounts_g0" for b in page.button)
 
-    next(b for b in page.button if b.key == f"do_remove_{PPE}").click().run()
+    next(b for b in page.button if b.key == f"do_remove_{PPE}__chart_of_accounts_g0").click().run()
 
     assert not page.exception
     assert Account.groupings_in_use(client_id) == []
@@ -244,9 +246,9 @@ def test_a_grouping_can_be_created_from_the_groupings_tab(client_id, accounts, m
     b = _grouped_account(client_id, "1510", "Shop Equipment", None)
 
     page = _page(monkeypatch, client_id)
-    page.text_input(key="new_grouping_name").set_value(PPE)
-    page.multiselect(key="new_grouping_members").set_value([a.id, b.id])
-    next(btn for btn in page.button if btn.key == "do_create_grouping").click().run()
+    page.text_input(key="new_grouping_name__chart_of_accounts_g0").set_value(PPE)
+    page.multiselect(key="new_grouping_members__chart_of_accounts_g0").set_value([a.id, b.id])
+    next(btn for btn in page.button if btn.key == "do_create_grouping__chart_of_accounts_g0").click().run()
 
     assert not page.exception
     assert Account.groupings_in_use(client_id) == [PPE]
@@ -257,8 +259,8 @@ def test_accounts_can_be_added_to_an_existing_grouping_from_the_tab(client_id, a
     joiner = _grouped_account(client_id, "1510", "Shop Equipment", None)
 
     page = _page(monkeypatch, client_id)
-    page.multiselect(key=f"add_to_{PPE}").set_value([joiner.id])
-    next(btn for btn in page.button if btn.key == f"do_add_{PPE}").click().run()
+    page.multiselect(key=f"add_to_{PPE}__chart_of_accounts_g0").set_value([joiner.id])
+    next(btn for btn in page.button if btn.key == f"do_add_{PPE}__chart_of_accounts_g0").click().run()
 
     assert not page.exception
     assert Account.get_by_id(joiner.id, client_id).account_grouping == PPE

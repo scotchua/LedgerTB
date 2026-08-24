@@ -11,6 +11,7 @@ from models.transaction import ImportedTransaction
 from database import connection as db_connection
 from services.backups import backup_health
 from utils import icons
+from utils.client_context import set_client_intent, sync_active_client_context
 
 
 # Narrow the sidebar (default is ~21rem). Uses width only — Streamlit collapses
@@ -164,6 +165,9 @@ def render_client_selector() -> Optional[int]:
 
     # Update session state
     st.session_state.selected_client_id = selected_id
+    sync_active_client_context(
+        st.session_state, selected_id, db_connection.DATABASE_PATH
+    )
 
     # Add-client affordance right where the clients are listed. A button rather
     # than a page_link so it can land on the Add Client view directly — a
@@ -220,16 +224,28 @@ def render_client_selector() -> Optional[int]:
         # Quick report links (collapsible)
         with st.sidebar.expander("Quick Reports"):
             if st.button("Trial Balance", key="qr_tb", type="tertiary", width="stretch"):
-                st.session_state.active_report = "Trial Balance"
+                set_client_intent(
+                    st.session_state, "report", {"report": "Trial Balance"},
+                    selected_id, db_connection.DATABASE_PATH,
+                )
                 st.switch_page("pages/5_Reports.py")
             if st.button("Income Statement", key="qr_is", type="tertiary", width="stretch"):
-                st.session_state.active_report = "Income Statement"
+                set_client_intent(
+                    st.session_state, "report", {"report": "Income Statement"},
+                    selected_id, db_connection.DATABASE_PATH,
+                )
                 st.switch_page("pages/5_Reports.py")
             if st.button("Balance Sheet", key="qr_bs", type="tertiary", width="stretch"):
-                st.session_state.active_report = "Balance Sheet"
+                set_client_intent(
+                    st.session_state, "report", {"report": "Balance Sheet"},
+                    selected_id, db_connection.DATABASE_PATH,
+                )
                 st.switch_page("pages/5_Reports.py")
             if st.button("General Ledger", key="qr_gl", type="tertiary", width="stretch"):
-                st.session_state.active_report = "General Ledger"
+                set_client_intent(
+                    st.session_state, "report", {"report": "General Ledger"},
+                    selected_id, db_connection.DATABASE_PATH,
+                )
                 st.switch_page("pages/5_Reports.py")
 
         st.sidebar.divider()

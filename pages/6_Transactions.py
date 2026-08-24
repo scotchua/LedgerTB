@@ -12,6 +12,8 @@ from models.transaction import ImportedTransaction
 from models.journal_entry import JournalEntry
 from models.audit_log import AuditLog
 from database import init_database
+from database import connection as dbconn
+from utils.client_context import scope_page_to_client
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 from utils import icons
@@ -44,6 +46,14 @@ current_fy_start, current_fy_end = fiscal_year_bounds(today, client.fiscal_year_
 previous_fy_start, previous_fy_end = previous_fiscal_year_bounds(
     today, client.fiscal_year_end_month
 )
+# Filters and pagination belong to (book, client): client ids restart at 1
+# in every book, so a bare client id would let one book's view state leak
+# into another book's same-numbered client. The scope generation gives each
+# ownership change fresh widget keys — the only reset the browser honors.
+transactions_scope = scope_page_to_client(
+    st.session_state, "transactions", client_id, dbconn.DATABASE_PATH
+)
+transactions_key = transactions_scope.key
 
 # Filters
 st.subheader("Filters")
@@ -58,18 +68,24 @@ with col1:
             "All Time", "Last 30 days", "Last 90 days",
             "This Fiscal Year", "Last Fiscal Year", "Custom",
         ],
-        index=0
+        index=0,
+        key=transactions_key("date_range"),
     )
 
 with col2:
     if date_range == "Custom":
-        start_date = st.date_input("Start Date", value=date.today() - timedelta(days=30))
+        start_date = st.date_input(
+            "Start Date", value=date.today() - timedelta(days=30),
+            key=transactions_key("start_date"),
+        )
     else:
         start_date = None
 
 with col3:
     if date_range == "Custom":
-        end_date = st.date_input("End Date", value=date.today())
+        end_date = st.date_input(
+            "End Date", value=date.today(), key=transactions_key("end_date")
+        )
     else:
         end_date = None
 
@@ -78,7 +94,12 @@ with col4:
     status_filter = st.selectbox(
         "Status",
         options=["All", "Posted", "Pending", "Categorized", "Dismissed", "Reversed"],
-        index=0
+        index=0,
+        key=transactions_key("status"),
+        help=(
+            "All shows current transaction rows. Choose Reversed to inspect "
+            "superseded import history."
+        ),
     )
 
 with col5:
@@ -86,6 +107,7 @@ with col5:
         "Reconciliation",
         options=["All", "Cleared", "Uncleared"],
         index=0,
+        key=transactions_key("clearance"),
     )
 
 # Calculate date range
@@ -120,7 +142,8 @@ with col1:
     selected_bank = st.selectbox(
         "Bank/Credit Card",
         options=list(bank_options.keys()),
-        format_func=lambda x: bank_options[x]
+        format_func=lambda x: bank_options[x],
+        key=transactions_key("bank_account"),
     )
 
 st.divider()
@@ -131,11 +154,13 @@ cleared_param = None if clearance_filter == "All" else clearance_filter == "Clea
 
 # Reset paging when the filter set changes.
 filter_signature = (
-    start_date, end_date, status_param, bank_param, cleared_param,
+    client_id, start_date, end_date, status_param, bank_param, cleared_param,
 )
-if st.session_state.get("transactions_filter_signature") != filter_signature:
-    st.session_state.transactions_filter_signature = filter_signature
-    st.session_state.transactions_page = 1
+signature_key = transactions_key("filter_signature")
+page_key = transactions_key("page")
+if st.session_state.get(signature_key) != filter_signature:
+    st.session_state[signature_key] = filter_signature
+    st.session_state[page_key] = 1
 
 page_size = 50
 summary = ImportedTransaction.get_filtered_summary(
@@ -147,8 +172,8 @@ summary = ImportedTransaction.get_filtered_summary(
     cleared=cleared_param,
 )
 page_count = max(1, (summary["total_count"] + page_size - 1) // page_size)
-current_page = min(max(1, st.session_state.get("transactions_page", 1)), page_count)
-st.session_state.transactions_page = current_page
+current_page = min(max(1, st.session_state.get(page_key, 1)), page_count)
+st.session_state[page_key] = current_page
 
 transactions = ImportedTransaction.get_all(
     client_id=client_id,
@@ -175,8 +200,11 @@ with col4:
 
 nav_left, nav_status, nav_right = st.columns([1, 2, 1])
 with nav_left:
-    if st.button("Previous", disabled=current_page <= 1, key="transactions_previous"):
-        st.session_state.transactions_page = current_page - 1
+    if st.button(
+        "Previous", disabled=current_page <= 1,
+        key=transactions_key("previous"),
+    ):
+        st.session_state[page_key] = current_page - 1
         st.rerun()
 with nav_status:
     first_row = (current_page - 1) * page_size + 1 if summary["total_count"] else 0
@@ -186,8 +214,11 @@ with nav_status:
         f"of {summary['total_count']}"
     )
 with nav_right:
-    if st.button("Next", disabled=current_page >= page_count, key="transactions_next"):
-        st.session_state.transactions_page = current_page + 1
+    if st.button(
+        "Next", disabled=current_page >= page_count,
+        key=transactions_key("next"),
+    ):
+        st.session_state[page_key] = current_page + 1
         st.rerun()
 
 st.divider()

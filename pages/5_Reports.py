@@ -14,6 +14,12 @@ from models.client import Client
 from models.audit_log import AuditLog
 from models.reports import ReportGenerator
 from database import init_database
+from database import connection as dbconn
+from utils.client_context import (
+    pop_client_intent,
+    scope_page_to_client,
+    set_client_intent,
+)
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 from utils.dates import long_date, short_date
@@ -59,6 +65,17 @@ if not client_id:
     st.page_link("pages/0_Clients.py", label="Go to Clients →")
     st.stop()
 
+report_scope = scope_page_to_client(
+    st.session_state, "reports", client_id, dbconn.DATABASE_PATH
+)
+if report_scope.changed:
+    st.session_state.active_report = "Trial Balance"
+    st.session_state.pop("_active_report_rendered", None)
+    for key in ("gl_account_id", "gl_start_date", "gl_end_date"):
+        st.session_state.pop(key, None)
+
+report_key = report_scope.key
+
 # Get client info
 client = Client.get_by_id(client_id)
 st.caption(f"Viewing: **{client.name}**")
@@ -75,11 +92,14 @@ def gl_drill_down(options, key, start_date, end_date):
             "Drill into general ledger",
             options=list(options.keys()),
             format_func=lambda account_id: options[account_id],
-            key=f"{key}_gl_pick",
+            key=report_key(f"{key}_gl_pick"),
         )
     with dd2:
         st.write("")
-        if st.button("Open GL →", width="stretch", key=f"{key}_gl_open"):
+        if st.button(
+            "Open GL →", width="stretch",
+            key=report_key(f"{key}_gl_open"),
+        ):
             st.session_state.gl_account_id = picked
             st.session_state.gl_start_date = start_date
             st.session_state.gl_end_date = end_date
@@ -95,6 +115,23 @@ report_options = [
     "General Ledger",
 ]
 
+report_intent = pop_client_intent(
+    st.session_state, "report", client_id, dbconn.DATABASE_PATH
+)
+if isinstance(report_intent, dict):
+    requested_report = report_intent.get("report")
+    if requested_report in report_options:
+        st.session_state.active_report = requested_report
+        st.session_state.pop("_active_report_rendered", None)
+        if requested_report == "General Ledger":
+            st.session_state.gl_account_id = report_intent.get("account_id")
+            st.session_state.gl_start_date = report_intent.get(
+                "start_date", current_fy_start
+            )
+            st.session_state.gl_end_date = report_intent.get(
+                "end_date", date.today()
+            )
+
 # Report selector (segmented tabs; programmatically controllable via
 # st.session_state.active_report from the sidebar quick links and GL drills).
 selected_report = view_switcher(report_options, key="active_report",
@@ -107,18 +144,21 @@ if selected_report == "Trial Balance":
 
     col1, col2 = st.columns([1, 3])
     with col1:
-        as_of_date = st.date_input("As of Date", value=date.today(), key="tb_date")
+        as_of_date = st.date_input(
+            "As of Date", value=date.today(), key=report_key("tb_date")
+        )
 
     rows = ReportGenerator.trial_balance(client_id, as_of_date)
     comparison = ReportGenerator.comparative_trial_balance(client_id, as_of_date)
     apply_default_on_change(
-        "tb_compare_py", (client_id, as_of_date, comparison['prior_available']),
+        report_key("tb_compare_py"),
+        (client_id, as_of_date, comparison['prior_available']),
         comparison['prior_available'],
     )
     compare_py = st.toggle(
         "Compare to prior year",
         disabled=not comparison['prior_available'],
-        key="tb_compare_py",
+        key=report_key("tb_compare_py"),
     )
     if not comparison['prior_available']:
         st.caption("No prior-year book history is available for this date.")
@@ -210,30 +250,34 @@ elif selected_report == "Income Statement":
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
-        is_start = st.date_input("Start Date", value=current_fy_start, key="is_start")
+        is_start = st.date_input(
+            "Start Date", value=current_fy_start, key=report_key("is_start")
+        )
     with col2:
-        is_end = st.date_input("End Date", value=date.today(), key="is_end")
+        is_end = st.date_input(
+            "End Date", value=date.today(), key=report_key("is_end")
+        )
 
     if is_start > is_end:
         st.error("Income statement start date cannot be after the end date.")
         st.stop()
 
     group_accounts_is = st.toggle(
-        "Group accounts", key="is_group_accounts",
+        "Group accounts", key=report_key("is_group_accounts"),
         help="Collapse accounts sharing a statement caption.",
     )
     report = ReportGenerator.comparative_income_statement(
         client_id, is_start, is_end, group_accounts_is
     )
     apply_default_on_change(
-        "is_compare_py",
+        report_key("is_compare_py"),
         (client_id, is_start, is_end, report['prior_available']),
         report['prior_available'],
     )
     compare_py = st.toggle(
         "Compare to prior year",
         disabled=not report['prior_available'],
-        key="is_compare_py",
+        key=report_key("is_compare_py"),
     )
     if not report['prior_available']:
         st.caption("No prior-year book history is available for this period.")
@@ -243,17 +287,17 @@ elif selected_report == "Income Statement":
         for group in report['revenue_groups'] + report['expense_groups']
     )
     apply_default_on_change(
-        "is_group_subtypes",
+        report_key("is_group_subtypes"),
         (client_id, is_start, is_end, has_unclassified_is),
         not has_unclassified_is,
     )
     group_is = st.toggle(
         "Group by statement subtype",
-        key="is_group_subtypes",
+        key=report_key("is_group_subtypes"),
         help=("Turn this off for the familiar flat statement. Accounts need a "
               "curated subtype before the grouped statement is fully useful."),
     )
-    is_show_numbers = _numbers_toggle("is_show_numbers", group_is)
+    is_show_numbers = _numbers_toggle(report_key("is_show_numbers"), group_is)
     if has_unclassified_is and not group_is:
         st.info(
             "This statement is using the classic layout because one or more "
@@ -382,23 +426,26 @@ elif selected_report == "Balance Sheet":
 
     col1, col2 = st.columns([1, 3])
     with col1:
-        bs_date = st.date_input("As of Date", value=date.today(), key="bs_date")
+        bs_date = st.date_input(
+            "As of Date", value=date.today(), key=report_key("bs_date")
+        )
 
     group_accounts_bs = st.toggle(
-        "Group accounts", key="bs_group_accounts",
+        "Group accounts", key=report_key("bs_group_accounts"),
         help="Collapse accounts sharing a statement caption.",
     )
     report = ReportGenerator.comparative_balance_sheet(
         client_id, bs_date, group_accounts_bs
     )
     apply_default_on_change(
-        "bs_compare_py", (client_id, bs_date, report['prior_available']),
+        report_key("bs_compare_py"),
+        (client_id, bs_date, report['prior_available']),
         report['prior_available'],
     )
     compare_py = st.toggle(
         "Compare to prior year",
         disabled=not report['prior_available'],
-        key="bs_compare_py",
+        key=report_key("bs_compare_py"),
     )
     if not report['prior_available']:
         st.caption("No prior-year book history is available for this date.")
@@ -411,17 +458,17 @@ elif selected_report == "Balance Sheet":
         )
     )
     apply_default_on_change(
-        "bs_group_subtypes",
+        report_key("bs_group_subtypes"),
         (client_id, bs_date, has_unclassified_bs),
         not has_unclassified_bs,
     )
     group_bs = st.toggle(
         "Group by statement subtype",
-        key="bs_group_subtypes",
+        key=report_key("bs_group_subtypes"),
         help=("Turn this off for the familiar flat statement. Accounts need a "
               "curated subtype before the grouped statement is fully useful."),
     )
-    bs_show_numbers = _numbers_toggle("bs_show_numbers", group_bs)
+    bs_show_numbers = _numbers_toggle(report_key("bs_show_numbers"), group_bs)
     if has_unclassified_bs and not group_bs:
         st.info(
             "This statement is using the classic layout because one or more "
@@ -561,10 +608,13 @@ elif selected_report == "Cash Flow":
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         cf_start = st.date_input(
-            "Start Date", value=current_fy_start, key="cf_start"
+            "Start Date", value=current_fy_start,
+            key=report_key("cf_start")
         )
     with col2:
-        cf_end = st.date_input("End Date", value=date.today(), key="cf_end")
+        cf_end = st.date_input(
+            "End Date", value=date.today(), key=report_key("cf_end")
+        )
 
     if cf_start > cf_end:
         st.error("Cash flow statement start date cannot be after the end date.")
@@ -574,14 +624,14 @@ elif selected_report == "Cash Flow":
         client_id, cf_start, cf_end
     )
     apply_default_on_change(
-        "cf_compare_py",
+        report_key("cf_compare_py"),
         (client_id, cf_start, cf_end, report['prior_available']),
         report['prior_available'],
     )
     compare_py = st.toggle(
         "Compare to prior year",
         disabled=not report['prior_available'],
-        key="cf_compare_py",
+        key=report_key("cf_compare_py"),
     )
     if not report['prior_available']:
         st.caption("No prior-year book history is available for this period.")
@@ -671,6 +721,18 @@ elif selected_report == "Cash Flow":
     for warning in report['current_warnings']:
         st.caption(f"• {warning}")
 
+    if compare_py:
+        if report['prior_ready']:
+            st.success(
+                "Prior-year cash flow is tied, reconciled, and fully classified."
+            )
+        else:
+            st.warning(
+                "Prior-year cash flow has items to review; see its warnings below."
+            )
+        for warning in report['prior_warnings']:
+            st.caption(f"• Prior year: {warning}")
+
     if report['unclassified']['current_entries']:
         with st.expander(
             "Unclassified cash activity details "
@@ -705,6 +767,19 @@ elif selected_report == "Cash Flow":
             f"({len(report['current_noncash_items'])})"
         ):
             for item in report['current_noncash_items']:
+                accounts_text = ", ".join(item['accounts'])
+                st.write(
+                    f"{item['entry_date']} · Entry #{item['entry_id']} · "
+                    f"{item['description'] or 'No description'} · "
+                    f"Accounts {accounts_text} · ${item['amount']:,.2f}"
+                )
+
+    if compare_py and report['prior_noncash_items']:
+        with st.expander(
+            f"Prior-year noncash investing and financing activity "
+            f"({len(report['prior_noncash_items'])})"
+        ):
+            for item in report['prior_noncash_items']:
                 accounts_text = ", ".join(item['accounts'])
                 st.write(
                     f"{item['entry_date']} · Entry #{item['entry_id']} · "
@@ -789,16 +864,21 @@ elif selected_report == "General Ledger":
                 format_func=lambda x: account_options[x],
                 index=default_idx,
                 placeholder="All accounts",
+                key=report_key("gl_account_filter"),
             )
         else:
             st.warning("No accounts available")
             selected_account = None
 
     with col2:
-        gl_start = st.date_input("Start Date", value=default_start, key="gl_start")
+        gl_start = st.date_input(
+            "Start Date", value=default_start, key=report_key("gl_start")
+        )
 
     with col3:
-        gl_end = st.date_input("End Date", value=default_end, key="gl_end")
+        gl_end = st.date_input(
+            "End Date", value=default_end, key=report_key("gl_end")
+        )
 
     if gl_start > gl_end:
         st.error("General ledger start date cannot be after the end date.")
@@ -809,7 +889,7 @@ elif selected_report == "General Ledger":
         value=True,
         help=("Hides an original imported entry and its reversal only when both "
               "are inside this date range. Replacement entries stay visible."),
-        key="gl_hide_reversed_imports",
+        key=report_key("gl_hide_reversed_imports"),
     )
     st.caption(
         "This changes only the on-screen view. Excel downloads always include "
@@ -919,12 +999,21 @@ elif selected_report == "General Ledger":
                     "Open journal entry",
                     options=list(open_options.keys()),
                     format_func=lambda entry_id: open_options[entry_id],
-                    key="gl_open_entry_pick",
+                    key=report_key("gl_open_entry_pick"),
                 )
             with oc2:
                 st.write("")
-                if st.button("Open entry →", width="stretch", key="gl_open_entry"):
-                    st.session_state.edit_entry_id = picked_entry
+                if st.button(
+                    "Open entry →", width="stretch",
+                    key=report_key("gl_open_entry"),
+                ):
+                    set_client_intent(
+                        st.session_state,
+                        "journal",
+                        {"entry_id": picked_entry, "view": "New Entry"},
+                        client_id,
+                        dbconn.DATABASE_PATH,
+                    )
                     st.switch_page("pages/2_Journal_Entries.py")
 
         # Export
