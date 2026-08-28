@@ -389,6 +389,16 @@ def list_staged_imports(client_id: int) -> list:
 
 @server.tool()
 @_mutating
+def sync_bank_feed(client_id: int, bank_account_id: int) -> dict:
+    """Fetch a linked SimpleFIN account and stage new transactions for human
+    review. Nothing posts to the ledger. Needs assistant access level
+    "propose" or higher."""
+    _require_level("propose")
+    return mcp_tools.sync_bank_feed(client_id, bank_account_id)
+
+
+@server.tool()
+@_mutating
 def post_entry(client_id: int, entry_date: str, description: str,
                lines: list, entry_type: str = "Regular") -> dict:
     """POST a balanced journal entry directly to the ledger. Only works at
