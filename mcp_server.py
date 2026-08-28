@@ -357,6 +357,18 @@ def propose_correction(client_id: int, original_entry_id: int,
 
 
 @server.tool()
+@_mutating
+def propose_depreciation_run(client_id: int, fixed_asset_id: int,
+                             period_end: str, rationale: str = "") -> dict:
+    """File a reviewable depreciation draft. This never posts depreciation;
+    a person must review it in LedgerTB. Needs access level "propose"."""
+    _require_level("propose")
+    return mcp_tools.propose_depreciation_run(
+        client_id, fixed_asset_id, period_end, rationale
+    )
+
+
+@server.tool()
 def list_drafts(client_id: int, status: str = "pending") -> list:
     """Draft entries this server has filed and their review status
     ("pending", "approved", "rejected", or "all")."""
