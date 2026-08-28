@@ -2,6 +2,7 @@
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date
+from decimal import Decimal
 from io import BytesIO
 
 import openpyxl
@@ -16,14 +17,36 @@ from models.journal_entry import JournalEntry, JournalEntryLine
 from services.close_package import (
     build_close_package,
     build_close_package_pdf,
+    canonicalize_close_package_snapshot,
+    close_package_snapshot_hash,
     get_cash_activity,
     get_period_transactions,
     load_close_package_snapshot,
+    recompute_document_audit,
 )
 from tests.conftest import post_entry
 
 
 Q1 = (date(2026, 1, 1), date(2026, 3, 31))
+
+
+def test_snapshot_hash_is_deterministic_and_canonicalizes_amounts_and_dates():
+    first = {
+        "date": date(2026, 3, 31),
+        "amounts": [Decimal("12.3400"), 12.34, -0.0],
+        "nested": {"b": 2, "a": 1},
+    }
+    second = {
+        "nested": {"a": 1, "b": 2},
+        "amounts": [Decimal("12.34"), 12.3400, Decimal("0.000")],
+        "date": date(2026, 3, 31),
+    }
+
+    assert canonicalize_close_package_snapshot(first) == (
+        b'{"amounts":["12.34","12.34","0"],"date":"2026-03-31",'
+        b'"nested":{"a":1,"b":2}}'
+    )
+    assert close_package_snapshot_hash(first) == close_package_snapshot_hash(second)
 
 
 @pytest.fixture
@@ -640,8 +663,55 @@ def test_pdf_package_contains_every_section(booked_period, accounts):
         assert "CASH AT BEGINNING OF PERIOD" in text
         assert "TOTALS" in text
         assert len(doc) >= 6
+        assert "Snapshot ID:" in text
+        assert "Document Audits, ID" in text
     finally:
         doc.close()
+
+
+def test_failed_pdf_render_rolls_back_document_and_export_audits(
+    booked_period, accounts, monkeypatch
+):
+    import services.close_package as close_package
+
+    tb_rows, _ = ReportGenerator.trial_balance_worksheet(booked_period, *Q1)
+
+    def failed_render(*args, **kwargs):
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(close_package.SimpleDocTemplate, "build", failed_render)
+    with pytest.raises(RuntimeError, match="render failed"):
+        build_close_package_pdf(booked_period, "Test Co", *Q1, tb_rows)
+
+    from database.connection import get_connection
+    conn = get_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM document_audits").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE table_name = 'document_audits'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_recompute_document_audit_reports_current_snapshot_match(
+    booked_period, accounts
+):
+    tb_rows, _ = ReportGenerator.trial_balance_worksheet(booked_period, *Q1)
+    build_close_package_pdf(booked_period, "Test Co", *Q1, tb_rows)
+
+    from database.connection import get_connection
+    conn = get_connection()
+    try:
+        document_audit_id = conn.execute(
+            "SELECT id FROM document_audits"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    result = recompute_document_audit(document_audit_id)
+    assert result["matches"] is True
+    assert result["stored_hash"] == result["recomputed_hash"]
 
 
 def test_snapshot_reuses_current_cash_flow_when_building_comparison(

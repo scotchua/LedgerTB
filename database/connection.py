@@ -70,16 +70,18 @@ _AUTH_INSERT = getattr(_driver, "SQLITE_INSERT", 18)
 # up so every assistant write is recorded. Nothing is UPDATE- or DELETE-able
 # at any assistant level; draft resolution belongs to the human app process.
 _ASSISTANT_INSERT_TABLES = {
-    # audit_log at every level: even a read-level assistant's actions that
-    # matter (file exports) get recorded, and the log is append-only anyway.
-    "read": frozenset({"audit_log"}),
+    # Export audit rows at every level: even a read-level assistant's file
+    # exports get recorded, and both tables are append-only anyway.
+    "read": frozenset({"audit_log", "document_audits"}),
     # clients/accounts at propose+: an assistant may scaffold a new client
     # and its chart (setup, not ledger); it still cannot alter either later
     # (no UPDATE/DELETE at any level).
     "propose": frozenset({"draft_entries", "imported_transactions", "audit_log",
+                          "document_audits",
                           "clients", "accounts", "close_review_proposals",
                           "client_branding_proposals"}),
     "post": frozenset({"draft_entries", "imported_transactions", "audit_log",
+                       "document_audits",
                        "clients", "accounts", "close_review_proposals",
                        "client_branding_proposals",
                        "journal_entries", "journal_entry_lines"}),
