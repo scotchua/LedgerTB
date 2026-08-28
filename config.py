@@ -86,8 +86,16 @@ def _read_saved_api_key() -> str:
     )
 
 
+def _read_openai_api_key() -> str:
+    from utils.secure_store import get_secret
+    return get_secret("openai_api_key") or ""
+
+
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "") or _read_saved_api_key()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "") or _read_openai_api_key()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+AI_PROVIDER = app_env("AI_PROVIDER", "anthropic")
 
 # Application settings
 APP_NAME = "LedgerTB"

@@ -1,8 +1,14 @@
 from typing import List, Dict, Optional
-from anthropic import Anthropic
-from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from config import (
+    AI_PROVIDER,
+    ANTHROPIC_API_KEY,
+    ANTHROPIC_MODEL,
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
+)
 from constants import DEFAULT_MISC_EXPENSE_ACCOUNT, DEFAULT_OTHER_INCOME_ACCOUNT
 from models.account import Account
+from services.ai_providers import ProviderSpec, create_request, get_provider
 from utils.untrusted import flatten_untrusted, untrusted_block
 
 
@@ -46,12 +52,29 @@ _CATEGORIZE_TOOL = {
 
 
 class CategorizationService:
-    """Uses Claude API to suggest account categorizations for transactions."""
+    """Uses the selected AI provider to suggest transaction categorizations."""
 
     def __init__(self):
         self.client = None
-        if ANTHROPIC_API_KEY:
-            self.client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.configuration_error = None
+        try:
+            registered = get_provider(AI_PROVIDER)
+            model = ANTHROPIC_MODEL if registered.name == "anthropic" else OPENAI_MODEL
+            self.provider = ProviderSpec(
+                registered.name, registered.wire_format, registered.base_url, model
+            )
+            api_key = (
+                ANTHROPIC_API_KEY if registered.name == "anthropic" else OPENAI_API_KEY
+            )
+            if not api_key:
+                raise ValueError(
+                    f"No API key is configured for selected AI provider "
+                    f"{registered.name!r}."
+                )
+            self.api_key = api_key
+            self.client = True
+        except ValueError as exc:
+            self.configuration_error = str(exc)
         # Result state from the most recent run (always present so callers never
         # read a stale value or hit a missing attribute).
         self.last_matched = 0
@@ -81,6 +104,7 @@ class CategorizationService:
             List of dicts with added 'suggested_account_id' and 'confidence'
         """
         if not self.is_available():
+            self.last_error = self.configuration_error
             return transactions
 
         # Process in batches to avoid response truncation
@@ -166,19 +190,12 @@ For each transaction, determine the most appropriate expense or revenue account.
 Call the categorize_transactions tool with a suggestion for every transaction listed above."""
 
         try:
-            response = self.client.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=4000,
-                tools=[_CATEGORIZE_TOOL],
-                tool_choice={"type": "tool", "name": "categorize_transactions"},
-                messages=[{"role": "user", "content": prompt}]
+            request = create_request(
+                self.provider, self.api_key, _CATEGORIZE_TOOL, prompt
             )
-
-            tool_use = next((b for b in response.content if b.type == "tool_use"), None)
-            if tool_use is None:
-                raise ValueError("Model response did not include a categorize_transactions tool call")
-
-            suggestions = tool_use.input.get("suggestions", [])
+            if self.client is not True:
+                request.client = self.client
+            suggestions = request.send()
             matched_count, unmatched_accounts = self._apply_suggestions(
                 transactions, suggestions, accounts
             )

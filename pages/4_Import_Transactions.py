@@ -31,7 +31,7 @@ from services.import_batch_reversal import (
 from services.document_import import (
     extract_document, parse_statement_text, parse_statement_with_ai,
 )
-from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from config import AI_PROVIDER, ANTHROPIC_API_KEY, ANTHROPIC_MODEL
 from constants import AccountSubtype
 from database import init_database
 from database import connection as dbconn
@@ -1743,15 +1743,15 @@ elif selected_tab == "Review & Categorize":
                 with col2:
                     st.caption(
                         "Sends transaction dates, descriptions, amounts, and the "
-                        "available account names/numbers to Anthropic. Suggestions "
-                        "only; nothing posts automatically."
+                        f"available account names/numbers to {AI_PROVIDER.title()}. "
+                        "Suggestions only; nothing posts automatically."
                     )
             else:
                 st.success("All transactions have been categorized!")
         else:
             # Configuration lives on Firm Settings with the rest of the
             # firm-level setup; this workflow page only points there.
-            st.caption("AI categorization is off — add your Anthropic API key "
+            st.caption(f"AI categorization is off — add your {AI_PROVIDER.title()} API key "
                        "on the Firm Settings page to enable suggestions here.")
             st.page_link("pages/12_Firm_Settings.py",
                          label="Set up AI categorization", icon=icons.FIRM)
@@ -2160,7 +2160,10 @@ elif selected_tab == "Review & Categorize":
 
         with col3:
             if not categorization_service.is_available():
-                st.caption("AI categorization unavailable — set ANTHROPIC_API_KEY")
+                st.caption(
+                    f"AI categorization unavailable — configure {AI_PROVIDER.title()} "
+                    "on Firm Settings"
+                )
 
 elif selected_tab == "Import History":
     st.subheader("Import History")
