@@ -84,6 +84,7 @@ with n1:
 with n2:
     st.page_link("pages/4_Import_Transactions.py", label="Import Transactions", icon=icons.IMPORT)
     st.page_link("pages/10_Bank_Reconciliation.py", label="Bank Reconciliation", icon=icons.RECONCILIATION)
+    st.page_link("pages/18_Bank_Feeds.py", label="Bank Feeds", icon=icons.IMPORT)
     st.page_link("pages/3_Chart_of_Accounts.py", label="Chart of Accounts", icon=icons.CHART_OF_ACCOUNTS)
 with n3:
     st.page_link("pages/5_Reports.py", label="Reports", icon=icons.REPORTS)

@@ -854,6 +854,24 @@ def list_staged_imports(client_id: int) -> list:
 
 
 @mutating
+def sync_bank_feed(client_id: int, bank_account_id: int) -> dict:
+    """Stage a linked SimpleFIN account's new rows for human review."""
+    from services.bank_feed import sync_bank_feed as _sync_bank_feed
+
+    _require_client(client_id)
+    account = Account.get_by_id(bank_account_id, client_id)
+    if account is None or account.type not in ("Asset", "Liability"):
+        raise ValueError("Choose a bank or credit-card account for this client.")
+    staged = _sync_bank_feed(client_id, bank_account_id)
+    return {
+        "staged": len(staged),
+        "rows": staged,
+        "note": ("Staged for human review in Import Transactions. Nothing "
+                 "was posted to the ledger."),
+    }
+
+
+@mutating
 def post_entry(client_id: int, entry_date: str, description: str,
                lines: list, entry_type: str = "Regular") -> dict:
     """POST a balanced journal entry directly (assistant access level "post"
