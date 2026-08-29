@@ -139,6 +139,8 @@ def _canonical_snapshot_value(value):
         if not math.isfinite(value):
             raise ValueError("Snapshot amounts must be finite")
         return _fixed_number(value)
+    if isinstance(value, (bytes, bytearray)):
+        return {"__bytes_sha256__": sha256(value).hexdigest()}
     return value
 
 
