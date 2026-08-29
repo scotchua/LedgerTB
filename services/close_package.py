@@ -6,11 +6,15 @@ Statement, Balance Sheet, final Trial Balance (with the worksheet columns),
 Transactions (every journal line in the period), Adjusting Entries, and
 Receipts & Disbursements per cash account.
 """
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from contextlib import contextmanager
 from datetime import date, datetime
+from decimal import Decimal
+from hashlib import sha256
 from html import unescape
 from io import BytesIO
+import json
+import math
 from typing import Dict, List, Optional
 
 import openpyxl
@@ -35,6 +39,7 @@ from reportlab.platypus import (
 from database import connection as dbconn
 from constants import AccountSubtype
 from database.connection import get_connection, get_cursor
+from models.audit_log import AuditLog
 from models.reports import ReportGenerator, TrialBalanceWorksheetRow
 from money import to_dollars
 from services.branding import (
@@ -101,6 +106,121 @@ class ClosePackageSnapshot:
     client_branding: ClientBranding
     branding: FirmBranding
     generated_at: datetime
+
+
+SNAPSHOT_CANONICALIZATION_VERSION = 1
+
+
+def _fixed_number(value) -> str:
+    decimal_value = value if isinstance(value, Decimal) else Decimal(str(value))
+    if not decimal_value.is_finite():
+        raise ValueError("Snapshot amounts must be finite")
+    text = format(decimal_value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
+
+
+def _canonical_snapshot_value(value):
+    if is_dataclass(value):
+        value = asdict(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_snapshot_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_snapshot_value(item) for item in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return _fixed_number(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Snapshot amounts must be finite")
+        return _fixed_number(value)
+    return value
+
+
+def close_package_snapshot_payload(
+    client_id: int,
+    client_name: str,
+    period_start: date,
+    period_end: date,
+    tb_rows: List[TrialBalanceWorksheetRow],
+    snapshot: ClosePackageSnapshot,
+) -> Dict:
+    """Return the exact source-data snapshot represented by a close package."""
+    return {
+        "client_id": client_id,
+        "client_name": client_name,
+        "period_start": period_start,
+        "period_end": period_end,
+        "trial_balance": tb_rows,
+        "close_package": {
+            key: value for key, value in asdict(snapshot).items()
+            if key != "generated_at"
+        },
+    }
+
+
+def canonicalize_close_package_snapshot(payload: Dict) -> bytes:
+    """Canonicalize a close-package source snapshot for SHA-256 hashing."""
+    # Version 1 sorts JSON keys, emits compact UTF-8 JSON, writes dates as ISO
+    # 8601, and writes Decimal/float amounts as fixed, non-exponent strings.
+    normalized = _canonical_snapshot_value(payload)
+    return json.dumps(
+        normalized, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+
+
+def close_package_snapshot_hash(payload: Dict) -> str:
+    return sha256(canonicalize_close_package_snapshot(payload)).hexdigest()
+
+
+def recompute_document_audit(document_audit_id: int) -> Dict:
+    """Recompute a close-package snapshot hash from current ledger data.
+
+    A mismatch after a legitimate later ledger correction is expected and is
+    not an error: it shows that current data differs from the exported snapshot.
+    """
+    with get_cursor() as cursor:
+        row = cursor.execute(
+            "SELECT * FROM document_audits WHERE id = ?", (document_audit_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Document audit {document_audit_id} does not exist")
+        client = cursor.execute(
+            "SELECT name FROM clients WHERE id = ?", (row["client_id"],)
+        ).fetchone()
+    if row["doc_type"] != "close_package":
+        raise ValueError(f"Unsupported document type: {row['doc_type']}")
+    if row["canonicalization_version"] != SNAPSHOT_CANONICALIZATION_VERSION:
+        raise ValueError(
+            "Unsupported snapshot canonicalization version: "
+            f"{row['canonicalization_version']}"
+        )
+    try:
+        stored_client_id, period_start, period_end = row["doc_key"].split(":", 2)
+    except ValueError as exc:
+        raise ValueError(f"Invalid close-package document key: {row['doc_key']}") from exc
+    if stored_client_id != str(row["client_id"]):
+        raise ValueError("Document audit client does not match its document key")
+    start = date.fromisoformat(period_start)
+    end = date.fromisoformat(period_end)
+    tb_rows, _ = ReportGenerator.trial_balance_worksheet(
+        row["client_id"], start, end
+    )
+    snapshot = load_close_package_snapshot(row["client_id"], start, end)
+    recomputed_hash = close_package_snapshot_hash(close_package_snapshot_payload(
+        row["client_id"], client["name"], start, end, tb_rows, snapshot
+    ))
+    return {
+        "document_audit_id": document_audit_id,
+        "stored_hash": row["content_hash"],
+        "recomputed_hash": recomputed_hash,
+        "matches": recomputed_hash == row["content_hash"],
+    }
 
 
 def get_period_transactions(client_id: int, period_start: date, period_end: date) -> List[dict]:
@@ -1083,6 +1203,10 @@ def build_close_package_pdf(
     comparative_tb = snapshot.comparative_trial_balance
     close_map = snapshot.close_map
     period_label = f"{long_date(period_start)} to {long_date(period_end)}"
+    snapshot_payload = close_package_snapshot_payload(
+        client_id, client_name, period_start, period_end, tb_rows, snapshot
+    )
+    content_hash = close_package_snapshot_hash(snapshot_payload)
 
     client_branding = snapshot.client_branding
     firm_branding = snapshot.branding
@@ -1107,6 +1231,8 @@ def build_close_package_pdf(
     if firm_branding.firm_name:
         footer_left = f"{footer_left} · Prepared by {firm_branding.firm_name}"
 
+    document_audit_id = None
+
     def _footer(canvas, _doc):
         canvas.saveState()
         canvas.setFont("Helvetica", 7.5)
@@ -1114,6 +1240,13 @@ def build_close_package_pdf(
         canvas.drawString(0.5 * inch, 0.3 * inch, footer_left)
         canvas.drawRightString(
             doc.pagesize[0] - 0.5 * inch, 0.3 * inch, f"Page {canvas.getPageNumber()}"
+        )
+        canvas.setFont("Helvetica", 6.5)
+        canvas.drawCentredString(
+            doc.pagesize[0] / 2,
+            0.18 * inch,
+            f"Snapshot ID: {content_hash[:16]} · Full verification hash and "
+            f"audit record: see Document Audits, ID {document_audit_id}",
         )
         canvas.restoreState()
 
@@ -1527,6 +1660,45 @@ def build_close_package_pdf(
     else:
         story.append(Paragraph("No adjusting entries in this period.", _PDF_BODY))
 
-    doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        doc_key = f"{client_id}:{period_start.isoformat()}:{period_end.isoformat()}"
+        audit_log_id = AuditLog.write(
+            cursor, client_id, "document_audits", 0, "EXPORT",
+            new_values={
+                "doc_type": "close_package",
+                "doc_key": doc_key,
+                "content_hash": content_hash,
+                "canonicalization_version": SNAPSHOT_CANONICALIZATION_VERSION,
+            },
+        )
+        cursor.execute(
+            """
+            INSERT INTO document_audits
+                (client_id, doc_type, doc_key, content_hash,
+                 canonicalization_version, audit_log_id)
+            VALUES (?, 'close_package', ?, ?, ?, ?)
+            """,
+            (
+                client_id, doc_key, content_hash,
+                SNAPSHOT_CANONICALIZATION_VERSION, audit_log_id,
+            ),
+        )
+        document_audit_id = cursor.lastrowid
+        cursor.execute(
+            "UPDATE audit_log SET record_id = ? WHERE id = ?",
+            (document_audit_id, audit_log_id),
+        )
+        # Keep both rows uncommitted through final rendering. A render failure
+        # rolls back the export event and document audit together. Committing
+        # after BytesIO rendering means every recorded PDF was fully produced.
+        doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     buffer.seek(0)
     return buffer
