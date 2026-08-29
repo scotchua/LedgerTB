@@ -8,7 +8,12 @@ file upload and the actual inserts.
 import csv
 import io
 
+from rapidfuzz import fuzz
+
 from constants import AccountSubtype, AccountType
+
+
+SIMILAR_ACCOUNT_THRESHOLD = 0.85
 
 # Recognized spellings for each column we care about.
 _HEADER_ALIASES = {
@@ -70,6 +75,31 @@ _TYPE_ALIASES = {
 
 def _norm(s):
     return (s or "").strip().lower()
+
+
+def suggest_similar_accounts(
+    new_account_name, existing_account_names,
+    threshold=SIMILAR_ACCOUNT_THRESHOLD,
+):
+    """Return similar existing account names as ``(name, score)`` pairs.
+
+    This is suggestion-only: callers decide how to display and act on the
+    candidates. Scores are normalized to the 0..1 range and sorted highest
+    first.
+    """
+    normalized_new_name = _norm(new_account_name)
+    if not normalized_new_name:
+        return []
+
+    suggestions = []
+    for existing_name in existing_account_names:
+        normalized_existing_name = _norm(existing_name)
+        if not normalized_existing_name:
+            continue
+        score = fuzz.WRatio(normalized_new_name, normalized_existing_name) / 100
+        if score >= threshold:
+            suggestions.append((existing_name, score))
+    return sorted(suggestions, key=lambda candidate: candidate[1], reverse=True)
 
 
 def _map_headers(fieldnames):

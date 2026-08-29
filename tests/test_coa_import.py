@@ -1,6 +1,32 @@
 """Tests for the chart-of-accounts CSV parser (services/coa_import.py)."""
 
-from services.coa_import import parse_coa_csv, normalize_type
+from services.coa_import import (
+    SIMILAR_ACCOUNT_THRESHOLD,
+    normalize_type,
+    parse_coa_csv,
+    suggest_similar_accounts,
+)
+
+
+def test_similar_account_suggestions_flag_near_duplicate_not_dissimilar():
+    suggestions = suggest_similar_accounts(
+        "  ACCOUNTS RECEIVABLE - TRADE  ",
+        ["Accounts Receivable", "Office Supplies"],
+    )
+
+    assert SIMILAR_ACCOUNT_THRESHOLD == 0.85
+    assert [name for name, _score in suggestions] == ["Accounts Receivable"]
+    assert suggestions[0][1] >= SIMILAR_ACCOUNT_THRESHOLD
+
+
+def test_similar_account_suggestions_are_sorted_and_do_not_mutate_inputs():
+    existing = ["Trade Receivables", "Accounts Receivable"]
+    before = list(existing)
+
+    suggestions = suggest_similar_accounts("Accounts Receivable", existing)
+
+    assert existing == before
+    assert suggestions == sorted(suggestions, key=lambda item: item[1], reverse=True)
 
 
 def test_parses_basic_csv():
