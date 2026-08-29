@@ -919,6 +919,7 @@ def export_close_package(client_id: int, period_start: str, period_end: str,
         build_close_package_pdf,
         consistent_export_window,
         load_close_package_snapshot,
+        write_close_package_audit,
     )
 
     client = _require_client(client_id)
@@ -968,12 +969,11 @@ def export_close_package(client_id: int, period_start: str, period_end: str,
     with consistent_export_window():
         tb_rows, _ = ReportGenerator.trial_balance_worksheet(client_id, start, end)
         snapshot = load_close_package_snapshot(client_id, start, end)
-        _write_private(
-            pdf_path,
-            build_close_package_pdf(
-                client_id, client.name, start, end, tb_rows, snapshot=snapshot
-            ).read(),
+        pdf, document_audit = build_close_package_pdf(
+            client_id, client.name, start, end, tb_rows, snapshot=snapshot,
+            defer_audit=True,
         )
+        _write_private(pdf_path, pdf.read())
         _write_private(
             xlsx_path,
             build_close_package(
@@ -981,6 +981,7 @@ def export_close_package(client_id: int, period_start: str, period_end: str,
             ).read(),
         )
 
+    write_close_package_audit(document_audit)
     AuditLog.log_event(client_id, "EXPORT", "close_package_mcp", {
         "start_date": start, "end_date": end,
         "pdf": pdf_path.name, "xlsx": xlsx_path.name, "directory": str(target),
