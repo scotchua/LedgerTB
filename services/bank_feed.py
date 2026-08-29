@@ -169,11 +169,18 @@ def list_bank_connections(client_id: int) -> list[dict]:
     with get_cursor() as cursor:
         cursor.execute(
             """SELECT bc.id, bc.client_id, bc.bank_account_id, bc.provider,
-                      bc.last_synced_at, bc.sync_window_start, bc.created_at,
+                      bcs.synced_at AS last_synced_at,
+                      bcs.sync_window_start, bc.created_at,
                       a.account_number, a.name AS account_name
                FROM bank_connections bc
                JOIN accounts a ON a.id = bc.bank_account_id
                               AND a.client_id = bc.client_id
+               LEFT JOIN bank_connection_syncs bcs
+                      ON bcs.id = (
+                          SELECT MAX(latest.id)
+                          FROM bank_connection_syncs latest
+                          WHERE latest.connection_id = bc.id
+                      )
                WHERE bc.client_id = ? ORDER BY bc.id""",
             (client_id,),
         )
@@ -183,8 +190,19 @@ def list_bank_connections(client_id: int) -> list[dict]:
 def _connection(client_id: int, bank_account_id: int):
     with get_cursor() as cursor:
         cursor.execute(
-            """SELECT * FROM bank_connections
-               WHERE client_id = ? AND bank_account_id = ? AND provider = ?""",
+            """SELECT bc.id, bc.client_id, bc.bank_account_id, bc.provider,
+                      bc.secret_name, bc.created_at,
+                      bcs.synced_at AS last_synced_at,
+                      bcs.sync_window_start AS sync_window_start
+               FROM bank_connections bc
+               LEFT JOIN bank_connection_syncs bcs
+                      ON bcs.id = (
+                          SELECT MAX(latest.id)
+                          FROM bank_connection_syncs latest
+                          WHERE latest.connection_id = bc.id
+                      )
+               WHERE bc.client_id = ? AND bc.bank_account_id = ?
+                 AND bc.provider = ?""",
             (client_id, bank_account_id, PROVIDER),
         )
         row = cursor.fetchone()
@@ -341,22 +359,16 @@ def sync_bank_feed(client_id: int, bank_account_id: int) -> list[dict]:
 
         synced_at = now.isoformat(timespec="seconds")
         cursor.execute(
-            """UPDATE bank_connections
-               SET last_synced_at = ?, sync_window_start = ?
-               WHERE id = ? AND client_id = ?""",
-            (synced_at, start.isoformat(), connection["id"], client_id),
+            """INSERT INTO bank_connection_syncs
+               (connection_id, synced_at, sync_window_start)
+               VALUES (?, ?, ?)""",
+            (connection["id"], synced_at, start.isoformat()),
         )
-        if cursor.rowcount != 1:
-            raise BankFeedError(
-                f"Connection {connection['id']} changed during synchronization."
-            )
+        sync_id = cursor.lastrowid
         AuditLog.write(
-            cursor, client_id, "bank_connections", connection["id"], "UPDATE",
-            old_values={
-                "last_synced_at": connection["last_synced_at"],
-                "sync_window_start": connection["sync_window_start"],
-            },
+            cursor, client_id, "bank_connection_syncs", sync_id, "INSERT",
             new_values={
+                "connection_id": connection["id"],
                 "last_synced_at": synced_at,
                 "sync_window_start": start.isoformat(),
                 "staged_count": len(staged),
