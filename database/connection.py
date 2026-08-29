@@ -66,10 +66,8 @@ _AUTH_ALLOWED_ACTIONS = {
     )
 }
 _AUTH_INSERT = getattr(_driver, "SQLITE_INSERT", 18)
-_AUTH_UPDATE = getattr(_driver, "SQLITE_UPDATE", 23)
 # INSERT surface per level (cumulative). audit_log rides along from "propose"
-# up so every assistant write is recorded. The authorizer below separately
-# permits only the bank-feed watermark UPDATE; ledger history stays append-only.
+# up so every assistant write is recorded.
 _ASSISTANT_INSERT_TABLES = {
     # Export audit rows at every level: even a read-level assistant's file
     # exports get recorded, and both tables are append-only anyway.
@@ -80,11 +78,13 @@ _ASSISTANT_INSERT_TABLES = {
     "propose": frozenset({"draft_entries", "imported_transactions", "audit_log",
                           "document_audits",
                           "clients", "accounts", "close_review_proposals",
-                          "client_branding_proposals", "bank_connections"}),
+                          "client_branding_proposals", "bank_connections",
+                          "bank_connection_syncs"}),
     "post": frozenset({"draft_entries", "imported_transactions", "audit_log",
                        "document_audits",
                        "clients", "accounts", "close_review_proposals",
                        "client_branding_proposals", "bank_connections",
+                       "bank_connection_syncs",
                        "journal_entries", "journal_entry_lines"}),
 }
 
@@ -94,10 +94,6 @@ def _assistant_authorizer(action, arg1, arg2, dbname, source):
     if action in _AUTH_ALLOWED_ACTIONS:
         return _AUTH_OK
     if action == _AUTH_INSERT and arg1 in _ASSISTANT_INSERT_TABLES[level]:
-        return _AUTH_OK
-    # A feed sync at propose level advances only its own non-ledger watermark.
-    # Ledger and proposal history remain append-only for assistants.
-    if action == _AUTH_UPDATE and arg1 == "bank_connections" and level != "read":
         return _AUTH_OK
     return _AUTH_DENY
 

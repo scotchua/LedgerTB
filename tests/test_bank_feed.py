@@ -4,9 +4,12 @@ from datetime import datetime, timedelta
 
 import httpx
 import pytest
+from streamlit.testing.v1 import AppTest
 
+from database import connection as dbconn
 from database.connection import get_cursor
-from services import bank_feed
+from services import bank_feed, mcp_tools
+from tests.conftest import page_path
 
 
 PUBLIC_IP = "93.184.216.34"
@@ -134,8 +137,10 @@ def test_second_sync_overlap_deduplicates_remote_transaction(
     )
     with get_cursor(commit=True) as cursor:
         cursor.execute(
-            "UPDATE bank_connections SET last_synced_at = ? WHERE id = ?",
-            (prior_watermark, connection_id),
+            """INSERT INTO bank_connection_syncs
+               (connection_id, synced_at, sync_window_start)
+               VALUES (?, ?, ?)""",
+            (connection_id, prior_watermark, starts[0]),
         )
 
     assert bank_feed.sync_bank_feed(client_id, accounts["cash"]) == []
@@ -162,7 +167,7 @@ def test_sync_failure_rolls_back_staged_rows_watermark_and_audits(
     real_write = bank_feed.AuditLog.write
 
     def fail_watermark(cursor, client_id, table_name, record_id, action, **kwargs):
-        if table_name == "bank_connections" and action == "UPDATE":
+        if table_name == "bank_connection_syncs" and action == "INSERT":
             raise RuntimeError("simulated mid-sync failure")
         return real_write(
             cursor, client_id, table_name, record_id, action, **kwargs,
@@ -174,12 +179,11 @@ def test_sync_failure_rolls_back_staged_rows_watermark_and_audits(
 
     with get_cursor() as cursor:
         cursor.execute(
-            "SELECT last_synced_at, sync_window_start FROM bank_connections WHERE id = ?",
+            """SELECT synced_at, sync_window_start
+               FROM bank_connection_syncs WHERE connection_id = ?""",
             (connection_id,),
         )
-        connection = cursor.fetchone()
-        assert connection["last_synced_at"] is None
-        assert connection["sync_window_start"] is None
+        assert cursor.fetchone() is None
         cursor.execute(
             "SELECT COUNT(*) FROM imported_transactions WHERE client_id = ?",
             (client_id,),
@@ -187,9 +191,97 @@ def test_sync_failure_rolls_back_staged_rows_watermark_and_audits(
         assert cursor.fetchone()[0] == 0
         cursor.execute(
             "SELECT COUNT(*) FROM audit_log WHERE table_name IN "
-            "('bank_connections', 'imported_transactions')",
+            "('bank_connection_syncs', 'imported_transactions')",
         )
         assert cursor.fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("level", ["propose", "post"])
+def test_assistant_sync_records_and_reads_watermark(
+    client_id, accounts, fake_credential_vault, monkeypatch, level,
+):
+    _link(client_id, accounts["cash"], fake_credential_vault)
+    _public_dns(monkeypatch)
+    monkeypatch.setattr(
+        bank_feed.httpx, "request",
+        lambda *args, **kwargs: Response(payload=_payload()),
+    )
+    monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", level)
+
+    result = mcp_tools.sync_bank_feed(client_id, accounts["cash"])
+    assert result["staged"] == 1
+
+    connections = bank_feed.list_bank_connections(client_id)
+    assert len(connections) == 1
+    assert connections[0]["last_synced_at"] is not None
+    assert connections[0]["sync_window_start"] is not None
+
+
+def test_connection_list_reports_fresh_and_synced_watermarks(
+    client_id, accounts, fake_credential_vault, monkeypatch,
+):
+    _link(client_id, accounts["cash"], fake_credential_vault)
+    assert bank_feed.list_bank_connections(client_id)[0]["last_synced_at"] is None
+
+    _public_dns(monkeypatch)
+    monkeypatch.setattr(
+        bank_feed.httpx, "request",
+        lambda *args, **kwargs: Response(payload=_payload()),
+    )
+    bank_feed.sync_bank_feed(client_id, accounts["cash"])
+
+    connection = bank_feed.list_bank_connections(client_id)[0]
+    assert connection["last_synced_at"] is not None
+    assert connection["sync_window_start"] is not None
+
+
+def test_bank_feed_page_displays_fresh_and_synced_watermarks(
+    client_id, accounts, fake_credential_vault, monkeypatch,
+):
+    _link(client_id, accounts["cash"], fake_credential_vault)
+    import utils.client_selector as selector
+
+    monkeypatch.setattr(selector, "render_client_selector", lambda: client_id)
+    fresh = AppTest.from_file(
+        page_path("pages/18_Bank_Feeds.py"), default_timeout=30,
+    ).run()
+    assert not fresh.exception
+    assert any(caption.value == "Last synced: Never" for caption in fresh.caption)
+
+    synced_at = "2026-08-28T05:50:58-07:00"
+    with get_cursor(commit=True) as cursor:
+        cursor.execute(
+            """INSERT INTO bank_connection_syncs
+               (connection_id, synced_at, sync_window_start)
+               SELECT id, ?, '2026-08-21' FROM bank_connections
+               WHERE client_id = ? AND bank_account_id = ?""",
+            (synced_at, client_id, accounts["cash"]),
+        )
+
+    synced = AppTest.from_file(
+        page_path("pages/18_Bank_Feeds.py"), default_timeout=30,
+    ).run()
+    assert not synced.exception
+    assert any(
+        caption.value == f"Last synced: {synced_at}"
+        for caption in synced.caption
+    )
+
+
+def test_start_date_uses_first_sync_window():
+    now = datetime(2026, 8, 28, 12, 0).astimezone()
+    assert bank_feed._start_date({"last_synced_at": None}, now) == (
+        now.date() - timedelta(days=bank_feed.FIRST_SYNC_DAYS)
+    )
+
+
+def test_start_date_uses_incremental_overlap():
+    now = datetime(2026, 8, 28, 12, 0).astimezone()
+    last_synced = "2026-08-27T09:30:00-07:00"
+    assert bank_feed._start_date({"last_synced_at": last_synced}, now) == (
+        datetime.fromisoformat(last_synced).date()
+        - timedelta(days=bank_feed.OVERLAP_DAYS)
+    )
 
 
 def test_connection_and_sync_audits_contain_no_credentials(
