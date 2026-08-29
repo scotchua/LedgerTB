@@ -197,6 +197,7 @@ def render_client_selector() -> Optional[int]:
             pass  # pre-migration database: no drafts table yet
         st.sidebar.page_link("pages/2_Journal_Entries.py", label=je_label, icon=icons.JOURNAL_ENTRIES)
         st.sidebar.page_link("pages/3_Chart_of_Accounts.py", label="Chart of Accounts", icon=icons.CHART_OF_ACCOUNTS)
+        st.sidebar.page_link("pages/19_Fixed_Assets.py", label="Fixed Assets", icon=icons.FIXED_ASSETS)
 
         # Import with pending badge
         import_label = "Import Transactions"

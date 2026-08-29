@@ -695,6 +695,20 @@ def propose_correction(client_id: int, original_entry_id: int,
     )
 
 
+@mutating
+def propose_depreciation_run(client_id: int, fixed_asset_id: int,
+                             period_end: str, rationale: str = "") -> dict:
+    """File a depreciation draft for human review without posting it."""
+    from models.fixed_asset import FixedAsset
+    from services.fixed_assets import propose_depreciation_run as _propose
+
+    _require_client(client_id)
+    asset = FixedAsset.get_by_id(fixed_asset_id, client_id)
+    if asset is None:
+        raise ValueError("Fixed asset not found for this client.")
+    return _propose(asset.id, _parse_date(period_end, "period_end"), rationale)
+
+
 def list_drafts(client_id: int, status: str = "pending") -> list:
     """Draft entries and their review status ('pending', or any status via
     'all')."""
