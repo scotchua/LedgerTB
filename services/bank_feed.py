@@ -95,6 +95,10 @@ def _response_text(response) -> str:
         content = response.content
     except (AttributeError, httpx.HTTPError) as exc:
         raise BankFeedError("SimpleFIN returned an unreadable response.") from exc
+    try:
+        return content.decode(response.encoding or "utf-8").strip()
+    except (LookupError, UnicodeDecodeError) as exc:
+        raise BankFeedError("SimpleFIN returned an unreadable response.") from exc
 
 
 def _response_json(response):
@@ -106,10 +110,6 @@ def _response_json(response):
         return json.loads(content)
     except (UnicodeDecodeError, ValueError) as exc:
         raise BankFeedError("SimpleFIN returned unreadable data.") from exc
-    try:
-        return content.decode(response.encoding or "utf-8").strip()
-    except (LookupError, UnicodeDecodeError) as exc:
-        raise BankFeedError("SimpleFIN returned an unreadable response.") from exc
 
 
 def claim_simplefin_token(setup_token: str) -> str:
