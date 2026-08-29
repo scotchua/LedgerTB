@@ -228,22 +228,37 @@ else:
 st.divider()
 st.subheader("AI categorization")
 st.caption(
-    "Powered by your own Anthropic API key, stored in the system credential "
+    "Powered by your own AI provider API key, stored in the system credential "
     "vault — never in a file. When suggestions run, transaction dates, "
     "descriptions, amounts, and your account names/numbers are sent to "
-    "Anthropic's API. Suggestions only; nothing posts without review."
+    "the selected provider. Changing providers changes which third party "
+    "receives this client data. Suggestions only; nothing posts without review."
 )
 
-from config import ANTHROPIC_API_KEY
+from config import AI_PROVIDER, ANTHROPIC_API_KEY, OPENAI_API_KEY
 from utils.secure_store import delete_secret, get_secret, set_secret
 
 _saved_key = get_secret("anthropic_api_key")
-if ANTHROPIC_API_KEY:
-    st.success("AI categorization is enabled for this session.")
-elif _saved_key:
-    st.info("An API key is saved. Restart LedgerTB to enable AI categorization.")
+_saved_openai_key = get_secret("openai_api_key")
+_active_key = {
+    "anthropic": ANTHROPIC_API_KEY,
+    "openai": OPENAI_API_KEY,
+}.get(AI_PROVIDER)
+if _active_key:
+    st.success(
+        f"AI categorization is enabled with {AI_PROVIDER.title()} for this session."
+    )
+elif AI_PROVIDER not in ("anthropic", "openai"):
+    st.error(
+        f"AI_PROVIDER {AI_PROVIDER!r} is not recognized; categorization is disabled."
+    )
+elif (_saved_key if AI_PROVIDER == "anthropic" else _saved_openai_key):
+    st.info(
+        "The selected provider's API key is saved. Restart LedgerTB to enable "
+        "AI categorization."
+    )
 else:
-    st.warning("Not configured — add an Anthropic API key below.")
+    st.warning(f"Not configured — add an {AI_PROVIDER.title()} API key below.")
 
 api_key_input = st.text_input(
     "Anthropic API Key",
@@ -264,6 +279,29 @@ with key_cols[1]:
     if _saved_key and st.button("Remove key"):
         delete_secret("anthropic_api_key")
         st.success("API key removed from the credential vault.")
+        st.rerun()
+
+openai_key_input = st.text_input(
+    "OpenAI API Key",
+    type="password",
+    placeholder="sk-...",
+    help="Get your API key at https://platform.openai.com/api-keys",
+    key="firm_settings_openai_api_key",
+)
+openai_key_cols = st.columns([1, 1, 3])
+with openai_key_cols[0]:
+    if st.button(
+        "Save OpenAI key", type="primary", disabled=not openai_key_input
+    ):
+        try:
+            set_secret("openai_api_key", openai_key_input.strip())
+            st.success("Saved to the system credential vault. Restart LedgerTB to enable.")
+        except Exception as exc:
+            st.error(f"Could not save the API key securely: {exc}")
+with openai_key_cols[1]:
+    if _saved_openai_key and st.button("Remove OpenAI key"):
+        delete_secret("openai_api_key")
+        st.success("OpenAI API key removed from the credential vault.")
         st.rerun()
 
 st.divider()

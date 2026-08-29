@@ -1,8 +1,12 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from models.account import Account
-from services.categorization import CategorizationService
+from services.ai_providers import ProviderSpec, ProviderConfigurationError
+from services.ai_providers.openai_format import OpenAIRequest
+from services.categorization import CategorizationService, _CATEGORIZE_TOOL
 
 
 def make_service_with_mocked_response(tool_input):
@@ -40,6 +44,29 @@ def test_categorize_transactions_applies_tool_use_suggestions():
     assert result[0]["suggested_account_id"] == 1
     assert result[0]["confidence"] == "high"
     assert result[1]["suggested_account_id"] == 2
+
+
+def test_anthropic_golden_request_matches_legacy_shape_exactly():
+    accounts = [
+        Account(id=1, client_id=1, account_number="6300", name="Software",
+                type="Expense", is_active=True),
+    ]
+    transactions = [
+        {"date": "2026-01-15", "description": "GITHUB", "amount": -25.0},
+    ]
+    service = make_service_with_mocked_response({"suggestions": []})
+
+    service.categorize_transactions(transactions, accounts)
+
+    call = service.client.messages.create.call_args
+    assert call.args == ()
+    assert call.kwargs == {
+        "model": "claude-sonnet-5",
+        "max_tokens": 4000,
+        "tools": [_CATEGORIZE_TOOL],
+        "tool_choice": {"type": "tool", "name": "categorize_transactions"},
+        "messages": [{"role": "user", "content": call.kwargs["messages"][0]["content"]}],
+    }
 
 
 def test_categorize_transactions_handles_unmatched_account_number():
@@ -160,3 +187,107 @@ def test_batch_failure_resets_stale_unmatched():
     assert service.last_unmatched == []
     assert service.last_matched == 0
     assert service.last_total == 0
+
+
+def test_openai_tool_call_produces_only_review_suggestions(monkeypatch):
+    accounts = _accts()
+    transactions = [
+        {"date": "2026-01-15", "description": "GITHUB", "amount": -25.0},
+    ]
+    service = CategorizationService()
+    service.provider = ProviderSpec(
+        "openai", "openai", "https://api.openai.com/v1", "gpt-5-mini"
+    )
+    service.api_key = "openai-test-key"
+    service.client = True
+    response = {
+        "choices": [{"message": {"tool_calls": [{"function": {
+            "arguments": '{"suggestions":[{"index":1,"account_number":'
+                         '"6300","confidence":"high","reason":"Software"}]}'
+        }}]}}]
+    }
+
+    class FakeHTTPResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            import json
+            return json.dumps(response).encode()
+
+    network = MagicMock(return_value=FakeHTTPResponse())
+    monkeypatch.setattr("services.ai_providers.openai_format.urlopen", network)
+
+    result = service.categorize_transactions(transactions, accounts)
+
+    assert result[0]["suggested_account_id"] == 10
+    assert set(result[0]).isdisjoint({"journal_entry_id", "status"})
+    assert network.call_count == 1
+
+
+def test_unknown_provider_fails_closed_before_request(monkeypatch):
+    monkeypatch.setattr("services.categorization.AI_PROVIDER", "untrusted")
+    network = MagicMock()
+    monkeypatch.setattr("services.ai_providers.openai_format.urlopen", network)
+
+    service = CategorizationService()
+    result = service.categorize_transactions(
+        [{"date": "", "description": "X", "amount": -1.0}], _accts()
+    )
+
+    assert not service.is_available()
+    assert "Unknown AI_PROVIDER" in service.last_error
+    assert "suggested_account_id" not in result[0]
+    network.assert_not_called()
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_missing_selected_key_fails_closed_before_request(monkeypatch, provider):
+    monkeypatch.setattr("services.categorization.AI_PROVIDER", provider)
+    monkeypatch.setattr("services.categorization.ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr("services.categorization.OPENAI_API_KEY", "")
+    network = MagicMock()
+    monkeypatch.setattr("services.ai_providers.openai_format.urlopen", network)
+
+    service = CategorizationService()
+    service.categorize_transactions(
+        [{"date": "", "description": "X", "amount": -1.0}], _accts()
+    )
+
+    assert not service.is_available()
+    assert f"selected AI provider '{provider}'" in service.last_error
+    network.assert_not_called()
+
+
+def test_provider_rejects_non_matching_host_before_network():
+    spec = ProviderSpec(
+        "openai", "openai", "https://api.openai.com/v1", "gpt-5-mini"
+    )
+    request = OpenAIRequest(spec, "secret", _CATEGORIZE_TOOL, "prompt")
+    network = MagicMock()
+
+    with patch.object(OpenAIRequest, "url", new_callable=lambda: property(
+        lambda self: "https://attacker.example/v1/chat/completions"
+    )):
+        with patch("services.ai_providers.openai_format.urlopen", network):
+            with pytest.raises(ProviderConfigurationError, match="unexpected host"):
+                request.send()
+
+    network.assert_not_called()
+
+
+def test_provider_rejects_altered_registry_base_url_before_network():
+    spec = ProviderSpec(
+        "openai", "openai", "https://attacker.example/v1", "gpt-5-mini"
+    )
+    request = OpenAIRequest(spec, "secret", _CATEGORIZE_TOOL, "prompt")
+    network = MagicMock()
+
+    with patch("services.ai_providers.openai_format.urlopen", network):
+        with pytest.raises(ProviderConfigurationError, match="altered base URL"):
+            request.send()
+
+    network.assert_not_called()

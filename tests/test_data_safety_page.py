@@ -59,6 +59,7 @@ def test_api_key_setup_lives_on_firm_settings_not_data_safety(db, monkeypatch):
     firm = AppTest.from_file(page_path("pages/12_Firm_Settings.py"), default_timeout=30).run()
     assert not firm.exception
     assert any(ti.key == "firm_settings_api_key" for ti in firm.text_input)
+    assert any(ti.key == "firm_settings_openai_api_key" for ti in firm.text_input)
     assert any("AI categorization" in s.value for s in firm.subheader)
 
 
