@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pandas as pd
 
 from models.account import Account
+from models.audit_log import AuditLog
 from models.client import Client
 from database import init_database
 from database import connection as dbconn
@@ -16,7 +17,11 @@ from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 from utils import icons
 from constants import AccountSubtype, AccountType
-from services.coa_import import assign_missing_numbers, parse_coa_csv
+from services.coa_import import (
+    assign_missing_numbers,
+    parse_coa_csv,
+    suggest_similar_accounts,
+)
 
 
 GROUP_NONE = "None (own line)"
@@ -462,7 +467,9 @@ with tab3:
             )
 
         if parsed:
-            existing = {a.account_number for a in Account.get_all(client_id, active_only=False)}
+            existing_accounts = Account.get_all(client_id, active_only=False)
+            existing = {a.account_number for a in existing_accounts}
+            existing_names = [a.name for a in existing_accounts]
             assigned = assign_missing_numbers(parsed, taken=existing)
             if assigned:
                 shown = ", ".join(f"{no} {name}" for no, name in assigned[:6])
@@ -472,12 +479,30 @@ with tab3:
                     f"numbers were assigned by type range: {shown}{more}. "
                     "Edit any account later to renumber.", icon="🔢",
                 )
+            suggestions = {
+                a["number"]: suggest_similar_accounts(a["name"], existing_names)
+                for a in parsed if a["number"] not in existing
+            }
             preview = pd.DataFrame([{
                 "Acct #": a["number"], "Name": a["name"], "Type": a["type"],
                 "Subtype": a["subtype"] or "", "Description": a["description"] or "",
                 "Status": "exists — skip" if a["number"] in existing else "new",
+                "Review": (
+                    "possible duplicate — review before creating: "
+                    + ", ".join(name for name, _score in suggestions[a["number"]])
+                    if suggestions.get(a["number"]) else ""
+                ),
             } for a in parsed])
             st.dataframe(preview, width="stretch", hide_index=True)
+
+            flagged = {number: matches for number, matches in suggestions.items() if matches}
+            if flagged:
+                st.warning(
+                    f"**{len(flagged)} possible duplicate account name(s) — "
+                    "review before creating.** These are suggestions only; "
+                    "confirming the import still creates every new account.",
+                    icon="⚠️",
+                )
 
             new_count = sum(1 for a in parsed if a["number"] not in existing)
             skip_count = len(parsed) - new_count
@@ -503,6 +528,14 @@ with tab3:
                 st.success(msg)
                 if failed:
                     st.error("Some failed: " + "; ".join(failed[:3]))
+                if flagged:
+                    AuditLog.log_event(
+                        client_id, "REVIEW", "coa_duplicate_suggestions", {
+                            "suggestion_shown": True,
+                            "flagged_account_count": len(flagged),
+                            "import_confirmed": True,
+                        },
+                    )
                 st.rerun()
 
 

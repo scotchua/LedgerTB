@@ -6,6 +6,7 @@ from streamlit.testing.v1 import AppTest
 import streamlit as st
 
 from models.account import Account
+from models.audit_log import AuditLog
 from models.client import Client
 from models.draft_entry import DraftEntry
 from models.journal_entry import JournalEntry
@@ -280,6 +281,46 @@ def test_chart_of_accounts_discards_write_state_after_client_switch(
         key="coa_upload__chart_of_accounts_g1"
     ).value is None
     assert not any(button.label.startswith("Import ") for button in page.button)
+
+
+def test_chart_import_flagged_suggestion_still_creates_account(
+    client_id, accounts, monkeypatch
+):
+    Account(
+        client_id=client_id,
+        account_number="1100",
+        name="Accounts Receivable",
+        type="Asset",
+    ).save()
+    _select_client(monkeypatch, client_id)
+    page = AppTest.from_file(
+        page_path("pages/3_Chart_of_Accounts.py"), default_timeout=30
+    ).run()
+    page.file_uploader(key="coa_upload__chart_of_accounts_g0").upload(
+        "near-duplicate.csv",
+        b"Account Number,Name,Type\n1190,Accounts Receivable - Trade,Asset\n",
+        "text/csv",
+    ).run()
+
+    assert not page.exception
+    assert "possible duplicate" in " ".join(warning.value for warning in page.warning)
+    next(
+        button for button in page.button
+        if button.label == "Import 1 account(s)"
+    ).click().run()
+
+    assert not page.exception
+    imported = next(
+        account for account in Account.get_all(client_id, active_only=False)
+        if account.account_number == "1190"
+    )
+    assert imported.name == "Accounts Receivable - Trade"
+    review = next(
+        log for log in AuditLog.get_all(client_id, action="REVIEW")
+        if log.table_name == "coa_duplicate_suggestions"
+    )
+    assert review.new_values["suggestion_shown"] is True
+    assert review.new_values["import_confirmed"] is True
 
 
 def test_account_groupings_do_not_leak_between_clients_sharing_a_name(
