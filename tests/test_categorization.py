@@ -5,6 +5,7 @@ import pytest
 
 from models.account import Account
 from services.ai_providers import ProviderSpec, ProviderConfigurationError
+from services.ai_providers.anthropic_format import AnthropicRequest
 from services.ai_providers.openai_format import OpenAIRequest
 from services.categorization import CategorizationService, _CATEGORIZE_TOOL
 
@@ -275,6 +276,31 @@ def test_provider_rejects_non_matching_host_before_network():
         with patch("services.ai_providers.openai_format.urlopen", network):
             with pytest.raises(ProviderConfigurationError, match="unexpected host"):
                 request.send()
+
+    network.assert_not_called()
+
+
+def test_anthropic_request_pins_client_base_url_to_provider_spec():
+    spec = ProviderSpec(
+        "anthropic", "anthropic", "https://api.anthropic.com", "claude-sonnet-5"
+    )
+
+    request = AnthropicRequest(spec, "secret", _CATEGORIZE_TOOL, "prompt")
+
+    assert str(request.client.base_url) == spec.base_url
+
+
+def test_anthropic_provider_rejects_non_matching_host_before_network():
+    spec = ProviderSpec(
+        "anthropic", "anthropic", "https://api.anthropic.com", "claude-sonnet-5"
+    )
+    request = AnthropicRequest(spec, "secret", _CATEGORIZE_TOOL, "prompt")
+    network = MagicMock()
+    request.client.base_url = "https://attacker.example"
+    request.client.messages.create = network
+
+    with pytest.raises(ProviderConfigurationError, match="unexpected host"):
+        request.send()
 
     network.assert_not_called()
 
