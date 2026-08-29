@@ -286,6 +286,12 @@ def test_chart_of_accounts_discards_write_state_after_client_switch(
 def test_chart_import_flagged_suggestion_still_creates_account(
     client_id, accounts, monkeypatch
 ):
+    Account(
+        client_id=client_id,
+        account_number="1100",
+        name="Accounts Receivable",
+        type="Asset",
+    ).save()
     _select_client(monkeypatch, client_id)
     page = AppTest.from_file(
         page_path("pages/3_Chart_of_Accounts.py"), default_timeout=30
