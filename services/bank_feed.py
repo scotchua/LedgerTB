@@ -190,7 +190,8 @@ def list_bank_connections(client_id: int) -> list[dict]:
 def _connection(client_id: int, bank_account_id: int):
     with get_cursor() as cursor:
         cursor.execute(
-            """SELECT bc.*,
+            """SELECT bc.id, bc.client_id, bc.bank_account_id, bc.provider,
+                      bc.secret_name, bc.created_at,
                       bcs.synced_at AS last_synced_at,
                       bcs.sync_window_start AS sync_window_start
                FROM bank_connections bc
