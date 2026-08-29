@@ -4,14 +4,14 @@ from anthropic import Anthropic
 class AnthropicRequest:
     def __init__(self, spec, api_key, tool, prompt):
         self.spec = spec
-        self.client = Anthropic(api_key=api_key)
+        self.client = Anthropic(api_key=api_key, base_url=spec.base_url)
         self.tool = tool
         self.prompt = prompt
 
     def send(self):
         from . import validate_provider_url
 
-        validate_provider_url(self.spec, self.spec.base_url)
+        validate_provider_url(self.spec, str(self.client.base_url))
         response = self.client.messages.create(
             model=self.spec.model,
             max_tokens=4000,
