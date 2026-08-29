@@ -17,6 +17,7 @@ def make_service_with_mocked_response(tool_input):
     fake_tool_use_block = SimpleNamespace(type="tool_use", input=tool_input)
     fake_response = SimpleNamespace(content=[fake_tool_use_block])
     service.client = MagicMock()
+    service.client.base_url = service.provider.base_url
     service.client.messages.create.return_value = fake_response
     return service
 
@@ -92,6 +93,7 @@ def test_categorize_transactions_missing_tool_call_sets_error():
 
     service = CategorizationService()
     service.client = MagicMock()
+    service.client.base_url = service.provider.base_url
     service.client.messages.create.return_value = SimpleNamespace(content=[])  # no tool_use block
 
     result = service.categorize_transactions(transactions, accounts)
@@ -109,6 +111,7 @@ def test_categorize_transactions_batches_and_aggregates_stats():
 
     service = CategorizationService()
     service.client = MagicMock()
+    service.client.base_url = service.provider.base_url
 
     def make_response(*args, **kwargs):
         # Each batch call gets one suggestion for its single transaction.
