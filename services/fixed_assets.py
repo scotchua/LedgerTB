@@ -26,9 +26,11 @@ def depreciation_amount_cents(asset: FixedAsset, period_end: date) -> int:
         raise ValueError("Depreciation cannot precede the in-service month.")
     with get_cursor() as cursor:
         cursor.execute(
-            "SELECT MAX(period_end) latest FROM depreciation_runs "
+            "SELECT MAX(period_end) latest, COUNT(*) run_count "
+            "FROM depreciation_runs "
             "WHERE fixed_asset_id = ?", (asset.id,))
-        latest = cursor.fetchone()["latest"]
+        run_summary = cursor.fetchone()
+        latest = run_summary["latest"]
     if latest and period_end <= date.fromisoformat(latest):
         raise ValueError("Depreciation periods must be run in chronological order.")
     remaining = asset.book_value_cents - asset.salvage_value_cents
@@ -36,6 +38,8 @@ def depreciation_amount_cents(asset: FixedAsset, period_end: date) -> int:
         raise ValueError("Asset is already at its salvage value.")
     asset_type = FixedAssetType.get_by_id(asset.fixed_asset_type_id, asset.client_id)
     if asset_type.method == "straight_line":
+        if run_summary["run_count"] + 1 >= asset_type.effective_life_months:
+            return remaining
         monthly = (Decimal(asset.cost_cents - asset.salvage_value_cents)
                    / Decimal(asset_type.effective_life_months))
     else:

@@ -100,19 +100,27 @@ def test_duplicate_period_is_refused_before_insert(client_id, fixed_accounts):
 
 
 @pytest.mark.parametrize(
-    "proceeds, expected_lines",
+    "proceeds",
     [
-        (8000, [(0, 10000), (1000, 0), (7000, 0), (2000, 0)]),
-        (5000, [(0, 10000), (1000, 0), (4000, 0), (5000, 0)]),
-        (0, [(0, 10000), (1000, 0), (9000, 0)]),
+        pytest.param(8000, id="gain"),
+        pytest.param(5000, id="loss"),
+        pytest.param(0, id="zero_proceeds"),
     ],
-    ids=["gain", "loss", "zero_proceeds"],
 )
-def test_disposal_gain_loss_and_zero(client_id, fixed_accounts, proceeds,
-                                     expected_lines):
+def test_disposal_gain_loss_and_zero(client_id, fixed_accounts, proceeds):
     asset = _make_asset(client_id, _make_type(client_id, fixed_accounts),
                         cost=10000, salvage=1000)
     run_depreciation(asset.id, date(2026, 1, 31))
+    accumulated = sum(_run_amounts(asset.id))
+    book_value = asset.cost_cents - accumulated
+    gain_loss = proceeds - book_value
+    expected_lines = [(0, asset.cost_cents), (accumulated, 0)]
+    if proceeds:
+        expected_lines.append((proceeds, 0))
+    if gain_loss > 0:
+        expected_lines.append((0, gain_loss))
+    elif gain_loss < 0:
+        expected_lines.append((-gain_loss, 0))
     entry_id = dispose_asset(
         asset.id, date(2026, 2, 15), proceeds,
         fixed_accounts["cash"], fixed_accounts["gain_loss"])
