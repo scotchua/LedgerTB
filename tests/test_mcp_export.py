@@ -101,8 +101,14 @@ def test_export_writes_both_files_at_read_level(client_id, accounts, tmp_path,
     conn = get_connection()
     try:
         audit = conn.execute(
-            "SELECT doc_key, content_hash, canonicalization_version "
+            "SELECT id, doc_key, content_hash, canonicalization_version "
             "FROM document_audits WHERE client_id = ?",
+            (client_id,),
+        ).fetchone()
+        audit_log = conn.execute(
+            "SELECT record_id FROM audit_log "
+            "WHERE client_id = ? AND table_name = 'document_audits' "
+            "AND action = 'EXPORT'",
             (client_id,),
         ).fetchone()
     finally:
@@ -111,6 +117,8 @@ def test_export_writes_both_files_at_read_level(client_id, accounts, tmp_path,
     assert audit["doc_key"] == f"{client_id}:2026-01-01:2026-03-31"
     assert audit["content_hash"] == expected_hash
     assert audit["canonicalization_version"] == SNAPSHOT_CANONICALIZATION_VERSION
+    assert audit_log is not None
+    assert audit_log["record_id"] == audit["id"]
 
     # The export is audit-logged even at read level.
     monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", None)

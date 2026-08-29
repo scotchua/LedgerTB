@@ -194,31 +194,28 @@ def write_close_package_audit(audit: ClosePackageAudit, conn=None) -> int:
     conn = conn or get_connection()
     try:
         cursor = conn.cursor()
-        audit_log_id = AuditLog.write(
-            cursor, audit.client_id, "document_audits", 0, "EXPORT",
+        cursor.execute(
+            """
+            INSERT INTO document_audits
+                (client_id, doc_type, doc_key, content_hash,
+                 canonicalization_version)
+            VALUES (?, 'close_package', ?, ?, ?)
+            """,
+            (
+                audit.client_id, audit.doc_key, audit.content_hash,
+                audit.canonicalization_version,
+            ),
+        )
+        document_audit_id = cursor.lastrowid
+        AuditLog.write(
+            cursor, audit.client_id, "document_audits", document_audit_id,
+            "EXPORT",
             new_values={
                 "doc_type": "close_package",
                 "doc_key": audit.doc_key,
                 "content_hash": audit.content_hash,
                 "canonicalization_version": audit.canonicalization_version,
             },
-        )
-        cursor.execute(
-            """
-            INSERT INTO document_audits
-                (client_id, doc_type, doc_key, content_hash,
-                 canonicalization_version, audit_log_id)
-            VALUES (?, 'close_package', ?, ?, ?, ?)
-            """,
-            (
-                audit.client_id, audit.doc_key, audit.content_hash,
-                audit.canonicalization_version, audit_log_id,
-            ),
-        )
-        document_audit_id = cursor.lastrowid
-        cursor.execute(
-            "UPDATE audit_log SET record_id = ? WHERE id = ?",
-            (document_audit_id, audit_log_id),
         )
         if own_connection:
             conn.commit()
