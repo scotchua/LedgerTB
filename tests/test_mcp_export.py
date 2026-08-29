@@ -14,9 +14,16 @@ import openpyxl
 import pytest
 
 from database import connection as dbconn
+from database.connection import get_connection
 from models.audit_log import AuditLog
 from models.client import Client
 from services import mcp_tools
+from services.close_package import (
+    SNAPSHOT_CANONICALIZATION_VERSION,
+    close_package_snapshot_hash,
+    close_package_snapshot_payload,
+    load_close_package_snapshot,
+)
 from tests.conftest import post_entry
 
 
@@ -80,6 +87,38 @@ def test_export_writes_both_files_at_read_level(client_id, accounts, tmp_path,
             f"col {col} is an uncalculated formula"
         assert isinstance(value, (int, float))
     assert tb.cell(row=totals_row, column=10).value == pytest.approx(500.0)
+
+    start = date(2026, 1, 1)
+    end = date(2026, 3, 31)
+    client = Client.get_by_id(client_id)
+    tb_rows, _ = mcp_tools.ReportGenerator.trial_balance_worksheet(
+        client_id, start, end
+    )
+    snapshot = load_close_package_snapshot(client_id, start, end)
+    expected_hash = close_package_snapshot_hash(close_package_snapshot_payload(
+        client_id, client.name, start, end, tb_rows, snapshot
+    ))
+    conn = get_connection()
+    try:
+        audit = conn.execute(
+            "SELECT id, doc_key, content_hash, canonicalization_version "
+            "FROM document_audits WHERE client_id = ?",
+            (client_id,),
+        ).fetchone()
+        audit_log = conn.execute(
+            "SELECT record_id FROM audit_log "
+            "WHERE client_id = ? AND table_name = 'document_audits' "
+            "AND action = 'EXPORT'",
+            (client_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert audit is not None
+    assert audit["doc_key"] == f"{client_id}:2026-01-01:2026-03-31"
+    assert audit["content_hash"] == expected_hash
+    assert audit["canonicalization_version"] == SNAPSHOT_CANONICALIZATION_VERSION
+    assert audit_log is not None
+    assert audit_log["record_id"] == audit["id"]
 
     # The export is audit-logged even at read level.
     monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", None)

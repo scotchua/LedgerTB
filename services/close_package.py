@@ -108,6 +108,14 @@ class ClosePackageSnapshot:
     generated_at: datetime
 
 
+@dataclass(frozen=True)
+class ClosePackageAudit:
+    client_id: int
+    doc_key: str
+    content_hash: str
+    canonicalization_version: int
+
+
 SNAPSHOT_CANONICALIZATION_VERSION = 1
 
 
@@ -178,6 +186,47 @@ def canonicalize_close_package_snapshot(payload: Dict) -> bytes:
 
 def close_package_snapshot_hash(payload: Dict) -> str:
     return sha256(canonicalize_close_package_snapshot(payload)).hexdigest()
+
+
+def write_close_package_audit(audit: ClosePackageAudit, conn=None) -> int:
+    """Write one close-package snapshot audit and its linked export event."""
+    own_connection = conn is None
+    conn = conn or get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO document_audits
+                (client_id, doc_type, doc_key, content_hash,
+                 canonicalization_version)
+            VALUES (?, 'close_package', ?, ?, ?)
+            """,
+            (
+                audit.client_id, audit.doc_key, audit.content_hash,
+                audit.canonicalization_version,
+            ),
+        )
+        document_audit_id = cursor.lastrowid
+        AuditLog.write(
+            cursor, audit.client_id, "document_audits", document_audit_id,
+            "EXPORT",
+            new_values={
+                "doc_type": "close_package",
+                "doc_key": audit.doc_key,
+                "content_hash": audit.content_hash,
+                "canonicalization_version": audit.canonicalization_version,
+            },
+        )
+        if own_connection:
+            conn.commit()
+        return document_audit_id
+    except Exception:
+        if own_connection:
+            conn.rollback()
+        raise
+    finally:
+        if own_connection:
+            conn.close()
 
 
 def recompute_document_audit(document_audit_id: int) -> Dict:
@@ -1188,7 +1237,8 @@ def build_close_package_pdf(
     period_end: date,
     tb_rows: List[TrialBalanceWorksheetRow],
     snapshot: Optional[ClosePackageSnapshot] = None,
-) -> BytesIO:
+    defer_audit: bool = False,
+):
     """One presentable PDF: Summary, statements, TB, transactions, AJEs."""
     snapshot = snapshot or load_close_package_snapshot(
         client_id, period_start, period_end
@@ -1209,6 +1259,12 @@ def build_close_package_pdf(
         client_id, client_name, period_start, period_end, tb_rows, snapshot
     )
     content_hash = close_package_snapshot_hash(snapshot_payload)
+    audit = ClosePackageAudit(
+        client_id=client_id,
+        doc_key=f"{client_id}:{period_start.isoformat()}:{period_end.isoformat()}",
+        content_hash=content_hash,
+        canonicalization_version=SNAPSHOT_CANONICALIZATION_VERSION,
+    )
 
     client_branding = snapshot.client_branding
     firm_branding = snapshot.branding
@@ -1662,45 +1718,18 @@ def build_close_package_pdf(
     else:
         story.append(Paragraph("No adjusting entries in this period.", _PDF_BODY))
 
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        doc_key = f"{client_id}:{period_start.isoformat()}:{period_end.isoformat()}"
-        audit_log_id = AuditLog.write(
-            cursor, client_id, "document_audits", 0, "EXPORT",
-            new_values={
-                "doc_type": "close_package",
-                "doc_key": doc_key,
-                "content_hash": content_hash,
-                "canonicalization_version": SNAPSHOT_CANONICALIZATION_VERSION,
-            },
-        )
-        cursor.execute(
-            """
-            INSERT INTO document_audits
-                (client_id, doc_type, doc_key, content_hash,
-                 canonicalization_version, audit_log_id)
-            VALUES (?, 'close_package', ?, ?, ?, ?)
-            """,
-            (
-                client_id, doc_key, content_hash,
-                SNAPSHOT_CANONICALIZATION_VERSION, audit_log_id,
-            ),
-        )
-        document_audit_id = cursor.lastrowid
-        cursor.execute(
-            "UPDATE audit_log SET record_id = ? WHERE id = ?",
-            (document_audit_id, audit_log_id),
-        )
-        # Keep both rows uncommitted through final rendering. A render failure
-        # rolls back the export event and document audit together. Committing
-        # after BytesIO rendering means every recorded PDF was fully produced.
+    if defer_audit:
         doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    else:
+        conn = get_connection()
+        try:
+            document_audit_id = write_close_package_audit(audit, conn=conn)
+            doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
     buffer.seek(0)
-    return buffer
+    return (buffer, audit) if defer_audit else buffer
