@@ -33,6 +33,10 @@ class BankFeedError(RuntimeError):
     """A user-safe bank-feed failure with no credential details."""
 
 
+class BankFeedResponseTooLargeError(BankFeedError):
+    """A user-safe failure for an oversized provider response."""
+
+
 def _decode_setup_token(setup_token: str) -> str:
     token = (setup_token or "").strip()
     if not token:
@@ -97,7 +101,7 @@ def _response_text(response) -> str:
     except (AttributeError, httpx.HTTPError) as exc:
         raise BankFeedError("SimpleFIN returned an unreadable response.") from exc
     if len(content) > MAX_RESPONSE_BYTES:
-        raise BankFeedError("SimpleFIN returned too much data.")
+        raise BankFeedResponseTooLargeError("SimpleFIN returned too much data.")
     try:
         return content.decode(response.encoding or "utf-8").strip()
     except (LookupError, UnicodeDecodeError) as exc:
@@ -110,7 +114,7 @@ def _response_json(response):
     except (AttributeError, httpx.HTTPError) as exc:
         raise BankFeedError("SimpleFIN returned unreadable data.") from exc
     if len(content) > MAX_RESPONSE_BYTES:
-        raise BankFeedError("SimpleFIN returned too much data.")
+        raise BankFeedResponseTooLargeError("SimpleFIN returned too much data.")
     try:
         return json.loads(content)
     except (UnicodeDecodeError, ValueError) as exc:
@@ -256,6 +260,10 @@ def _fetch(access_url: str, username: str, password: str,
         )
     try:
         payload = _response_json(response)
+    except BankFeedResponseTooLargeError as exc:
+        raise BankFeedError(
+            f"SimpleFIN returned too much data for connection {connection_id}."
+        ) from exc
     except BankFeedError as exc:
         raise BankFeedError(
             f"SimpleFIN returned invalid data for connection {connection_id}."
