@@ -40,13 +40,15 @@ def _invoice(client_id, customer_id, accounts, amount=10000, due=date(2026, 8, 3
     return invoice
 
 
-def _entry_lines(entry_id):
+def _entry_lines(entry_id, include_memo=False):
     conn = get_connection()
     rows = conn.execute(
-        "SELECT account_id, debit, credit FROM journal_entry_lines WHERE journal_entry_id = ? ORDER BY id",
+        "SELECT account_id, debit, credit, memo FROM journal_entry_lines WHERE journal_entry_id = ? ORDER BY id",
         (entry_id,),
     ).fetchall()
     conn.close()
+    if include_memo:
+        return [(row["account_id"], row["debit"], row["credit"], row["memo"]) for row in rows]
     return [(row["account_id"], row["debit"], row["credit"]) for row in rows]
 
 
@@ -55,6 +57,99 @@ def _scalar(sql, params=()):
     value = conn.execute(sql, params).fetchone()[0]
     conn.close()
     return value
+
+
+def _audit_actions(since_id=0):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT table_name, action FROM audit_log WHERE id > ? ORDER BY id", (since_id,),
+    ).fetchall()
+    conn.close()
+    return [(row["table_name"], row["action"]) for row in rows]
+
+
+def test_invoice_and_bill_post_exact_balanced_entries_and_audits(client_id, ar_ap_accounts):
+    customer = create_customer(client_id, "Northwind Labs")
+    invoice = create_invoice(client_id, customer.id, [
+        {"description": "Consulting", "quantity": 2, "unit_price_cents": 12550,
+         "revenue_account_id": ar_ap_accounts["revenue"]},
+        {"description": "Setup", "quantity": 1, "unit_price_cents": 4995,
+         "revenue_account_id": ar_ap_accounts["revenue_2"]},
+    ], date(2026, 8, 1), date(2026, 8, 31))
+    posted_invoice = post_invoice(invoice.id, ar_ap_accounts["ar"])
+    assert _entry_lines(posted_invoice.journal_entry_id, include_memo=True) == [
+        (ar_ap_accounts["ar"], 30095, 0, None),
+        (ar_ap_accounts["revenue"], 0, 25100, "Consulting"),
+        (ar_ap_accounts["revenue_2"], 0, 4995, "Setup"),
+    ]
+    assert _audit_actions()[-2:] == [("invoices", "INSERT"), ("invoices", "UPDATE")]
+
+    vendor = create_vendor(client_id, "Office Market")
+    bill = create_bill(client_id, vendor.id, [
+        {"description": "Paper", "quantity": 3, "unit_price_cents": 1234,
+         "expense_account_id": ar_ap_accounts["expense"]},
+        {"description": "Ink", "quantity": 2, "unit_price_cents": 2499,
+         "expense_account_id": ar_ap_accounts["expense_2"]},
+    ], date(2026, 8, 2), date(2026, 9, 1))
+    posted_bill = post_bill(bill.id, ar_ap_accounts["ap"])
+    assert _entry_lines(posted_bill.journal_entry_id, include_memo=True) == [
+        (ar_ap_accounts["expense"], 3702, 0, "Paper"),
+        (ar_ap_accounts["expense_2"], 4998, 0, "Ink"),
+        (ar_ap_accounts["ap"], 0, 8700, None),
+    ]
+    assert _audit_actions()[-2:] == [("bills", "INSERT"), ("bills", "UPDATE")]
+
+
+def test_reposting_invoice_and_bill_is_refused(client_id, ar_ap_accounts):
+    customer = create_customer(client_id, "Posted Customer")
+    invoice = _invoice(client_id, customer.id, ar_ap_accounts)
+    with pytest.raises(ValueError, match="already been posted"):
+        post_invoice(invoice.id, ar_ap_accounts["ar"])
+
+    vendor = create_vendor(client_id, "Posted Vendor")
+    bill = create_bill(client_id, vendor.id, [{"description": "Fee", "quantity": 1,
+        "unit_price_cents": 5000, "expense_account_id": ar_ap_accounts["expense"]}])
+    post_bill(bill.id, ar_ap_accounts["ap"])
+    with pytest.raises(ValueError, match="already been posted"):
+        post_bill(bill.id, ar_ap_accounts["ap"])
+
+
+def test_vendor_normalization_and_foreign_keys_remain_valid(client_id, ar_ap_accounts):
+    vendor = create_vendor(client_id, "  BLUE   Sky  Supply ")
+    assert vendor.normalized_name == "blue sky supply"
+    conn = get_connection()
+    stored = conn.execute(
+        "SELECT normalized_name FROM vendors WHERE id = ?", (vendor.id,),
+    ).fetchone()
+    assert stored["normalized_name"] == "blue sky supply"
+    conn.execute(
+        "INSERT INTO categorization_rules (client_id, vendor_id, pattern, default_account_id) "
+        "VALUES (?, ?, ?, ?)",
+        (client_id, vendor.id, "BLUE SKY", ar_ap_accounts["expense"]),
+    )
+    conn.commit()
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    conn.close()
+
+
+def test_customer_payment_audit_attribution_sequence(client_id, ar_ap_accounts):
+    customer = create_customer(client_id, "Audit Customer")
+    invoices = [_invoice(client_id, customer.id, ar_ap_accounts, amount)
+                for amount in (1000, 2000)]
+    before = _scalar("SELECT COALESCE(MAX(id), 0) FROM audit_log")
+    record_customer_payment(
+        client_id, customer.id, date(2026, 8, 15), 3000, ar_ap_accounts["cash"],
+        [{"invoice_id": invoices[0].id, "amount_cents": 1000},
+         {"invoice_id": invoices[1].id, "amount_cents": 2000}],
+    )
+    assert _audit_actions(before) == [
+        ("journal_entries", "INSERT"),
+        ("payment_allocations", "INSERT"),
+        ("payment_allocations", "INSERT"),
+        ("payments", "INSERT"),
+        ("invoices", "UPDATE"),
+        ("invoices", "UPDATE"),
+    ]
 
 
 def test_stored_control_account_prevents_cash_on_both_sides(client_id, ar_ap_accounts):
