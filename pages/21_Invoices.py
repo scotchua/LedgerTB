@@ -13,8 +13,9 @@ from database import init_database
 from database.connection import get_cursor
 from models.account import Account
 from money import to_cents, to_dollars
-from services.ar_ap import (create_customer, create_invoice, list_invoices,
-                            post_invoice, record_invoice_payment)
+from services.ar_ap import (create_customer, create_invoice, list_customer_credits,
+                            list_invoices, post_invoice, record_customer_payment,
+                            void_invoice, void_payment)
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 
@@ -70,7 +71,8 @@ if customers and revenue:
 rows = list_invoices(client_id)
 st.dataframe(pd.DataFrame([{"Invoice": row["id"], "Customer": row["party_name"],
     "Date": row["invoice_date"], "Due": row["due_date"], "Status": row["status"],
-    "Total": f"${to_dollars(row['total_cents']):,.2f}"} for row in rows]),
+    "Total": f"${to_dollars(row['total_cents']):,.2f}",
+    "Open": f"${to_dollars(row['open_balance_cents']):,.2f}"} for row in rows]),
     hide_index=True, width="stretch")
 
 if rows and assets:
@@ -84,13 +86,41 @@ if rows and assets:
             st.error(str(exc))
         else:
             st.rerun()
-    st.subheader("Record payment")
+    if st.button("Void invoice"):
+        try:
+            void_invoice(selected, date.today())
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.rerun()
+    st.subheader("Record customer payment")
+    selected_row = next(row for row in rows if row["id"] == selected)
     amount = st.number_input("Payment amount", min_value=0.01, step=0.01)
+    allocation = st.number_input("Allocate to selected invoice", min_value=0.01,
+                                 max_value=max(0.01, to_dollars(selected_row["open_balance_cents"])),
+                                 step=0.01)
     deposit_id = st.selectbox("Deposit account", [a.id for a in assets], format_func=asset_label)
     payment_date = st.date_input("Payment date", date.today())
     if st.button("Record payment"):
         try:
-            record_invoice_payment(selected, to_cents(amount), deposit_id, payment_date, control_id)
+            record_customer_payment(client_id, selected_row["customer_id"], payment_date,
+                                    to_cents(amount), deposit_id,
+                                    [{"invoice_id": selected, "amount_cents": to_cents(allocation)}])
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.rerun()
+
+credits = list_customer_credits(client_id)
+if credits:
+    st.subheader("Open customer credits")
+    st.dataframe(pd.DataFrame([{"Payment": row["payment_id"], "Customer": row["party_name"],
+        "Credit": f"${to_dollars(row['open_credit_cents']):,.2f}"} for row in credits]),
+        hide_index=True, width="stretch")
+    credit_payment = st.selectbox("Payment to void", [row["payment_id"] for row in credits])
+    if st.button("Void customer payment"):
+        try:
+            void_payment(credit_payment, date.today())
         except Exception as exc:
             st.error(str(exc))
         else:

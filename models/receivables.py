@@ -35,6 +35,8 @@ class Invoice:
     due_date: Optional[date] = None
     status: str = "draft"
     journal_entry_id: Optional[int] = None
+    voided_journal_entry_id: Optional[int] = None
+    control_account_id: Optional[int] = None
     lines: List[InvoiceLine] = field(default_factory=list)
 
     @property
