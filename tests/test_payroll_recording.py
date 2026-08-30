@@ -112,4 +112,7 @@ def test_payroll_schema_contains_only_minimal_employee_fields(db):
     with get_cursor() as cursor:
         cursor.execute("PRAGMA table_info(employees)")
         columns = {row["name"] for row in cursor.fetchall()}
-    assert columns == {"id", "client_id", "name", "start_date", "status", "created_at"}
+    # department_id (migration 035) is a GL-routing dimension, not PII; this
+    # guard's purpose is keeping SSNs/bank fields out of the payroll schema.
+    assert columns == {"id", "client_id", "name", "start_date", "status",
+                       "created_at", "department_id"}
