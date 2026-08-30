@@ -1580,6 +1580,7 @@ def send_invoice_email(invoice_id: int, to_address: str, subject=None, body=None
 
 
 def _open_credit_rows(client_id: int, as_of, is_invoice: bool):
+    as_of = _iso(as_of, "as_of")
     table = "invoices" if is_invoice else "bills"
     party_table = "customers" if is_invoice else "vendors"
     party_field = "customer_id" if is_invoice else "vendor_id"
@@ -1603,7 +1604,7 @@ def _open_credit_rows(client_id: int, as_of, is_invoice: bool):
                       SELECT 1 FROM journal_entries vje
                       WHERE vje.id = p.voided_journal_entry_id AND vje.entry_date <= ?))
                 ORDER BY p.payment_date, p.id""",
-            (as_of.isoformat(), as_of.isoformat(), client_id, as_of.isoformat(), as_of.isoformat()),
+            (as_of, as_of, client_id, as_of, as_of),
         )
         credits = [dict(row) for row in cursor.fetchall()]
     for credit in credits:
@@ -1629,7 +1630,7 @@ def _open_credit_rows(client_id: int, as_of, is_invoice: bool):
                           SELECT 1 FROM journal_entries vje
                           WHERE vje.id = cm.voided_journal_entry_id AND vje.entry_date <= ?))
                     ORDER BY cm.memo_date, cm.id""",
-                (as_of.isoformat(), client_id, as_of.isoformat(), as_of.isoformat()),
+                (as_of, client_id, as_of, as_of),
             )
             memo_credits = [dict(row) for row in cursor.fetchall()]
         for credit in memo_credits:
