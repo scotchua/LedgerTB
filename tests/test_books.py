@@ -1,6 +1,9 @@
 """Firm mode: book-file registry, the in-use lock protocol, and book switching."""
 import json
 import os
+import getpass
+import socket
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -64,47 +67,87 @@ def test_local_book_detection_is_conservative(settings, tmp_path, monkeypatch):
     assert not books.is_local_book(tmp_path / "shared" / "Smith.db")
 
 
+@pytest.fixture(autouse=True)
+def release_test_leases():
+    yield
+    for token, fd in list(book_lock._leases.values()):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    book_lock._leases.clear()
+
+
 def test_lock_acquire_conflict_takeover_release(settings, tmp_path):
     book = tmp_path / "shared.db"
 
-    assert book_lock.acquire(book)["acquired"] is True
+    first = book_lock.acquire(book)
+    assert first["acquired"] is True
     holder = book_lock.read_lock(book)
     assert holder["pid"] == os.getpid()
+    assert holder["token"] == first["token"]
     # Re-acquiring our own lock is fine (same process reopening).
     assert book_lock.acquire(book)["acquired"] is True
 
-    # Someone on another machine holds it: refused, holder reported.
-    other = {"user": "colleague", "host": "OFFICE-PC", "pid": 1234,
-             "opened_at": "2026-08-04T15:00:00+00:00"}
-    book_lock.lock_path(book).write_text(json.dumps(other))
+    # A second process loses O_EXCL and gets a useful holder description.
+    book_lock._forget(book)
     result = book_lock.acquire(book)
     assert result["acquired"] is False
-    assert "colleague on OFFICE-PC" in book_lock.describe(result["holder"])
+    assert getpass.getuser() in book_lock.describe(result["holder"])
+    assert socket.gethostname() in book_lock.describe(result["holder"])
     description = book_lock.describe(result["holder"])
-    assert "T15:00:00+00:00" not in description
+    assert "T" not in description
     assert " at " in description
 
-    # release() never removes someone else's lock…
+
+def test_release_with_mismatched_token_preserves_replacement(settings, tmp_path):
+    book = tmp_path / "shared.db"
+    first = book_lock.acquire(book)
+    replacement = dict(book_lock.read_lock(book), token="replacement-token")
+    book_lock.lock_path(book).write_text(json.dumps(replacement))
+
     book_lock.release(book)
-    assert book_lock.read_lock(book)["user"] == "colleague"
-    # …but a deliberate takeover replaces it, and release then clears ours.
-    assert book_lock.takeover(book)["acquired"] is True
-    book_lock.release(book)
-    assert book_lock.read_lock(book) is None
+
+    assert book_lock.read_lock(book)["token"] == "replacement-token"
+    assert first["token"] != "replacement-token"
 
 
-def test_stale_lock_from_this_machine_is_reclaimed(settings, tmp_path):
-    import getpass
-    import socket
+def test_takeover_requires_stale_heartbeat_and_fences_old_owner(settings,
+                                                                tmp_path):
+    book = tmp_path / "shared.db"
+    first = book_lock.acquire(book)
+    fresh = book_lock.read_lock(book)
 
-    book = tmp_path / "crashed.db"
-    stale = {"user": getpass.getuser(), "host": socket.gethostname(),
-             "pid": 99999999, "opened_at": "2026-08-04T09:00:00+00:00"}
-    book_lock.lock_path(book).write_text(json.dumps(stale))
+    refused = book_lock.takeover(book)
+    assert refused["acquired"] is False
+    assert refused["holder"]["token"] == first["token"]
 
-    result = book_lock.acquire(book)
-    assert result["acquired"] is True
-    assert book_lock.read_lock(book)["pid"] == os.getpid()
+    fresh["heartbeat_at"] = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=book_lock.STALE_AFTER_SECONDS + 1)
+    ).isoformat()
+    book_lock.lock_path(book).write_text(json.dumps(fresh))
+    book_lock._forget(book)  # simulate the old owner living in another process
+
+    replacement = book_lock.takeover(book)
+    assert replacement["acquired"] is True
+    assert replacement["token"] != first["token"]
+
+    replacement_handle = book_lock._leases.pop(str(book_lock.lock_path(book)))
+    old_fd = os.open(book_lock.lock_path(book), os.O_WRONLY)
+    book_lock._leases[str(book_lock.lock_path(book))] = (first["token"], old_fd)
+    with pytest.raises(RuntimeError, match="Another computer took over this book"):
+        book_lock.verify_and_refresh(book)
+    os.close(replacement_handle[1])
+
+
+def test_missing_sidecar_fences_owner(settings, tmp_path):
+    book = tmp_path / "shared.db"
+    book_lock.acquire(book)
+    book_lock.lock_path(book).unlink()
+
+    with pytest.raises(RuntimeError, match="Another computer took over this book"):
+        book_lock.verify_and_refresh(book)
 
 
 def test_switching_books_isolates_data(client_id, accounts, tmp_path):

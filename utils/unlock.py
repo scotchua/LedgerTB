@@ -11,9 +11,9 @@ state, so one unlock covers the whole launch (and the pytest ``db`` fixture,
 which sets a key directly, transparently passes the gate).
 
 Firm mode: the gate is also where a different BOOK FILE is chosen (a firm can
-keep book files on a shared drive, ProSystem-style). Opening a book takes an
-in-use lock beside the file; if someone else holds it, the opener chooses
-read-only or takeover. See utils/books.py and utils/book_lock.py.
+keep book files on a shared drive, ProSystem-style). Opening a book takes a
+heartbeat lease beside the file. A fresh lease permits read-only access only;
+a stale lease can be taken over. See utils/books.py and utils/book_lock.py.
 """
 
 import atexit
@@ -407,6 +407,13 @@ def require_unlock():
         )
         return
     if dbconn.has_active_key():
+        if not dbconn.READ_ONLY and not books.is_local_book(dbconn.DATABASE_PATH):
+            try:
+                book_lock.verify_and_refresh(dbconn.DATABASE_PATH)
+            except RuntimeError as exc:
+                dbconn.READ_ONLY = True
+                st.error(str(exc))
+                st.stop()
         migration_copy = plaintext_backup_path(dbconn.DATABASE_PATH)
         if migration_copy.exists() or migration_copy.is_symlink():
             st.warning(
@@ -516,9 +523,8 @@ def _render_lock_choice():
     holder = st.session_state["_book_lock_holder"]
     st.warning(f"This book is in use by **{book_lock.describe(holder)}**.")
     st.caption(
-        "Open read-only to look without touching anything. Take over only if "
-        "you are sure no one is actually working in it (for example, after a "
-        "crash left the lock behind) — two writers can corrupt a shared book."
+        "Open read-only to look without touching anything. Takeover becomes "
+        "available only after the other session's heartbeat has gone stale."
     )
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
@@ -530,13 +536,18 @@ def _render_lock_choice():
             books.set_active_book(dbconn.DATABASE_PATH)
             st.rerun()
     with c2:
-        if st.button("Take over the book"):
-            book_lock.takeover(dbconn.DATABASE_PATH)
-            dbconn.set_active_key(st.session_state.pop("_pending_book_key"))
-            st.session_state.pop("_book_lock_holder", None)
-            st.session_state.pop("_switch_book", None)
-            books.set_active_book(dbconn.DATABASE_PATH)
-            st.rerun()
+        stale = book_lock.is_stale(holder)
+        if st.button("Take over the book", disabled=not stale):
+            result = book_lock.takeover(dbconn.DATABASE_PATH)
+            if result["acquired"]:
+                dbconn.set_active_key(st.session_state.pop("_pending_book_key"))
+                st.session_state.pop("_book_lock_holder", None)
+                st.session_state.pop("_switch_book", None)
+                books.set_active_book(dbconn.DATABASE_PATH)
+                st.rerun()
+            else:
+                st.session_state["_book_lock_holder"] = result["holder"]
+                st.error("The other session is still active; takeover was refused.")
     with c3:
         if st.button("Cancel"):
             st.session_state.pop("_pending_book_key", None)
