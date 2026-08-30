@@ -22,12 +22,11 @@ def assistant(client_id, accounts, monkeypatch, tmp_path):
 
     monkeypatch.setattr(books_mod, "USER_DATA_DIR", tmp_path)
     monkeypatch.setattr(mcp_server, "_require_level", lambda *a, **k: None)
-    dbconn.ASSISTANT_ACCESS_LEVEL = "post"
-    yield
-    dbconn.ASSISTANT_ACCESS_LEVEL = None
+    monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", "post")
 
 
-def test_posting_an_entry_registers_a_writer(assistant, client_id, accounts):
+def test_posting_an_entry_registers_a_writer(
+        assistant, client_id, accounts, monkeypatch):
     """Charlie's reproduction: instrument the writer, call the real tool, and
     the entry posted without the context ever being entered."""
     seen = []
@@ -37,21 +36,18 @@ def test_posting_an_entry_registers_a_writer(assistant, client_id, accounts):
         seen.append(str(path))
         return real(path)
 
-    srv_writer = maintenance_lock.writer
-    maintenance_lock.writer = spy
-    try:
-        mcp_server.post_entry(
-            client_id, date(2026, 3, 1).isoformat(), "assistant entry",
-            [{"account_number": "1000", "debit": 25, "credit": 0},
-             {"account_number": "4000", "debit": 0, "credit": 25}],
-        )
-    finally:
-        maintenance_lock.writer = srv_writer
+    monkeypatch.setattr(maintenance_lock, "writer", spy)
+    mcp_server.post_entry(
+        client_id, date(2026, 3, 1).isoformat(), "assistant entry",
+        [{"account_number": "1000", "debit": 25, "credit": 0},
+         {"account_number": "4000", "debit": 0, "credit": 25}],
+    )
 
     assert seen, "posting an entry must declare itself as a write"
 
 
-def test_maintenance_refuses_while_a_real_tool_is_mid_write(assistant, client_id, accounts):
+def test_maintenance_refuses_while_a_real_tool_is_mid_write(
+        assistant, client_id, accounts, monkeypatch):
     """The race the lock exists for, driven through a real mutation."""
     import threading
 
@@ -67,7 +63,7 @@ def test_maintenance_refuses_while_a_real_tool_is_mid_write(assistant, client_id
         release.wait(timeout=5)
         return original(*args, **kwargs)
 
-    mcp_server.mcp_tools.post_entry = slow_post
+    monkeypatch.setattr(mcp_server.mcp_tools, "post_entry", slow_post)
     worker = threading.Thread(target=lambda: mcp_server.post_entry(
         client_id, date(2026, 3, 2).isoformat(), "slow entry",
         [{"account_number": "1000", "debit": 10, "credit": 0},
@@ -83,7 +79,6 @@ def test_maintenance_refuses_while_a_real_tool_is_mid_write(assistant, client_id
     finally:
         release.set()
         worker.join(timeout=5)
-        mcp_server.mcp_tools.post_entry = original
 
     assert not worker.is_alive()
     with maintenance_lock.hold(book):

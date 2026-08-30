@@ -1,6 +1,8 @@
 import threading
 import time
 
+import pytest
+
 import mcp_server
 from database import connection as dbconn
 
@@ -15,8 +17,8 @@ def test_tool_invocations_are_serialized_end_to_end(monkeypatch):
     def refresh():
         with state_lock:
             path, level = state.pop(0)
-        dbconn.DATABASE_PATH = path
-        dbconn.ASSISTANT_ACCESS_LEVEL = level
+        monkeypatch.setattr(dbconn, "DATABASE_PATH", path)
+        monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", level)
         return level
 
     def slow_tool():
@@ -54,8 +56,8 @@ def test_refresh_precedes_per_book_lock_and_state_reads(monkeypatch):
 
     def refresh():
         events.append("refresh")
-        dbconn.DATABASE_PATH = "book-b.db"
-        dbconn.ASSISTANT_ACCESS_LEVEL = "post"
+        monkeypatch.setattr(dbconn, "DATABASE_PATH", "book-b.db")
+        monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", "post")
         return "post"
 
     class Writer:
@@ -78,3 +80,27 @@ def test_refresh_precedes_per_book_lock_and_state_reads(monkeypatch):
 
     assert events == ["refresh", ("lock", "book-b.db"),
                       ("body", "book-b.db", "post")]
+
+
+def test_raising_tool_releases_serialization_lock(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(mcp_server, "_refresh_access", lambda: "read")
+    monkeypatch.setattr(
+        mcp_server.mcp_tools, "list_clients",
+        lambda: (_ for _ in ()).throw(RuntimeError("tool failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="tool failed"):
+        mcp_server.list_clients()
+
+    monkeypatch.setattr(
+        mcp_server.mcp_tools, "list_clients",
+        lambda: calls.append("next invocation") or [],
+    )
+    worker = threading.Thread(target=mcp_server.list_clients)
+    worker.start()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert calls == ["next invocation"]
