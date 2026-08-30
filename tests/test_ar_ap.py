@@ -15,6 +15,7 @@ from services.ar_ap import (apply_customer_credit, create_bill, create_customer,
                             post_invoice, record_customer_payment,
                             record_vendor_payment, refund_customer_credit,
                             void_invoice, void_payment)
+from services.inventory import create_item, inventory_position, record_movement
 
 
 @pytest.fixture
@@ -66,6 +67,122 @@ def _audit_actions(since_id=0):
     ).fetchall()
     conn.close()
     return [(row["table_name"], row["action"]) for row in rows]
+
+
+def _inventory_item(client_id, accounts):
+    inventory = Account(client_id=client_id, account_number="1200", name="Inventory", type="Asset")
+    cogs = Account(client_id=client_id, account_number="5000", name="COGS", type="Expense")
+    inventory.save()
+    cogs.save()
+    return create_item(client_id, "WIDGET", "Widget", inventory.id, cogs.id), inventory.id, cogs.id
+
+
+def test_invoice_inventory_post_and_void_use_frozen_cost(client_id, ar_ap_accounts):
+    item_id, inventory_id, cogs_id = _inventory_item(client_id, ar_ap_accounts)
+    record_movement(item_id, date(2026, 7, 1), "purchase", 10, 1001)
+    customer = create_customer(client_id, "Inventory Customer")
+    invoice = create_invoice(client_id, customer.id, [
+        {"description": "Widgets A", "quantity": 2, "unit_price_cents": 3000,
+         "revenue_account_id": ar_ap_accounts["revenue"], "inventory_item_id": item_id},
+        {"description": "Widgets B", "quantity": 3, "unit_price_cents": 3000,
+         "revenue_account_id": ar_ap_accounts["revenue"], "inventory_item_id": item_id},
+        {"description": "Service", "quantity": 1, "unit_price_cents": 500,
+         "revenue_account_id": ar_ap_accounts["revenue"]},
+    ], date(2026, 8, 1), date(2026, 8, 31))
+
+    posted = post_invoice(invoice.id, ar_ap_accounts["ar"])
+    conn = get_connection()
+    movements = conn.execute(
+        "SELECT * FROM inventory_movements WHERE source_type = 'invoice' ORDER BY source_line_id"
+    ).fetchall()
+    cogs_entry_id = movements[0]["journal_entry_id"]
+    conn.close()
+    assert len(movements) == 2
+    assert [(row["source_id"], row["quantity"], row["unit_cost_cents"])
+            for row in movements] == [(invoice.id, -2, 1001), (invoice.id, -3, 1001)]
+    assert len({row["source_line_id"] for row in movements}) == 2
+    assert _entry_lines(posted.journal_entry_id) == [
+        (ar_ap_accounts["ar"], 15500, 0),
+        (ar_ap_accounts["revenue"], 0, 6000),
+        (ar_ap_accounts["revenue"], 0, 9000),
+        (ar_ap_accounts["revenue"], 0, 500),
+    ]
+    assert _entry_lines(cogs_entry_id) == [
+        (cogs_id, 2002, 0), (inventory_id, 0, 2002),
+        (cogs_id, 3003, 0), (inventory_id, 0, 3003),
+    ]
+    assert inventory_position(item_id)["quantity"] == 5
+
+    record_movement(item_id, date(2026, 8, 10), "purchase", 10, 2000)
+    void_invoice(invoice.id, date(2026, 8, 20))
+    conn = get_connection()
+    reversals = conn.execute(
+        "SELECT * FROM inventory_movements WHERE source_type = 'invoice_void' ORDER BY source_line_id"
+    ).fetchall()
+    reversal_entry_id = reversals[0]["journal_entry_id"]
+    conn.close()
+    assert [(row["quantity"], row["unit_cost_cents"]) for row in reversals] == [
+        (2, 1001), (3, 1001),
+    ]
+    assert _entry_lines(reversal_entry_id) == [
+        (inventory_id, 2002, 0), (cogs_id, 0, 2002),
+        (inventory_id, 3003, 0), (cogs_id, 0, 3003),
+    ]
+    assert inventory_position(item_id)["quantity"] == 20
+
+
+def test_invoice_inventory_negative_stock_rolls_back_everything(client_id, ar_ap_accounts):
+    item_id, _, _ = _inventory_item(client_id, ar_ap_accounts)
+    record_movement(item_id, date(2026, 8, 1), "purchase", 1, 1000)
+    customer = create_customer(client_id, "No Stock Customer")
+    invoice = create_invoice(client_id, customer.id, [{
+        "description": "Widgets", "quantity": 2, "unit_price_cents": 3000,
+        "revenue_account_id": ar_ap_accounts["revenue"], "inventory_item_id": item_id,
+    }], date(2026, 8, 2), date(2026, 8, 31))
+    before_entries = _scalar("SELECT COUNT(*) FROM journal_entries")
+    before_movements = _scalar("SELECT COUNT(*) FROM inventory_movements")
+    before_audits = _scalar("SELECT COUNT(*) FROM audit_log")
+
+    with pytest.raises(ValueError, match="Movement cannot reduce inventory below zero"):
+        post_invoice(invoice.id, ar_ap_accounts["ar"])
+
+    assert _scalar("SELECT COUNT(*) FROM journal_entries") == before_entries
+    assert _scalar("SELECT COUNT(*) FROM inventory_movements") == before_movements
+    assert _scalar("SELECT COUNT(*) FROM audit_log") == before_audits
+    assert _scalar("SELECT status FROM invoices WHERE id = ?", (invoice.id,)) == "draft"
+
+
+def test_invoice_inventory_duplicate_post_refuses_without_duplicate_movements(
+    client_id, ar_ap_accounts,
+):
+    item_id, _, _ = _inventory_item(client_id, ar_ap_accounts)
+    record_movement(item_id, date(2026, 8, 1), "purchase", 2, 1000)
+    customer = create_customer(client_id, "Replay Customer")
+    invoice = create_invoice(client_id, customer.id, [{
+        "description": "Widget", "quantity": 1, "unit_price_cents": 3000,
+        "revenue_account_id": ar_ap_accounts["revenue"], "inventory_item_id": item_id,
+    }], date(2026, 8, 2), date(2026, 8, 31))
+    post_invoice(invoice.id, ar_ap_accounts["ar"])
+
+    with pytest.raises(ValueError, match="already been posted"):
+        post_invoice(invoice.id, ar_ap_accounts["ar"])
+
+    assert _scalar(
+        "SELECT COUNT(*) FROM inventory_movements WHERE source_type = 'invoice' AND source_id = ?",
+        (invoice.id,),
+    ) == 1
+
+
+def test_service_invoice_has_no_inventory_entries(client_id, ar_ap_accounts):
+    customer = create_customer(client_id, "Service Customer")
+    invoice = _invoice(client_id, customer.id, ar_ap_accounts, post=False)
+    before_entries = _scalar("SELECT COUNT(*) FROM journal_entries")
+    post_invoice(invoice.id, ar_ap_accounts["ar"])
+    assert _scalar("SELECT COUNT(*) FROM journal_entries") == before_entries + 1
+    assert _scalar("SELECT COUNT(*) FROM inventory_movements") == 0
+    void_invoice(invoice.id, date(2026, 8, 20))
+    assert _scalar("SELECT COUNT(*) FROM journal_entries") == before_entries + 2
+    assert _scalar("SELECT COUNT(*) FROM inventory_movements") == 0
 
 
 def test_invoice_and_bill_post_exact_balanced_entries_and_audits(client_id, ar_ap_accounts):
