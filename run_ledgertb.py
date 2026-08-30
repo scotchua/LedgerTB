@@ -50,6 +50,8 @@ import keyring         # noqa: F401
 import altair          # noqa: F401  (streamlit dependency used for charts)
 import pypdfium2        # noqa: F401  (PDF text extraction and page rendering)
 import PIL              # noqa: F401  (image metadata/packaging support)
+import rapidfuzz        # noqa: F401  (chart-of-accounts fuzzy matching)
+import httpx            # noqa: F401  (bank-feed HTTP client)
 if sys.platform == "darwin":
     import Quartz       # noqa: F401  (native image decoding for Apple Vision OCR)
 
@@ -65,6 +67,24 @@ def bundle_dir() -> Path:
 
 BUNDLE = bundle_dir()
 WINDOW_TITLE = "LedgerTB"
+
+SELFCHECK_MODULES = [
+    "sqlcipher3", "database.connection", "database.crypto", "streamlit", "pandas",
+    "numpy", "pyarrow", "altair", "openpyxl",
+    "openpyxl.styles", "openpyxl.utils", "openpyxl.utils.dataframe",
+    "reportlab", "reportlab.platypus", "reportlab.lib.pagesizes",
+    "reportlab.lib.styles", "reportlab.pdfgen.canvas",
+    "anthropic", "pydantic", "pydantic_core", "dotenv", "platformdirs",
+    "portalocker", "rapidfuzz", "httpx",
+    "mcp", "mcp.server", "mcp.server.stdio",
+    "config", "constants", "money", "models.journal_entry", "models.reconciliation",
+    "models.payables", "models.receivables", "models.payroll", "models.fixed_asset",
+    "services.categorization", "services.document_import", "services.coa_import",
+    "services.bank_feed", "services.ar_ap", "services.inventory",
+    "services.payroll_recording", "services.fixed_assets", "services.ai_providers",
+    "services.ai_providers.anthropic_format", "services.ai_providers.openai_format",
+    "pypdfium2", "PIL", "keyring", "version",
+]
 
 
 def _app_env(suffix: str, default=None):
@@ -277,19 +297,8 @@ def _selfcheck() -> int:
     # NB: submodules must be listed explicitly — importing a package does NOT
     # import its submodules, so a bare "openpyxl" here passed while the Excel
     # export crashed on the missing openpyxl.styles / openpyxl.utils.
-    mods = ["sqlcipher3", "database.connection", "database.crypto", "streamlit", "pandas",
-            "numpy", "pyarrow", "altair", "openpyxl",
-            "openpyxl.styles", "openpyxl.utils", "openpyxl.utils.dataframe",
-            "reportlab", "reportlab.platypus", "reportlab.lib.pagesizes",
-            "reportlab.lib.styles", "reportlab.pdfgen.canvas",
-            "anthropic", "pydantic", "pydantic_core", "dotenv", "platformdirs",
-            "portalocker",
-            "mcp", "mcp.server", "mcp.server.stdio",
-            "config", "constants", "money", "models.journal_entry", "models.reconciliation",
-            "services.categorization", "services.document_import", "pypdfium2", "PIL",
-            "keyring", "version"]
     failed = []
-    for m in mods:
+    for m in SELFCHECK_MODULES:
         try:
             __import__(m)
         except Exception as e:
@@ -328,7 +337,7 @@ def _selfcheck() -> int:
     if failed:
         print("SELFCHECK FAIL:\n  " + "\n  ".join(failed))
         return 1
-    print("SELFCHECK OK — all", len(mods), "modules import")
+    print("SELFCHECK OK — all", len(SELFCHECK_MODULES), "modules import")
     return 0
 
 

@@ -81,7 +81,7 @@ for pkg in (
     "streamlit", "pandas", "numpy", "pyarrow", "altair", "anthropic",
     "openpyxl", "pillow", "tornado", "click", "rich", "platformdirs",
     "python-dotenv", "gitpython", "packaging", "keyring", "portalocker",
-    "pypdfium2", "Pillow", "pyobjc-framework-Quartz",
+    "pypdfium2", "Pillow", "pyobjc-framework-Quartz", "rapidfuzz", "httpx",
 ):
     try:
         metadatas += copy_metadata(pkg)
@@ -96,6 +96,7 @@ hiddenimports = st_hiddenimports + [
     "pypdfium2", "pypdfium2_raw", "PIL", "Quartz", "objc",
     "sqlcipher3", "sqlcipher3.dbapi2",  # encrypted database driver (native ext)
 ] + collect_submodules("openpyxl") + collect_submodules("reportlab") \
+  + collect_submodules("rapidfuzz") + collect_submodules("httpx") \
   + collect_submodules("mcp", filter=lambda name: "mcp.cli" not in name)
     # mcp: the server entry (mcp_server.py) is a data file, invisible to the
     # analyzer — same reason openpyxl/reportlab are collected wholesale.
