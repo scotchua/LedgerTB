@@ -9,6 +9,7 @@ from models.journal_entry import JournalEntry, JournalEntryLine
 from models.payables import Bill, BillLine, Vendor
 from models.receivables import Customer, Invoice, InvoiceLine
 from money import to_dollars
+from services.inventory import _record_movement
 
 
 def _iso(value, field_name: str) -> str:
@@ -46,9 +47,13 @@ def _coerce_lines(lines: Iterable, line_type, account_field: str):
             raise ValueError("Line quantity and unit price must be greater than zero.")
         if account_id <= 0:
             raise ValueError("Each line needs an account.")
+        extra = {}
+        if line_type is InvoiceLine:
+            item_id = _line_value(source, "inventory_item_id")
+            extra["inventory_item_id"] = int(item_id) if item_id not in (None, "") else None
         result.append(line_type(
             description=description, quantity=quantity, unit_price_cents=unit_price_cents,
-            **{account_field: account_id},
+            **{account_field: account_id}, **extra,
         ))
     if not result:
         raise ValueError("At least one line is required.")
@@ -122,17 +127,33 @@ def _create_document(client_id: int, party_id: int, lines: Iterable, document_da
         for line in document_lines:
             _assert_account(cursor, client_id, getattr(line, account_field),
                             "Revenue" if is_invoice else "Expense")
+            if is_invoice and line.inventory_item_id is not None:
+                cursor.execute(
+                    "SELECT 1 FROM inventory_items WHERE id = ? AND client_id = ?",
+                    (line.inventory_item_id, client_id),
+                )
+                if not cursor.fetchone():
+                    raise ValueError("The inventory item must belong to this client.")
         cursor.execute(
             f"INSERT INTO {table} (client_id, {party_field}, {date_field}, due_date) VALUES (?, ?, ?, ?)",
             (client_id, party_id, document_date, due_date),
         )
         record_id = cursor.lastrowid
         for line in document_lines:
-            cursor.execute(
-                f"INSERT INTO {lines_table} ({table[:-1]}_id, description, quantity, unit_price_cents, {account_field}) VALUES (?, ?, ?, ?, ?)",
-                (record_id, line.description, line.quantity, line.unit_price_cents,
-                 getattr(line, account_field)),
-            )
+            if is_invoice:
+                cursor.execute(
+                    "INSERT INTO invoice_lines (invoice_id, description, quantity, "
+                    "unit_price_cents, revenue_account_id, inventory_item_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (record_id, line.description, line.quantity, line.unit_price_cents,
+                     line.revenue_account_id, line.inventory_item_id),
+                )
+            else:
+                cursor.execute(
+                    f"INSERT INTO {lines_table} ({table[:-1]}_id, description, quantity, unit_price_cents, {account_field}) VALUES (?, ?, ?, ?, ?)",
+                    (record_id, line.description, line.quantity, line.unit_price_cents,
+                     getattr(line, account_field)),
+                )
             line.id = cursor.lastrowid
             setattr(line, f"{table[:-1]}_id", record_id)
         document = document_type(
@@ -180,6 +201,7 @@ def _load_document(cursor, record_id: int, is_invoice: bool):
         id=item["id"], **{f"{table[:-1]}_id": record_id}, description=item["description"],
         quantity=item["quantity"], unit_price_cents=item["unit_price_cents"],
         **{account_field: item[account_field]},
+        **({"inventory_item_id": item["inventory_item_id"]} if is_invoice else {}),
     ) for item in cursor.fetchall()]
     return document_type(
         id=row["id"], client_id=row["client_id"], **{party_field: row[party_field]},
@@ -225,6 +247,56 @@ def _post_document(record_id: int, control_account_id: int, is_invoice: bool):
             source_reference=f"{table[:-1].title()} {record_id}", lines=lines,
         )
         entry.save(conn=conn)
+        if is_invoice:
+            inventory_lines = []
+            for line in document.lines:
+                if line.inventory_item_id is None:
+                    continue
+                result = _record_movement(
+                    conn, line.inventory_item_id, document.invoice_date, "sale",
+                    -line.quantity, source_type="invoice", source_id=document.id,
+                    source_line_id=line.id,
+                )
+                inventory_lines.append((line, result))
+            if inventory_lines:
+                cogs_lines = []
+                movement_ids = []
+                for line, result in inventory_lines:
+                    cursor.execute(
+                        "SELECT inventory_account_id, cogs_account_id FROM inventory_items WHERE id = ?",
+                        (line.inventory_item_id,),
+                    )
+                    item = cursor.fetchone()
+                    cursor.execute(
+                        "SELECT unit_cost_cents FROM inventory_movements WHERE id = ?",
+                        (result["movement_id"],),
+                    )
+                    amount_cents = line.quantity * cursor.fetchone()["unit_cost_cents"]
+                    cogs_lines.extend([
+                        JournalEntryLine(account_id=item["cogs_account_id"],
+                                         debit=to_dollars(amount_cents), memo=line.description),
+                        JournalEntryLine(account_id=item["inventory_account_id"],
+                                         credit=to_dollars(amount_cents), memo=line.description),
+                    ])
+                    movement_ids.append(result["movement_id"])
+                cogs_entry = JournalEntry(
+                    client_id=document.client_id, entry_date=document.invoice_date,
+                    description=f"Inventory sale: invoice #{record_id}",
+                    source_reference=f"Invoice {record_id}", entry_type="Adjusting",
+                    lines=cogs_lines,
+                )
+                cogs_entry.save(conn=conn)
+                placeholders = ",".join("?" for _ in movement_ids)
+                cursor.execute(
+                    f"UPDATE inventory_movements SET journal_entry_id = ? WHERE id IN ({placeholders})",
+                    (cogs_entry.id, *movement_ids),
+                )
+                for movement_id in movement_ids:
+                    AuditLog.write(
+                        cursor, document.client_id, "inventory_movements", movement_id,
+                        "UPDATE", old_values={"journal_entry_id": None},
+                        new_values={"journal_entry_id": cogs_entry.id},
+                    )
         cursor.execute(
             f"UPDATE {table} SET status = 'posted', journal_entry_id = ?, control_account_id = ? WHERE id = ?",
             (entry.id, control_account_id, record_id),
@@ -658,6 +730,64 @@ def _void_document(record_id: int, void_date, is_invoice: bool):
             f"Void {table[:-1]} #{record_id}", f"Void {table[:-1]} {record_id}",
         )
         reversal.save(conn=conn)
+        if is_invoice:
+            inventory_lines = []
+            for line in document.lines:
+                if line.inventory_item_id is None:
+                    continue
+                cursor.execute(
+                    "SELECT id, unit_cost_cents FROM inventory_movements "
+                    "WHERE source_type = 'invoice' AND source_id = ? AND source_line_id = ?",
+                    (document.id, line.id),
+                )
+                original = cursor.fetchone()
+                if not original:
+                    raise ValueError(
+                        f"Original inventory movement is missing for invoice line {line.id}."
+                    )
+                inventory_lines.append((line, original))
+            if inventory_lines:
+                cogs_lines = []
+                movement_ids = []
+                reversal_date = date.fromisoformat(_iso(void_date, "void_date"))
+                for line, original in inventory_lines:
+                    result = _record_movement(
+                        conn, line.inventory_item_id, reversal_date, "adjustment",
+                        line.quantity, unit_cost_cents=original["unit_cost_cents"],
+                        source_type="invoice_void", source_id=document.id,
+                        source_line_id=line.id, automatic_journal_entry=False,
+                    )
+                    cursor.execute(
+                        "SELECT inventory_account_id, cogs_account_id FROM inventory_items WHERE id = ?",
+                        (line.inventory_item_id,),
+                    )
+                    item = cursor.fetchone()
+                    amount_cents = line.quantity * original["unit_cost_cents"]
+                    cogs_lines.extend([
+                        JournalEntryLine(account_id=item["inventory_account_id"],
+                                         debit=to_dollars(amount_cents), memo=line.description),
+                        JournalEntryLine(account_id=item["cogs_account_id"],
+                                         credit=to_dollars(amount_cents), memo=line.description),
+                    ])
+                    movement_ids.append(result["movement_id"])
+                cogs_reversal = JournalEntry(
+                    client_id=document.client_id, entry_date=reversal_date,
+                    description=f"Void inventory sale: invoice #{record_id}",
+                    source_reference=f"Void invoice {record_id}", entry_type="Adjusting",
+                    lines=cogs_lines,
+                )
+                cogs_reversal.save(conn=conn)
+                placeholders = ",".join("?" for _ in movement_ids)
+                cursor.execute(
+                    f"UPDATE inventory_movements SET journal_entry_id = ? WHERE id IN ({placeholders})",
+                    (cogs_reversal.id, *movement_ids),
+                )
+                for movement_id in movement_ids:
+                    AuditLog.write(
+                        cursor, document.client_id, "inventory_movements", movement_id,
+                        "UPDATE", old_values={"journal_entry_id": None},
+                        new_values={"journal_entry_id": cogs_reversal.id},
+                    )
         cursor.execute(
             f"UPDATE {table} SET status = 'voided', voided_journal_entry_id = ? WHERE id = ?",
             (reversal.id, record_id),

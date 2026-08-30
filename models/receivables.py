@@ -20,6 +20,7 @@ class InvoiceLine:
     quantity: int = 1
     unit_price_cents: int = 0
     revenue_account_id: int = 0
+    inventory_item_id: Optional[int] = None
 
     @property
     def amount_cents(self) -> int:

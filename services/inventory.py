@@ -150,6 +150,8 @@ def inventory_position(item_id, through_date=None, conn=None):
 def _record_movement(
     conn, item_id, movement_date, movement_type, movement_quantity, closed_period=None,
     unit_cost_cents=None, post_journal_entry=False, offset_account_id=None,
+    source_type=None, source_id=None, source_line_id=None, journal_entry_id=None,
+    automatic_journal_entry=True,
 ):
     """Record and validate one movement in the caller's transaction."""
     cursor = conn.cursor()
@@ -180,8 +182,9 @@ def _record_movement(
             raise ValueError("Movement cannot reduce inventory below zero.")
 
     stored_cost = _round_cents(effective_cost)
-    journal_entry_id = None
-    should_post = post_journal_entry or movement_type in ("adjustment", "count")
+    should_post = post_journal_entry or (
+        automatic_journal_entry and movement_type in ("adjustment", "count")
+    )
     if should_post:
         offset_id = (
             offset_account_id
@@ -223,11 +226,12 @@ def _record_movement(
         """
         INSERT INTO inventory_movements
             (inventory_item_id, movement_date, movement_type, quantity,
-             unit_cost_cents, journal_entry_id)
-        VALUES (?, ?, ?, ?, ?, ?)
+             unit_cost_cents, journal_entry_id, source_type, source_id, source_line_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (item_id, movement_date.isoformat(), movement_type,
-         float(movement_quantity), stored_cost, journal_entry_id),
+         float(movement_quantity), stored_cost, journal_entry_id,
+         source_type, source_id, source_line_id),
     )
     movement_id = cursor.lastrowid
     AuditLog.write(
@@ -239,6 +243,9 @@ def _record_movement(
             "quantity": float(movement_quantity),
             "unit_cost_cents": stored_cost,
             "journal_entry_id": journal_entry_id,
+            "source_type": source_type,
+            "source_id": source_id,
+            "source_line_id": source_line_id,
         },
     )
     result = inventory_position(item_id, conn=conn)

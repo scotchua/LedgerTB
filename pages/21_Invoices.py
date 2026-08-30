@@ -32,6 +32,17 @@ if not client_id:
 with get_cursor() as cursor:
     cursor.execute("SELECT id, name FROM customers WHERE client_id = ? ORDER BY name", (client_id,))
     customers = {row["id"]: row["name"] for row in cursor.fetchall()}
+    cursor.execute(
+        """SELECT i.id, i.sku, COALESCE(SUM(m.quantity), 0) quantity
+           FROM inventory_items i
+           LEFT JOIN inventory_movements m ON m.inventory_item_id = i.id
+           WHERE i.client_id = ? GROUP BY i.id, i.sku ORDER BY i.sku""",
+        (client_id,),
+    )
+    inventory_items = {
+        row["id"]: f"{row['sku']} ({row['quantity']:g} on hand)"
+        for row in cursor.fetchall()
+    }
 
 with st.expander("Add customer"):
     with st.form("add_customer"):
@@ -58,11 +69,17 @@ if customers and revenue:
             unit_price = st.number_input("Unit price", min_value=0.01, step=0.01)
             revenue_id = st.selectbox("Revenue account", [a.id for a in revenue],
                                       format_func=lambda aid: next(f"{a.account_number} — {a.name}" for a in revenue if a.id == aid))
+            inventory_item_id = st.selectbox(
+                "Inventory item (optional)", [None, *inventory_items],
+                format_func=lambda item_id: "Service / not tracked" if item_id is None
+                else inventory_items[item_id],
+            )
             if st.form_submit_button("Create invoice"):
                 try:
                     create_invoice(client_id, customer_id, [{"description": description,
                         "quantity": int(quantity), "unit_price_cents": to_cents(unit_price),
-                        "revenue_account_id": revenue_id}], invoice_date, due_date)
+                        "revenue_account_id": revenue_id,
+                        "inventory_item_id": inventory_item_id}], invoice_date, due_date)
                 except Exception as exc:
                     st.error(str(exc))
                 else:
