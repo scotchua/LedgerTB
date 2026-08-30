@@ -22,6 +22,10 @@ def assistant(client_id, accounts, monkeypatch, tmp_path):
 
     monkeypatch.setattr(books_mod, "USER_DATA_DIR", tmp_path)
     monkeypatch.setattr(mcp_server, "_require_level", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mcp_server, "_refresh_access",
+        lambda: dbconn.ASSISTANT_ACCESS_LEVEL,
+    )
     monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", "post")
 
 

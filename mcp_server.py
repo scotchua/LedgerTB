@@ -159,6 +159,8 @@ def _require_level(minimum: str):
     current = (dbconn.ASSISTANT_ACCESS_LEVEL if getattr(
         _tool_state, "active", False
     ) else _refresh_access())
+    if current not in order:
+        raise PermissionError("LedgerTB assistant access is not available.")
     if order.index(current) < order.index(minimum):
         raise ValueError(
             f"This tool needs assistant access level '{minimum}'; the current "

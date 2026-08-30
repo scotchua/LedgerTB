@@ -82,10 +82,14 @@ def test_refresh_precedes_per_book_lock_and_state_reads(monkeypatch):
                       ("body", "book-b.db", "post")]
 
 
-def test_raising_tool_releases_serialization_lock(monkeypatch):
+def test_raising_tool_releases_lock_and_resets_active(monkeypatch):
     calls = []
 
-    monkeypatch.setattr(mcp_server, "_refresh_access", lambda: "read")
+    monkeypatch.setattr(
+        mcp_server, "_refresh_access",
+        lambda: dbconn.ASSISTANT_ACCESS_LEVEL,
+    )
+    monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", "read")
     monkeypatch.setattr(
         mcp_server.mcp_tools, "list_clients",
         lambda: (_ for _ in ()).throw(RuntimeError("tool failed")),
@@ -93,6 +97,8 @@ def test_raising_tool_releases_serialization_lock(monkeypatch):
 
     with pytest.raises(RuntimeError, match="tool failed"):
         mcp_server.list_clients()
+
+    assert not getattr(mcp_server._tool_state, "active", False)
 
     monkeypatch.setattr(
         mcp_server.mcp_tools, "list_clients",
@@ -104,3 +110,21 @@ def test_raising_tool_releases_serialization_lock(monkeypatch):
 
     assert not worker.is_alive()
     assert calls == ["next invocation"]
+
+
+def test_sequential_tool_call_honors_vault_level_change(monkeypatch):
+    levels = iter(("post", None))
+
+    def refresh():
+        level = next(levels)
+        monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", level)
+        if level is None:
+            raise PermissionError("assistant access disabled")
+        return level
+
+    monkeypatch.setattr(mcp_server, "_refresh_access", refresh)
+    monkeypatch.setattr(mcp_server.mcp_tools, "list_clients", lambda: [])
+
+    assert mcp_server.list_clients() == []
+    with pytest.raises(PermissionError, match="assistant access disabled"):
+        mcp_server.list_clients()
