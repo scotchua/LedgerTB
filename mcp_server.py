@@ -19,6 +19,7 @@ Run from the bundle:  LEDGERTB_MODE=mcp <LedgerTB binary>
 """
 import functools
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,6 +31,13 @@ from services import mcp_tools
 from services.backups import active_book_id
 from utils.assistant_access import credential_names
 from utils import secure_store
+
+
+# The MCP framework may dispatch calls on parallel worker threads. Keep this
+# explicit invariant even if its worker count is later pinned to one: database
+# path, key, read-only mode, and access level are process globals.
+_tool_lock = threading.Lock()
+_tool_state = threading.local()
 
 
 def _access_level(names) -> str:
@@ -131,9 +139,28 @@ def _mutating(fn):
     return wrapper
 
 
+def _serialized(fn):
+    """Refresh book state, then run one complete tool call without overlap."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _tool_lock:
+            _refresh_access()
+            _tool_state.active = True
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _tool_state.active = False
+
+    return wrapper
+
+
 def _require_level(minimum: str):
     order = ("read", "propose", "post")
-    current = _refresh_access()
+    current = (dbconn.ASSISTANT_ACCESS_LEVEL if getattr(
+        _tool_state, "active", False
+    ) else _refresh_access())
+    if current not in order:
+        raise PermissionError("LedgerTB assistant access is not available.")
     if order.index(current) < order.index(minimum):
         raise ValueError(
             f"This tool needs assistant access level '{minimum}'; the current "
@@ -172,6 +199,7 @@ def _unlock_from_vault() -> bool:
 
 
 @server.tool()
+@_serialized
 def list_clients() -> list:
     """List the clients (sets of books) with their client_id."""
     _require_level("read")
@@ -179,6 +207,7 @@ def list_clients() -> list:
 
 
 @server.tool()
+@_serialized
 def list_accounts(client_id: int) -> list:
     """The client's chart of accounts: number, name, type, subtype, active."""
     _require_level("read")
@@ -186,6 +215,7 @@ def list_accounts(client_id: int) -> list:
 
 
 @server.tool()
+@_serialized
 def client_branding_detail(client_id: int) -> dict:
     """The client identity used on deliverables and any pending text/color
     proposals. Reports whether a logo exists without exposing its contents."""
@@ -194,6 +224,7 @@ def client_branding_detail(client_id: int) -> dict:
 
 
 @server.tool()
+@_serialized
 @_mutating
 def propose_client_branding(client_id: int, display_name: str = "",
                             tagline: str = "", accent_hex: str = "",
@@ -212,6 +243,7 @@ def propose_client_branding(client_id: int, display_name: str = "",
 
 
 @server.tool()
+@_serialized
 def trial_balance(client_id: int, as_of: str = "",
                   compare_to_prior_year: bool = False) -> dict:
     """Trial balance as of a date (ISO, default today): every account's debit
@@ -223,6 +255,7 @@ def trial_balance(client_id: int, as_of: str = "",
 
 
 @server.tool()
+@_serialized
 def income_statement(client_id: int, start: str, end: str,
                      compare_to_prior_year: bool = False) -> dict:
     """Income statement for a period (ISO dates): revenues, expenses, and net
@@ -234,6 +267,7 @@ def income_statement(client_id: int, start: str, end: str,
 
 
 @server.tool()
+@_serialized
 def balance_sheet(client_id: int, as_of: str,
                   compare_to_prior_year: bool = False) -> dict:
     """Balance sheet as of a date (ISO): assets, liabilities, equity (including
@@ -244,6 +278,7 @@ def balance_sheet(client_id: int, as_of: str,
 
 
 @server.tool()
+@_serialized
 def cash_flow_statement(client_id: int, start: str, end: str,
                         compare_to_prior_year: bool = False) -> dict:
     """Derived indirect-method cash flow for an ISO date range. Returns
@@ -257,6 +292,7 @@ def cash_flow_statement(client_id: int, start: str, end: str,
 
 
 @server.tool()
+@_serialized
 def general_ledger(client_id: int, account_number: str,
                    start: str = "", end: str = "") -> dict:
     """One account's ledger for a period: dated entries with running balance.
@@ -267,6 +303,7 @@ def general_ledger(client_id: int, account_number: str,
 
 
 @server.tool()
+@_serialized
 def find_entries(client_id: int, search: str = "", start: str = "",
                  end: str = "", account_number: str = "",
                  entry_type: str = "", limit: int = 50) -> list:
@@ -281,6 +318,7 @@ def find_entries(client_id: int, search: str = "", start: str = "",
 
 
 @server.tool()
+@_serialized
 def entry_detail(client_id: int, entry_id: int) -> dict:
     """A single journal entry with all its debit/credit lines and memos."""
     _require_level("read")
@@ -288,6 +326,7 @@ def entry_detail(client_id: int, entry_id: int) -> dict:
 
 
 @server.tool()
+@_serialized
 def close_readiness(client_id: int, fiscal_year: int) -> dict:
     """Close Map status for a fiscal year: account balances, PY changes,
     evidence counts, exceptions, and human preparer/reviewer signoffs."""
@@ -296,6 +335,7 @@ def close_readiness(client_id: int, fiscal_year: int) -> dict:
 
 
 @server.tool()
+@_serialized
 def account_close_detail(client_id: int, fiscal_year: int,
                          account_id: int) -> dict:
     """Detailed Close Map record for one account, including its explanation,
@@ -306,6 +346,7 @@ def account_close_detail(client_id: int, fiscal_year: int,
 
 
 @server.tool()
+@_serialized
 @_mutating
 def propose_close_explanation(client_id: int, fiscal_year: int, account_id: int,
                               explanation: str, rationale: str = "") -> dict:
@@ -319,6 +360,7 @@ def propose_close_explanation(client_id: int, fiscal_year: int, account_id: int,
 
 
 @server.tool()
+@_serialized
 @_mutating
 def propose_entry(client_id: int, entry_date: str, description: str,
                   lines: list, rationale: str = "",
@@ -339,6 +381,7 @@ def propose_entry(client_id: int, entry_date: str, description: str,
 
 
 @server.tool()
+@_serialized
 @_mutating
 def propose_correction(client_id: int, original_entry_id: int,
                        entry_date: str, description: str, lines: list,
@@ -357,6 +400,7 @@ def propose_correction(client_id: int, original_entry_id: int,
 
 
 @server.tool()
+@_serialized
 @_mutating
 def propose_depreciation_run(client_id: int, fixed_asset_id: int,
                              period_end: str, rationale: str = "") -> dict:
@@ -369,6 +413,7 @@ def propose_depreciation_run(client_id: int, fixed_asset_id: int,
 
 
 @server.tool()
+@_serialized
 def list_drafts(client_id: int, status: str = "pending") -> list:
     """Draft entries this server has filed and their review status
     ("pending", "approved", "rejected", or "all")."""
@@ -377,6 +422,7 @@ def list_drafts(client_id: int, status: str = "pending") -> list:
 
 
 @server.tool()
+@_serialized
 @_mutating
 def propose_import(client_id: int, bank_account_number: str, rows: list,
                    source_label: str = "Assistant import") -> dict:
@@ -393,6 +439,7 @@ def propose_import(client_id: int, bank_account_number: str, rows: list,
 
 
 @server.tool()
+@_serialized
 def list_staged_imports(client_id: int) -> list:
     """Staged transactions still awaiting human review in the import flow."""
     _require_level("read")
@@ -400,6 +447,7 @@ def list_staged_imports(client_id: int) -> list:
 
 
 @server.tool()
+@_serialized
 @_mutating
 def sync_bank_feed(client_id: int, bank_account_id: int) -> dict:
     """Fetch a linked SimpleFIN account and stage new transactions for human
@@ -410,6 +458,7 @@ def sync_bank_feed(client_id: int, bank_account_id: int) -> dict:
 
 
 @server.tool()
+@_serialized
 @_mutating
 def post_entry(client_id: int, entry_date: str, description: str,
                lines: list, entry_type: str = "Regular") -> dict:
@@ -425,6 +474,7 @@ def post_entry(client_id: int, entry_date: str, description: str,
 
 
 @server.tool()
+@_serialized
 def export_close_package(client_id: int, period_start: str, period_end: str,
                          out_dir: str) -> dict:
     """Write the period's close package — a branded PDF and an Excel workbook
@@ -439,6 +489,7 @@ def export_close_package(client_id: int, period_start: str, period_end: str,
 
 
 @server.tool()
+@_serialized
 @_mutating
 def create_client(name: str, entity_type: str = "",
                   fiscal_year_end_month: int = 12,
@@ -452,6 +503,7 @@ def create_client(name: str, entity_type: str = "",
 
 
 @server.tool()
+@_serialized
 @_mutating
 def import_accounts(client_id: int, rows: list) -> dict:
     """Add accounts to a client's chart of accounts. rows:
@@ -464,6 +516,7 @@ def import_accounts(client_id: int, rows: list) -> dict:
 
 
 @server.tool()
+@_serialized
 def integrity_sweep(client_id: int, start: str, end: str) -> dict:
     """Deterministic bookkeeping checks for a period: unbalanced or one-line
     entries, unposted imports, broken import links, future dates,

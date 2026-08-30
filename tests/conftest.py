@@ -21,12 +21,11 @@ from models.journal_entry import JournalEntry, JournalEntryLine
 
 @pytest.fixture(autouse=True)
 def _human_actor_by_default(monkeypatch):
-    """mcp_server's vault unlock marks the whole process as assistant
-    (utils.actor._ASSISTANT); without this reset, one vault-unlock test taints
-    every later test's writes with the "(AI)" stamp."""
+    """Reset process-global assistant state before every test."""
     from utils import actor
 
     monkeypatch.setattr(actor, "_ASSISTANT", False)
+    monkeypatch.setattr(db_connection, "ASSISTANT_ACCESS_LEVEL", None)
 
 
 @pytest.fixture(autouse=True)
