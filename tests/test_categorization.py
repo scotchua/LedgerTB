@@ -248,6 +248,66 @@ def test_unknown_provider_fails_closed_before_request(monkeypatch):
     network.assert_not_called()
 
 
+def test_stored_provider_beats_environment_default(
+    monkeypatch, fake_credential_vault
+):
+    fake_credential_vault["firm:ai_provider"] = "openai"
+    monkeypatch.setattr("services.categorization.AI_PROVIDER", "anthropic")
+    monkeypatch.setattr("services.categorization.OPENAI_API_KEY", "openai-key")
+
+    service = CategorizationService()
+
+    assert service.provider.name == "openai"
+
+
+def test_selected_provider_reads_current_key_from_vault(
+    monkeypatch, fake_credential_vault
+):
+    fake_credential_vault["firm:ai_provider"] = "openai"
+    fake_credential_vault["openai_api_key"] = "saved-openai-key"
+    monkeypatch.setattr("services.categorization.OPENAI_API_KEY", "")
+
+    service = CategorizationService()
+
+    assert service.is_available()
+    assert service.api_key == "saved-openai-key"
+
+
+def test_environment_provider_beats_builtin_default(monkeypatch):
+    monkeypatch.setattr("services.categorization.AI_PROVIDER", "openai")
+    monkeypatch.setattr("services.categorization.OPENAI_API_KEY", "openai-key")
+
+    service = CategorizationService()
+
+    assert service.provider.name == "openai"
+
+
+def test_builtin_provider_default_is_anthropic(monkeypatch):
+    monkeypatch.setattr("services.categorization.AI_PROVIDER", "")
+
+    service = CategorizationService()
+
+    assert service.provider.name == "anthropic"
+
+
+def test_garbage_stored_provider_fails_closed(monkeypatch, fake_credential_vault):
+    fake_credential_vault["firm:ai_provider"] = "garbage"
+    network = MagicMock()
+    monkeypatch.setattr("services.ai_providers.openai_format.urlopen", network)
+
+    service = CategorizationService()
+    result = service.categorize_transactions(
+        [{"date": "", "description": "X", "amount": -1.0}], _accts()
+    )
+
+    assert not service.is_available()
+    assert service.last_error == (
+        "Unknown AI_PROVIDER 'garbage'; expected one of: anthropic, openai."
+    )
+    assert "suggested_account_id" not in result[0]
+    network.assert_not_called()
+
+
 @pytest.mark.parametrize("provider", ["anthropic", "openai"])
 def test_missing_selected_key_fails_closed_before_request(monkeypatch, provider):
     monkeypatch.setattr("services.categorization.AI_PROVIDER", provider)

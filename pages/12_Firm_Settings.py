@@ -264,30 +264,50 @@ st.caption(
     "receives this client data. Suggestions only; nothing posts without review."
 )
 
-from config import AI_PROVIDER, ANTHROPIC_API_KEY, OPENAI_API_KEY
+from services.categorization import (
+    AI_PROVIDER_SECRET_NAME,
+    provider_api_key,
+    selected_ai_provider,
+)
 from utils.secure_store import delete_secret, get_secret, set_secret
 
 _saved_key = get_secret("anthropic_api_key")
 _saved_openai_key = get_secret("openai_api_key")
-_active_key = {
-    "anthropic": ANTHROPIC_API_KEY,
-    "openai": OPENAI_API_KEY,
-}.get(AI_PROVIDER)
-if _active_key:
-    st.success(
-        f"AI categorization is enabled with {AI_PROVIDER.title()} for this session."
-    )
-elif AI_PROVIDER not in ("anthropic", "openai"):
+_selected_provider = selected_ai_provider()
+_provider_options = {"Anthropic": "anthropic", "OpenAI": "openai"}
+_selected_label = next(
+    (label for label, value in _provider_options.items()
+     if value == _selected_provider),
+    None,
+)
+if _selected_label is None:
     st.error(
-        f"AI_PROVIDER {AI_PROVIDER!r} is not recognized; categorization is disabled."
+        f"Saved AI provider {_selected_provider!r} is not recognized; "
+        "categorization is disabled until you select Anthropic or OpenAI."
     )
-elif (_saved_key if AI_PROVIDER == "anthropic" else _saved_openai_key):
-    st.info(
-        "The selected provider's API key is saved. Restart LedgerTB to enable "
-        "AI categorization."
+provider_col, status_col = st.columns(2)
+with provider_col:
+    provider_label = st.selectbox(
+        "AI provider",
+        list(_provider_options),
+        index=(list(_provider_options).index(_selected_label)
+               if _selected_label else None),
+        placeholder="Select a valid provider",
+        key="firm_settings_ai_provider",
     )
-else:
-    st.warning(f"Not configured — add an {AI_PROVIDER.title()} API key below.")
+    provider = _provider_options.get(provider_label)
+    if provider and provider != _selected_provider:
+        set_secret(AI_PROVIDER_SECRET_NAME, provider)
+        st.rerun()
+
+_active_key = provider_api_key(provider) if provider else ""
+with status_col:
+    if not provider:
+        st.warning("ACTIVE: none — select Anthropic or OpenAI.")
+    elif _active_key:
+        st.success(f"ACTIVE: {provider_label} — API key configured.")
+    else:
+        st.warning(f"ACTIVE: {provider_label} — no API key configured.")
 
 api_key_input = st.text_input(
     "Anthropic API Key",
@@ -301,7 +321,7 @@ with key_cols[0]:
     if st.button("Save key", type="primary", disabled=not api_key_input):
         try:
             set_secret("anthropic_api_key", api_key_input.strip())
-            st.success("Saved to the system credential vault. Restart LedgerTB to enable.")
+            st.success("Saved to the system credential vault.")
         except Exception as exc:
             st.error(f"Could not save the API key securely: {exc}")
 with key_cols[1]:
@@ -324,7 +344,7 @@ with openai_key_cols[0]:
     ):
         try:
             set_secret("openai_api_key", openai_key_input.strip())
-            st.success("Saved to the system credential vault. Restart LedgerTB to enable.")
+            st.success("Saved to the system credential vault.")
         except Exception as exc:
             st.error(f"Could not save the API key securely: {exc}")
 with openai_key_cols[1]:
