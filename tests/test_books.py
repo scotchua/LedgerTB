@@ -142,6 +142,16 @@ def test_missing_sidecar_fences_owner(settings, tmp_path):
         book_lock.verify_and_refresh(book)
 
 
+def test_keyed_non_local_session_without_owned_token_passes_gate(
+        db, monkeypatch):
+    from utils import unlock
+
+    monkeypatch.setattr(books, "is_local_book", lambda _book: False)
+
+    assert book_lock._owned_token(dbconn.DATABASE_PATH) is None
+    assert unlock.require_unlock() is None
+
+
 def test_switching_books_isolates_data(client_id, accounts, tmp_path,
                                        monkeypatch):
     from database import init_database

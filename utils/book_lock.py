@@ -149,8 +149,10 @@ def takeover(book) -> dict:
 def verify_and_refresh(book) -> bool:
     """Fence a former owner and refresh the current owner's heartbeat."""
     token = _owned_token(book)
+    if not token:
+        return
     holder = read_lock(book)
-    if not token or not holder or holder.get("token") != token:
+    if not holder or holder.get("token") != token:
         _forget(book)
         raise RuntimeError(TAKEN_OVER_MESSAGE)
     holder["heartbeat_at"] = _now().isoformat(timespec="seconds")
