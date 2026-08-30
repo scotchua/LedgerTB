@@ -8,7 +8,9 @@ from models.fiscal_period import FiscalPeriod
 from models.transaction import ImportedTransaction
 
 
-def test_delete_entry_linked_to_imported_transaction_is_blocked(client_id, accounts):
+def test_delete_entry_linked_to_imported_transaction_uses_blanket_refusal(
+    client_id, accounts
+):
     """Imported source history must never be left marked Posted without its entry."""
     entry = post_entry(client_id, date(2025, 5, 1), [
         (accounts["cash"], 100, 0),
@@ -28,7 +30,7 @@ def test_delete_entry_linked_to_imported_transaction_is_blocked(client_id, accou
     )
     txn.save()
 
-    with pytest.raises(ValueError, match="Reverse it instead"):
+    with pytest.raises(ValueError, match="Posted entries cannot be deleted"):
         JournalEntry.delete(entry.id)
 
     assert JournalEntry.get_by_id(entry.id) is not None

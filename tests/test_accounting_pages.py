@@ -806,21 +806,22 @@ def test_journal_discards_unsaved_state_for_same_client_id_in_another_book(
         type="Revenue",
     ).save()
 
-    # Simulate other client-owned workflow state that must never survive the
-    # book boundary, even though both selected clients have numeric id 1.
-    journal.session_state["editing_entry_id"] = 123
-    journal.session_state["correct_import_entry_id"] = 123
-    journal.session_state["journal_active_tab"] = "View Entries"
-    journal.session_state["filter_search"] = "FIRST BOOK"
-    journal.session_state["journal_page"] = 4
+    # The reverse-and-correct workflow is client-owned state and must never
+    # survive the book boundary, even though both clients have numeric id 1.
+    journal.session_state["reverse_and_correct_entry_id"] = 123
+    journal.session_state["reversal_entry_id"] = 123
+    journal.session_state["journal_active_tab"] = "Reverse Entry"
+    journal.session_state["reversal_date"] = date(2026, 8, 1)
+    journal.session_state["confirm_reversal"] = True
     journal.run()
 
     assert not journal.exception
     assert journal.session_state["je_form_gen"] == 1
     assert journal.session_state["journal_active_tab"] == "New Entry"
-    assert journal.session_state["editing_entry_id"] is None
-    assert "correct_import_entry_id" not in journal.session_state
-    assert "filter_search" not in journal.session_state
+    assert "reverse_and_correct_entry_id" not in journal.session_state
+    assert "reversal_entry_id" not in journal.session_state
+    assert "reversal_date" not in journal.session_state
+    assert "confirm_reversal" not in journal.session_state
     assert journal.selectbox(key="account_0_g1").value is None
     assert journal.number_input(key="debit_0_g1").value == 0.0
     assert journal.text_input(key="je_hdr_desc_g1").value == ""
@@ -867,17 +868,17 @@ def test_current_client_journal_intent_survives_destination_context_reset(
     set_client_intent(
         journal.session_state,
         "journal",
-        {"entry_id": target.id, "view": "New Entry"},
+        {"entry_id": target.id, "view": "View Entries"},
         second_client_id,
         dbconn.DATABASE_PATH,
     )
     journal.run()
 
     assert not journal.exception
-    assert journal.session_state["journal_active_tab"] == "New Entry"
-    assert journal.session_state["editing_entry_id"] == target.id
+    assert journal.session_state["journal_active_tab"] == "View Entries"
+    assert journal.session_state["reverse_and_correct_entry_id"] == target.id
     assert journal.session_state["je_form_gen"] == 1
-    assert journal.text_input(key="je_hdr_desc_g1").value == "test entry"
+    assert journal.button(key=f"reverse_correct_entry_{target.id}")
     assert journal.selectbox(key="account_0_g1").value == second_cash.id
 
 

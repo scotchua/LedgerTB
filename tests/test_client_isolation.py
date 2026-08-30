@@ -97,7 +97,7 @@ def test_entry_save_rejects_cross_client_accounts(two_clients):
     assert JournalEntry.count(d["b"]) == 1
 
 
-def test_entry_update_rejects_cross_client_id(two_clients):
+def test_entry_save_with_id_and_reverse_reject_cross_client_id(two_clients):
     d = two_clients
     entry = JournalEntry(
         id=d["b_entry"],
@@ -109,9 +109,14 @@ def test_entry_update_rejects_cross_client_id(two_clients):
             JournalEntryLine(account_id=d["a_rev"], credit=100),
         ],
     )
-    with pytest.raises(ValueError, match="not found"):
+    with pytest.raises(ValueError, match="Posted entries cannot be edited"):
         entry.save()
+    with pytest.raises(ValueError, match="not found for the selected client"):
+        JournalEntry.reverse(d["b_entry"], d["a"])
     assert JournalEntry.get_by_id(d["b_entry"]).description == "test entry"
+    assert JournalEntry.get_by_id(d["b_entry"]).reversed_by_journal_entry_id is None
+    assert JournalEntry.count(d["a"]) == 1
+    assert JournalEntry.count(d["b"]) == 1
 
 
 def test_account_update_rejects_cross_client_id(two_clients):

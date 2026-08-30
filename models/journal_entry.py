@@ -491,6 +491,31 @@ class JournalEntry:
                     f"#{row['reversed_by_journal_entry_id']}."
                 )
 
+            cursor.execute(
+                """SELECT 1
+                   FROM bank_reconciliation_items bri
+                   JOIN journal_entry_lines jel
+                     ON jel.id = bri.journal_entry_line_id
+                   WHERE jel.journal_entry_id = ? LIMIT 1""",
+                (entry_id,),
+            )
+            if cursor.fetchone():
+                raise ValueError(
+                    "This entry is selected in a bank reconciliation. Unselect it, "
+                    "or reopen the completed reconciliation, before reversing it."
+                )
+
+            cursor.execute(
+                """SELECT id FROM imported_transactions
+                   WHERE client_id = ? AND journal_entry_id = ? LIMIT 1""",
+                (client_id, entry_id),
+            )
+            if cursor.fetchone():
+                raise ValueError(
+                    "Imported postings cannot be reversed here. Correct the category, "
+                    "or reverse the import batch from Import History."
+                )
+
             controlled_tables = (
                 ("invoices", "invoice"), ("bills", "bill"),
                 ("payments", "customer payment"),
