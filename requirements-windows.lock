@@ -95,6 +95,7 @@ pywebview==6.2.1
 pywin32==312
 pywin32-ctypes==0.2.3
 referencing==0.37.0
+rapidfuzz==3.14.3
 reportlab==5.0.0
 requests==2.34.2
 rpds-py==2026.6.3

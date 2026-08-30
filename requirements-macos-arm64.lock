@@ -78,6 +78,7 @@ python-dotenv==1.2.2
 python-multipart==0.0.32
 pywebview==6.2.1
 referencing==0.37.0
+rapidfuzz==3.14.3
 reportlab==5.0.0
 requests==2.34.2
 rpds-py==2026.6.3
