@@ -90,6 +90,33 @@ def test_reverse_swaps_lines_links_audits_and_refuses_second(client_id, accounts
         JournalEntry.reverse(entry.id, client_id)
 
 
+def test_reverse_participates_in_caller_transaction(client_id, accounts):
+    from database.connection import get_connection, get_cursor
+
+    entry = post_entry(client_id, date(2025, 5, 4), [
+        (accounts["cash"], 125, 0),
+        (accounts["revenue"], 0, 125),
+    ])
+    with get_cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) FROM audit_log")
+        audit_count = cursor.fetchone()[0]
+
+    conn = get_connection()
+    try:
+        JournalEntry.reverse(entry.id, client_id, conn=conn)
+        raise RuntimeError("fault between reversal and correction")
+    except RuntimeError:
+        conn.rollback()
+    finally:
+        conn.close()
+
+    assert JournalEntry.count(client_id) == 1
+    assert JournalEntry.get_by_id(entry.id).reversed_by_journal_entry_id is None
+    with get_cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) FROM audit_log")
+        assert cursor.fetchone()[0] == audit_count
+
+
 def test_closed_period_reversal_requires_and_uses_open_date(client_id, accounts):
     entry = post_entry(client_id, date(2025, 12, 31), [
         (accounts["cash"], 80, 0),

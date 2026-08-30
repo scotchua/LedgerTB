@@ -875,10 +875,9 @@ def test_current_client_journal_intent_survives_destination_context_reset(
     journal.run()
 
     assert not journal.exception
-    assert journal.session_state["journal_active_tab"] == "View Entries"
+    assert journal.session_state["journal_active_tab"] == "New Entry"
     assert journal.session_state["reverse_and_correct_entry_id"] == target.id
     assert journal.session_state["je_form_gen"] == 1
-    assert journal.button(key=f"reverse_correct_entry_{target.id}")
     assert journal.selectbox(key="account_0_g1").value == second_cash.id
 
 
@@ -937,13 +936,53 @@ def test_reverse_and_correct_prefills_new_entry(client_id, accounts, monkeypatch
 
     journal.button(key=f"reverse_correct_entry_{entry.id}").click().run()
     assert not journal.exception
-    assert journal.session_state["journal_active_tab"] == "Reverse Entry"
-    journal.checkbox(key="confirm_reversal").check().run()
-    journal.button(key="post_reversal").click().run()
-    assert not journal.exception
     assert journal.session_state["journal_active_tab"] == "New Entry"
     assert journal.session_state["correction_source_entry_id"] == entry.id
+    assert journal.session_state["reverse_and_correct_entry_id"] == entry.id
     assert journal.selectbox(key="account_0_g1").value == accounts["cash"]
+
+
+def test_abandoning_staged_correction_posts_nothing(client_id, accounts, monkeypatch):
+    _select_client(monkeypatch, client_id)
+    entry = post_entry(
+        client_id, date(2026, 3, 21),
+        [(accounts["cash"], 60, 0), (accounts["revenue"], 0, 60)],
+    )
+    journal = AppTest.from_file(
+        page_path("pages/2_Journal_Entries.py"), default_timeout=30
+    )
+    journal.session_state["journal_active_tab"] = "View Entries"
+    journal.run()
+
+    journal.button(key=f"reverse_correct_entry_{entry.id}").click().run()
+    next(b for b in journal.button if b.label == "Clear Form").click().run()
+
+    assert JournalEntry.count(client_id) == 1
+    assert JournalEntry.get_by_id(entry.id).reversed_by_journal_entry_id is None
+    assert "reverse_and_correct_entry_id" not in journal.session_state
+
+
+def test_staged_correction_refuses_if_plain_reverse_wins_race(
+    client_id, accounts, monkeypatch
+):
+    _select_client(monkeypatch, client_id)
+    entry = post_entry(
+        client_id, date(2026, 3, 21),
+        [(accounts["cash"], 60, 0), (accounts["revenue"], 0, 60)],
+    )
+    journal = AppTest.from_file(
+        page_path("pages/2_Journal_Entries.py"), default_timeout=30
+    )
+    journal.session_state["journal_active_tab"] = "View Entries"
+    journal.run()
+    journal.button(key=f"reverse_correct_entry_{entry.id}").click().run()
+
+    plain_reversal = JournalEntry.reverse(entry.id, client_id)
+    next(b for b in journal.button if b.label == "Save Entry").click().run()
+
+    errors = " ".join(str(item.value) for item in journal.error)
+    assert f"already reversed by JE #{plain_reversal.id}" in errors
+    assert JournalEntry.count(client_id) == 2
 
 
 def test_correction_copy_of_aje_preserves_its_reference(client_id, accounts, monkeypatch):
@@ -966,12 +1005,17 @@ def test_correction_copy_of_aje_preserves_its_reference(client_id, accounts, mon
     journal = AppTest.from_file(page_path("pages/2_Journal_Entries.py"), default_timeout=30
     )
     journal.session_state["reverse_and_correct_entry_id"] = entry.id
-    journal.session_state["reversal_entry_id"] = entry.id
-    journal.session_state["journal_active_tab"] = "Reverse Entry"
+    journal.session_state["correction_source_entry_id"] = entry.id
+    journal.session_state["je_lines"] = [
+        {'account_id': line.account_id, 'debit': line.debit,
+         'credit': line.credit, 'memo': line.memo or ''}
+        for line in entry.lines
+    ]
+    journal.session_state["je_entry_type"] = entry.entry_type
+    journal.session_state["je_aje_reference"] = entry.aje_reference
+    journal.session_state["journal_active_tab"] = "New Entry"
     journal.run()
     assert not journal.exception
-    journal.checkbox(key="confirm_reversal").check().run()
-    journal.button(key="post_reversal").click().run()
     next(b for b in journal.button if b.label == "Save Entry").click().run()
 
     assert not journal.exception

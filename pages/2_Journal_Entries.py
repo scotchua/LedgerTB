@@ -159,48 +159,6 @@ if st.session_state.pop("_prune_je_form_widgets", False):
 if 'correction_source_entry_id' not in st.session_state:
     st.session_state.correction_source_entry_id = None
 
-# Check if we're coming from General Ledger drill-down
-if 'edit_entry_id' in st.session_state:
-    # A context change already rotated the form before the valid, tagged
-    # navigation intent was applied. Same-context drill-downs still need a new
-    # generation so an unsaved form cannot overwrite the loaded entry.
-    if not journal_scope.changed:
-        start_new_form_generation()
-    entry_to_edit = JournalEntry.get_by_id(st.session_state.edit_entry_id, client_id=client_id)
-    if entry_to_edit:
-        import_link = ImportedTransaction.get_links_for_journal_entries(
-            client_id, [entry_to_edit.id]
-        ).get(entry_to_edit.id)
-        if import_link:
-            st.session_state.correct_import_entry_id = entry_to_edit.id
-            st.info(
-                "Imported postings use a category correction so their source "
-                "and reconciliation history remain intact."
-            )
-        else:
-            st.session_state.journal_active_tab = "New Entry"
-            st.session_state.reverse_and_correct_entry_id = entry_to_edit.id
-            st.session_state.journal_active_tab = "View Entries"
-            st.info("Posted entries are immutable. Reverse this entry to correct it.")
-    del st.session_state.edit_entry_id
-
-
-def reset_entry_form():
-    start_new_form_generation()
-    st.session_state.je_lines = _empty_je_lines()
-    st.session_state.correction_source_entry_id = None
-    # Clear header fields
-    if 'je_entry_date' in st.session_state:
-        del st.session_state.je_entry_date
-    if 'je_entry_type' in st.session_state:
-        del st.session_state.je_entry_type
-    if 'je_source_reference' in st.session_state:
-        del st.session_state.je_source_reference
-    if 'je_description' in st.session_state:
-        del st.session_state.je_description
-    if 'je_aje_reference' in st.session_state:
-        del st.session_state.je_aje_reference
-
 
 def load_entry_as_correction(entry: JournalEntry):
     st.session_state.correction_source_entry_id = entry.id
@@ -221,6 +179,48 @@ def load_entry_as_correction(entry: JournalEntry):
     start_new_form_generation()
 
 
+# Check if we're coming from General Ledger drill-down
+if 'edit_entry_id' in st.session_state:
+    # A context change already rotated the form before the valid, tagged
+    # navigation intent was applied. Same-context drill-downs still need a new
+    # generation so an unsaved form cannot overwrite the loaded entry.
+    entry_to_edit = JournalEntry.get_by_id(st.session_state.edit_entry_id, client_id=client_id)
+    if entry_to_edit:
+        import_link = ImportedTransaction.get_links_for_journal_entries(
+            client_id, [entry_to_edit.id]
+        ).get(entry_to_edit.id)
+        if import_link:
+            st.session_state.correct_import_entry_id = entry_to_edit.id
+            st.info(
+                "Imported postings use a category correction so their source "
+                "and reconciliation history remain intact."
+            )
+        else:
+            load_entry_as_correction(entry_to_edit)
+            st.session_state.reverse_and_correct_entry_id = entry_to_edit.id
+            st.session_state.journal_active_tab = "New Entry"
+            st.info(f"Correcting journal entry #{entry_to_edit.id}.")
+    del st.session_state.edit_entry_id
+
+
+def reset_entry_form():
+    start_new_form_generation()
+    st.session_state.je_lines = _empty_je_lines()
+    st.session_state.correction_source_entry_id = None
+    st.session_state.pop("reverse_and_correct_entry_id", None)
+    # Clear header fields
+    if 'je_entry_date' in st.session_state:
+        del st.session_state.je_entry_date
+    if 'je_entry_type' in st.session_state:
+        del st.session_state.je_entry_type
+    if 'je_source_reference' in st.session_state:
+        del st.session_state.je_source_reference
+    if 'je_description' in st.session_state:
+        del st.session_state.je_description
+    if 'je_aje_reference' in st.session_state:
+        del st.session_state.je_aje_reference
+
+
 def render_entry_controls(entry: JournalEntry, import_link: dict | None):
     if import_link:
         st.caption("Imported posting")
@@ -237,9 +237,9 @@ def render_entry_controls(entry: JournalEntry, import_link: dict | None):
         "Reverse and duplicate as correction",
         key=f"reverse_correct_entry_{entry.id}",
     ):
+        load_entry_as_correction(entry)
         st.session_state.reverse_and_correct_entry_id = entry.id
-        st.session_state.reversal_entry_id = entry.id
-        st.session_state.journal_active_tab = "Reverse Entry"
+        st.session_state.journal_active_tab = "New Entry"
         st.rerun()
 
 
@@ -376,6 +376,11 @@ active_view = view_switcher(
     ["New Entry", "View Entries", "Reverse Entry", "Drafts"],
     key="journal_active_tab"
 )
+if (
+    active_view != "New Entry"
+    and st.session_state.get("reverse_and_correct_entry_id")
+):
+    reset_entry_form()
 
 # Point at pending assistant proposals from anywhere on the page.
 _pending_drafts = DraftEntry.pending_count(client_id)
@@ -593,7 +598,25 @@ if active_view == "New Entry":
                     st.error(error)
             else:
                 try:
-                    entry.save()
+                    correction_source_id = st.session_state.get(
+                        "reverse_and_correct_entry_id"
+                    )
+                    if correction_source_id:
+                        conn = dbconn.get_connection()
+                        try:
+                            JournalEntry.reverse(
+                                correction_source_id, client_id, entry_date,
+                                conn=conn,
+                            )
+                            entry.save(conn=conn)
+                            conn.commit()
+                        except Exception:
+                            conn.rollback()
+                            raise
+                        finally:
+                            conn.close()
+                    else:
+                        entry.save()
                     st.session_state.je_saved_message = (
                         f"Journal entry #{entry.id} created!"
                     )

@@ -471,11 +471,18 @@ class JournalEntry:
     def reverse(
         entry_id: int, client_id: int, reversal_date: Optional[date] = None,
         memo: Optional[str] = None,
+        conn=None,
     ) -> 'JournalEntry':
-        """Post an equal-and-opposite entry without altering accounting history."""
+        """Post an equal-and-opposite entry without altering accounting history.
+
+        If ``conn`` is provided, participate in the caller's transaction without
+        committing, rolling back, or closing the connection.
+        """
         from models.audit_log import AuditLog
 
-        conn = get_connection()
+        owns_conn = conn is None
+        if owns_conn:
+            conn = get_connection()
         try:
             cursor = conn.cursor()
             cursor.execute(
@@ -603,13 +610,16 @@ class JournalEntry:
                     "reversal_date": effective_date.isoformat(),
                 },
             )
-            conn.commit()
+            if owns_conn:
+                conn.commit()
             return reversal
         except Exception:
-            conn.rollback()
+            if owns_conn:
+                conn.rollback()
             raise
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
 
     @staticmethod
     def get_next_aje_reference(client_id: int, period_start: date, period_end: date) -> str:
