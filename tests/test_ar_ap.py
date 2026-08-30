@@ -1,8 +1,10 @@
 from datetime import date
+from pathlib import Path
 import threading
 import time
 
 import pytest
+import pypdfium2 as pdfium
 
 from database.connection import get_connection
 from models.account import Account
@@ -10,12 +12,15 @@ from models.client import Client
 from models.journal_entry import JournalEntry
 import services.ar_ap as ar_ap
 from services.ar_ap import (apply_credit_memo, apply_customer_credit, create_bill,
-                            create_credit_memo, create_customer, create_invoice,
-                            create_vendor, get_ar_aging,
+                            build_invoice_pdf, create_credit_memo, create_customer,
+                            create_invoice, create_vendor, get_1099_summary,
+                            get_ar_aging, get_income_by_customer,
+                            get_sales_tax_report,
                             list_customer_credits, list_invoices, post_bill,
                             post_credit_memo, post_invoice, record_customer_payment,
                             record_sales_tax_remittance,
                             record_vendor_payment, refund_customer_credit,
+                            send_invoice_email,
                             void_credit_memo, void_invoice, void_payment)
 from services.inventory import create_item, inventory_position, record_movement
 
@@ -78,6 +83,147 @@ def _inventory_item(client_id, accounts):
     inventory.save()
     cogs.save()
     return create_item(client_id, "WIDGET", "Widget", inventory.id, cogs.id), inventory.id, cogs.id
+
+
+def _pdf_text(buffer):
+    document = pdfium.PdfDocument(buffer.read())
+    try:
+        return "\n".join(
+            document[index].get_textpage().get_text_range()
+            for index in range(len(document))
+        )
+    finally:
+        document.close()
+
+
+def test_ar_ap_reports_hand_computed_void_credit_and_on_account_cases(
+    client_id, ar_ap_accounts,
+):
+    customer = create_customer(client_id, "Report Customer")
+    vendor = create_vendor(client_id, "Report Vendor")
+    taxed = create_invoice(client_id, customer.id, [{"description": "Taxed", "quantity": 1,
+        "unit_price_cents": 10000, "revenue_account_id": ar_ap_accounts["revenue"]}],
+        date(2026, 1, 10), date(2026, 2, 10), "0.10")
+    post_invoice(taxed.id, ar_ap_accounts["ar"], ar_ap_accounts["tax"])
+    untaxed = _invoice(client_id, customer.id, ar_ap_accounts, 5000,
+                       date(2026, 2, 28))
+    voided = _invoice(client_id, customer.id, ar_ap_accounts, 9000)
+    void_invoice(voided.id, date(2026, 1, 20))
+    payment = record_customer_payment(client_id, customer.id, date(2026, 1, 15),
+        7000, ar_ap_accounts["cash"], [{"invoice_id": taxed.id, "amount_cents": 4000}])
+    apply_customer_credit(payment, untaxed.id, 1000)
+    credit = create_credit_memo(client_id, customer.id, [{"description": "Allowance", "quantity": 1,
+        "unit_price_cents": 2000, "revenue_account_id": ar_ap_accounts["revenue"]}],
+        date(2026, 1, 18), "0.10", taxed.id)
+    post_credit_memo(credit.id, ar_ap_accounts["ar"], ar_ap_accounts["tax"])
+    apply_credit_memo(credit.id, taxed.id, 2200)
+
+    bill = create_bill(client_id, vendor.id, [{"description": "Fees", "quantity": 1,
+        "unit_price_cents": 80000, "expense_account_id": ar_ap_accounts["expense"]}],
+        date(2026, 1, 5), date(2026, 2, 5))
+    post_bill(bill.id, ar_ap_accounts["ap"])
+    record_vendor_payment(client_id, vendor.id, date(2026, 2, 1), 65000,
+        ar_ap_accounts["cash"], [{"bill_id": bill.id, "amount_cents": 65000}])
+    void_bill = create_bill(client_id, vendor.id, [{"description": "Void", "quantity": 1,
+        "unit_price_cents": 10000, "expense_account_id": ar_ap_accounts["expense"]}],
+        date(2026, 1, 6), date(2026, 2, 6))
+    post_bill(void_bill.id, ar_ap_accounts["ap"])
+    void_vendor = record_vendor_payment(client_id, vendor.id, date(2026, 2, 2), 10000,
+        ar_ap_accounts["cash"], [{"bill_id": void_bill.id, "amount_cents": 10000}])
+    ar_ap.void_vendor_payment(void_vendor, date(2026, 2, 3))
+
+    tax = get_sales_tax_report(client_id, date(2026, 1, 1), date(2026, 12, 31))
+    assert (tax["total_sales_cents"], tax["total_taxable_cents"],
+            tax["total_non_taxable_cents"], tax["total_tax_cents"]) == (
+                13000, 8000, 5000, 800,
+            )
+    summary = get_1099_summary(client_id, 2026)["vendors"]
+    assert summary == [{"vendor_id": vendor.id, "vendor_name": "Report Vendor",
+                        "total_paid_cents": 65000, "review_threshold": True}]
+    income = get_income_by_customer(client_id, date(2026, 1, 1), date(2026, 12, 31))
+    assert income == [{"customer_id": customer.id, "customer_name": "Report Customer",
+                       "invoice_count": 2, "subtotal_cents": 15000,
+                       "total_cents": 16000, "total_paid_cents": 7200,
+                       "open_balance_cents": 8800}]
+    assert sum(row["open_balance_cents"] for row in income) == sum(
+        row["amount_cents"] for row in get_ar_aging(client_id, date(2026, 12, 31))
+    )
+
+
+@pytest.mark.parametrize("tax_rate,partial,voided", [
+    (None, False, False), ("0.10", False, False), (None, True, False),
+    (None, False, True),
+])
+def test_invoice_pdf_tax_payment_and_void_variants(
+    client_id, ar_ap_accounts, tax_rate, partial, voided,
+):
+    customer = create_customer(client_id, f"PDF Customer {tax_rate} {partial} {voided}")
+    invoice = create_invoice(client_id, customer.id, [{"description": "Advisory work",
+        "quantity": 2, "unit_price_cents": 5000,
+        "revenue_account_id": ar_ap_accounts["revenue"]}], date(2026, 3, 1),
+        date(2026, 3, 31), tax_rate)
+    post_invoice(invoice.id, ar_ap_accounts["ar"], ar_ap_accounts["tax"] if tax_rate else None)
+    if partial:
+        record_customer_payment(client_id, customer.id, date(2026, 3, 5), 2500,
+            ar_ap_accounts["cash"], [{"invoice_id": invoice.id, "amount_cents": 2500}])
+    if voided:
+        void_invoice(invoice.id, date(2026, 3, 10))
+    pdf = build_invoice_pdf(invoice.id)
+    assert pdf.getvalue().startswith(b"%PDF")
+    text = _pdf_text(pdf)
+    assert "INVOICE" in text and "Advisory work" in text and "Balance due" in text
+    assert ("VOID" in text) is voided
+    assert ("Tax (0.10)" in text) is bool(tax_rate)
+    if partial:
+        assert "$25.00" in text
+
+
+def test_invoice_email_success_and_redacted_failure(
+    client_id, ar_ap_accounts, fake_credential_vault, monkeypatch,
+):
+    customer = create_customer(client_id, "Email Customer", "customer@example.com")
+    invoice = _invoice(client_id, customer.id, ar_ap_accounts)
+    fake_credential_vault.update({"smtp.host": "smtp.example.com", "smtp.port": "587",
+        "smtp.username": "mailer", "smtp.password": "top-secret-password",
+        "smtp.from_address": "billing@example.com"})
+    sent = []
+
+    class FakeSMTP:
+        def __init__(self, host, port):
+            assert (host, port) == ("smtp.example.com", 587)
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def starttls(self): pass
+        def login(self, username, password):
+            assert (username, password) == ("mailer", "top-secret-password")
+        def send_message(self, message): sent.append(message)
+
+    monkeypatch.setattr(ar_ap.smtplib, "SMTP", FakeSMTP)
+    send_invoice_email(invoice.id, "customer@example.com", "Your invoice", "Attached.")
+    message = sent[0]
+    assert message["To"] == "customer@example.com" and message["Subject"] == "Your invoice"
+    assert any(part.get_content_type() == "application/pdf" for part in message.iter_attachments())
+
+    class FailingSMTP(FakeSMTP):
+        def send_message(self, message):
+            raise RuntimeError("server echoed top-secret-password")
+
+    monkeypatch.setattr(ar_ap.smtplib, "SMTP", FailingSMTP)
+    with pytest.raises(RuntimeError, match="could not be sent"):
+        send_invoice_email(invoice.id, "customer@example.com")
+    conn = get_connection()
+    logs = conn.execute("SELECT status, error FROM email_log ORDER BY id").fetchall()
+    audits = conn.execute("SELECT COUNT(*) FROM audit_log WHERE table_name = 'email_log'").fetchone()[0]
+    conn.close()
+    assert [row["status"] for row in logs] == ["sent", "failed"]
+    assert "top-secret-password" not in (logs[-1]["error"] or "")
+    assert audits == 2
+
+
+def test_smtp_credentials_are_vault_only():
+    schema = (Path(__file__).parent.parent / "database" / "migrations" /
+              "040_email_log.sql").read_text()
+    assert "password" not in schema.lower()
 
 
 def test_invoice_inventory_post_and_void_use_frozen_cost(client_id, ar_ap_accounts):

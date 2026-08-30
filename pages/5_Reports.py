@@ -13,6 +13,8 @@ from models.account import Account
 from models.client import Client
 from models.audit_log import AuditLog
 from models.reports import ReportGenerator
+from money import to_dollars
+from services.ar_ap import get_1099_summary, get_income_by_customer, get_sales_tax_report
 from database import init_database
 from database import connection as dbconn
 from utils.client_context import (
@@ -112,7 +114,7 @@ if 'active_report' not in st.session_state:
 
 report_options = [
     "Trial Balance", "Income Statement", "Balance Sheet", "Cash Flow",
-    "General Ledger",
+    "General Ledger", "Sales Tax", "1099 Summary", "Income by Customer",
 ]
 
 report_intent = pop_client_intent(
@@ -139,7 +141,33 @@ selected_report = view_switcher(report_options, key="active_report",
 
 st.divider()
 
-if selected_report == "Trial Balance":
+if selected_report in {"Sales Tax", "Income by Customer"}:
+    st.subheader(selected_report)
+    range_col1, range_col2 = st.columns(2)
+    with range_col1:
+        report_start = st.date_input("Start Date", current_fy_start,
+                                     key=report_key("ar_start"))
+    with range_col2:
+        report_end = st.date_input("End Date", date.today(),
+                                   key=report_key("ar_end"))
+    if selected_report == "Sales Tax":
+        report = get_sales_tax_report(client_id, report_start, report_end)
+        st.caption("Accrual basis. Bookkeeping workpaper; filing figures require CPA review.")
+        st.dataframe(pd.DataFrame(report["documents"]), hide_index=True, width="stretch")
+        st.write({key: f"${to_dollars(value):,.2f}" for key, value in report.items()
+                  if key.endswith("_cents")})
+    else:
+        st.dataframe(pd.DataFrame(get_income_by_customer(
+            client_id, report_start, report_end
+        )), hide_index=True, width="stretch")
+elif selected_report == "1099 Summary":
+    st.subheader("1099 Summary")
+    year = st.number_input("Calendar year", min_value=2000, max_value=2100,
+                           value=date.today().year, step=1)
+    st.caption("Draft workpaper for CPA review, not a filing document. Reviewer exclusions are not modeled.")
+    st.dataframe(pd.DataFrame(get_1099_summary(client_id, year)["vendors"]),
+                 hide_index=True, width="stretch")
+elif selected_report == "Trial Balance":
     st.subheader("Trial Balance")
 
     col1, col2 = st.columns([1, 3])
