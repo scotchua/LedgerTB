@@ -179,6 +179,7 @@ def _record_movement(
         if Decimal(str(before["quantity"])) + movement_quantity < 0:
             raise ValueError("Movement cannot reduce inventory below zero.")
 
+    stored_cost = _round_cents(effective_cost)
     journal_entry_id = None
     should_post = post_journal_entry or movement_type in ("adjustment", "count")
     if should_post:
@@ -194,7 +195,7 @@ def _record_movement(
             item["inventory_account_id"], offset_id
         }:
             raise ValueError("Posting accounts must belong to the inventory item's client.")
-        amount_cents = abs(_round_cents(movement_quantity * effective_cost))
+        amount_cents = abs(_round_cents(movement_quantity * stored_cost))
         if not amount_cents:
             raise ValueError("A posted movement must have a non-zero valuation.")
         amount = to_dollars(amount_cents)
@@ -218,7 +219,6 @@ def _record_movement(
         )
         journal_entry_id = entry.save(conn=conn)
 
-    stored_cost = _round_cents(effective_cost)
     cursor.execute(
         """
         INSERT INTO inventory_movements
