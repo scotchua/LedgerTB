@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from database.connection import get_connection, get_cursor
 from models.audit_log import AuditLog
+from models.fiscal_period import FiscalPeriod
 from models.journal_entry import JournalEntry, JournalEntryLine
 from money import to_dollars
 from utils.fiscal_dates import require_valid_range
@@ -123,6 +124,8 @@ def inventory_position(item_id, through_date=None, conn=None):
         average_cents = Decimal("0")
         for row in cursor.fetchall():
             movement_quantity = Decimal(str(row["quantity"]))
+            # Older rows may not have a stored cost; preserve their historical
+            # running-average valuation without migrating existing data.
             unit_cost = (
                 Decimal(row["unit_cost_cents"])
                 if row["unit_cost_cents"] is not None else average_cents
@@ -142,6 +145,105 @@ def inventory_position(item_id, through_date=None, conn=None):
     finally:
         if owns_conn:
             conn.close()
+
+
+def _record_movement(
+    conn, item_id, movement_date, movement_type, movement_quantity, closed_period=None,
+    unit_cost_cents=None, post_journal_entry=False, offset_account_id=None,
+):
+    """Record and validate one movement in the caller's transaction."""
+    cursor = conn.cursor()
+    item = _item(cursor, item_id)
+    if closed_period:
+        raise ValueError(
+            f"{closed_period.period_name} is closed. Reopen the year before recording "
+            f"inventory movements dated {movement_date.isoformat()}."
+        )
+    before = inventory_position(item_id, conn=conn)
+    effective_cost = (
+        _decimal(unit_cost_cents, "Unit cost")
+        if unit_cost_cents is not None else
+        Decimal(before["weighted_average_unit_cost_cents"])
+    )
+    if (
+        movement_type in ("adjustment", "count")
+        and movement_quantity > 0 and not before["quantity"]
+        and unit_cost_cents is None
+    ):
+        raise ValueError(
+            "Unit cost is required for a positive adjustment with no inventory on hand."
+        )
+    if effective_cost < 0:
+        raise ValueError("Unit cost cannot be negative.")
+    if movement_type in ("sale", "adjustment", "count"):
+        if Decimal(str(before["quantity"])) + movement_quantity < 0:
+            raise ValueError("Movement cannot reduce inventory below zero.")
+
+    journal_entry_id = None
+    should_post = post_journal_entry or movement_type in ("adjustment", "count")
+    if should_post:
+        offset_id = (
+            offset_account_id
+            if offset_account_id is not None else item["cogs_account_id"]
+        )
+        cursor.execute(
+            "SELECT id FROM accounts WHERE client_id = ? AND id IN (?, ?)",
+            (item["client_id"], item["inventory_account_id"], offset_id),
+        )
+        if {row["id"] for row in cursor.fetchall()} != {
+            item["inventory_account_id"], offset_id
+        }:
+            raise ValueError("Posting accounts must belong to the inventory item's client.")
+        amount_cents = abs(_round_cents(movement_quantity * effective_cost))
+        if not amount_cents:
+            raise ValueError("A posted movement must have a non-zero valuation.")
+        amount = to_dollars(amount_cents)
+        increase = movement_quantity > 0
+        entry = JournalEntry(
+            client_id=item["client_id"], entry_date=movement_date,
+            description=f"Inventory {movement_type}: {item['sku']}",
+            source_reference=f"Inventory item {item_id}", entry_type="Adjusting",
+            lines=[
+                JournalEntryLine(
+                    account_id=item["inventory_account_id"],
+                    debit=amount if increase else 0,
+                    credit=0 if increase else amount,
+                ),
+                JournalEntryLine(
+                    account_id=offset_id,
+                    debit=0 if increase else amount,
+                    credit=amount if increase else 0,
+                ),
+            ],
+        )
+        journal_entry_id = entry.save(conn=conn)
+
+    stored_cost = _round_cents(effective_cost)
+    cursor.execute(
+        """
+        INSERT INTO inventory_movements
+            (inventory_item_id, movement_date, movement_type, quantity,
+             unit_cost_cents, journal_entry_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (item_id, movement_date.isoformat(), movement_type,
+         float(movement_quantity), stored_cost, journal_entry_id),
+    )
+    movement_id = cursor.lastrowid
+    AuditLog.write(
+        cursor, item["client_id"], "inventory_movements", movement_id, "INSERT",
+        new_values={
+            "inventory_item_id": item_id,
+            "movement_date": movement_date.isoformat(),
+            "movement_type": movement_type,
+            "quantity": float(movement_quantity),
+            "unit_cost_cents": stored_cost,
+            "journal_entry_id": journal_entry_id,
+        },
+    )
+    result = inventory_position(item_id, conn=conn)
+    result.update({"movement_id": movement_id, "journal_entry_id": journal_entry_id})
+    return result
 
 
 def record_movement(
@@ -175,95 +277,19 @@ def record_movement(
     if post_journal_entry and movement_type == "purchase" and offset_account_id is None:
         raise ValueError("A payment or payable offset account is required to post a purchase.")
 
+    with get_cursor() as cursor:
+        item = _item(cursor, item_id)
+    closed_period = FiscalPeriod.get_closed_period_for_date(
+        item["client_id"], movement_date
+    )
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        item = _item(cursor, item_id)
-        before = inventory_position(item_id, conn=conn)
-        effective_cost = (
-            _decimal(unit_cost_cents, "Unit cost")
-            if unit_cost_cents is not None else
-            Decimal(before["weighted_average_unit_cost_cents"])
-        )
-        if (
-            movement_type in ("adjustment", "count")
-            and movement_quantity > 0 and not before["quantity"]
-            and unit_cost_cents is None
-        ):
-            raise ValueError(
-                "Unit cost is required for a positive adjustment with no inventory on hand."
-            )
-        if effective_cost < 0:
-            raise ValueError("Unit cost cannot be negative.")
-        if movement_type in ("sale", "adjustment", "count"):
-            if Decimal(str(before["quantity"])) + movement_quantity < 0:
-                raise ValueError("Movement cannot reduce inventory below zero.")
-
-        journal_entry_id = None
-        should_post = post_journal_entry or movement_type in ("adjustment", "count")
-        if should_post:
-            offset_id = (
-                offset_account_id
-                if offset_account_id is not None else item["cogs_account_id"]
-            )
-            cursor.execute(
-                "SELECT id FROM accounts WHERE client_id = ? AND id IN (?, ?)",
-                (item["client_id"], item["inventory_account_id"], offset_id),
-            )
-            if {row["id"] for row in cursor.fetchall()} != {
-                item["inventory_account_id"], offset_id
-            }:
-                raise ValueError("Posting accounts must belong to the inventory item's client.")
-            amount_cents = abs(_round_cents(movement_quantity * effective_cost))
-            if not amount_cents:
-                raise ValueError("A posted movement must have a non-zero valuation.")
-            amount = to_dollars(amount_cents)
-            increase = movement_quantity > 0
-            entry = JournalEntry(
-                client_id=item["client_id"], entry_date=movement_date,
-                description=f"Inventory {movement_type}: {item['sku']}",
-                source_reference=f"Inventory item {item_id}", entry_type="Adjusting",
-                lines=[
-                    JournalEntryLine(
-                        account_id=item["inventory_account_id"],
-                        debit=amount if increase else 0,
-                        credit=0 if increase else amount,
-                    ),
-                    JournalEntryLine(
-                        account_id=offset_id,
-                        debit=0 if increase else amount,
-                        credit=amount if increase else 0,
-                    ),
-                ],
-            )
-            journal_entry_id = entry.save(conn=conn)
-
-        stored_cost = _round_cents(effective_cost) if unit_cost_cents is not None else None
-        cursor.execute(
-            """
-            INSERT INTO inventory_movements
-                (inventory_item_id, movement_date, movement_type, quantity,
-                 unit_cost_cents, journal_entry_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (item_id, movement_date.isoformat(), movement_type,
-             float(movement_quantity), stored_cost, journal_entry_id),
-        )
-        movement_id = cursor.lastrowid
-        AuditLog.write(
-            cursor, item["client_id"], "inventory_movements", movement_id, "INSERT",
-            new_values={
-                "inventory_item_id": item_id,
-                "movement_date": movement_date.isoformat(),
-                "movement_type": movement_type,
-                "quantity": float(movement_quantity),
-                "unit_cost_cents": stored_cost,
-                "journal_entry_id": journal_entry_id,
-            },
+        conn.execute("BEGIN IMMEDIATE")
+        result = _record_movement(
+            conn, item_id, movement_date, movement_type, movement_quantity,
+            closed_period, unit_cost_cents, post_journal_entry, offset_account_id,
         )
         conn.commit()
-        result = inventory_position(item_id)
-        result.update({"movement_id": movement_id, "journal_entry_id": journal_entry_id})
         return result
     except Exception:
         conn.rollback()
@@ -311,13 +337,31 @@ def record_movements_from_csv(item_id, file):
         except Exception as exc:
             raise ValueError(f"CSV row {row_number}: {exc}") from exc
 
-    imported = []
-    for movement_date, movement_type, quantity, unit_cost_cents in parsed:
-        imported.append(record_movement(
-            item_id, movement_date, movement_type, quantity,
-            unit_cost_cents=unit_cost_cents, post_journal_entry=False,
-        ))
-    return imported
+    with get_cursor() as cursor:
+        item = _item(cursor, item_id)
+    closed_periods = {
+        movement_date: FiscalPeriod.get_closed_period_for_date(
+            item["client_id"], movement_date
+        )
+        for movement_date, _, _, _ in parsed
+    }
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        imported = []
+        for movement_date, movement_type, quantity, unit_cost_cents in parsed:
+            imported.append(_record_movement(
+                conn, item_id, movement_date, movement_type, quantity,
+                closed_period=closed_periods[movement_date],
+                unit_cost_cents=unit_cost_cents, post_journal_entry=False,
+            ))
+        conn.commit()
+        return imported
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def inventory_rollforward(item_id, period_start, period_end):
