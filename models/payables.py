@@ -38,8 +38,15 @@ class Bill:
     journal_entry_id: Optional[int] = None
     voided_journal_entry_id: Optional[int] = None
     control_account_id: Optional[int] = None
+    tax_rate: Optional[str] = None
+    tax_amount_cents: int = 0
+    tax_account_id: Optional[int] = None
     lines: List[BillLine] = field(default_factory=list)
 
     @property
-    def total_cents(self) -> int:
+    def subtotal_cents(self) -> int:
         return sum(line.amount_cents for line in self.lines)
+
+    @property
+    def total_cents(self) -> int:
+        return self.subtotal_cents + self.tax_amount_cents

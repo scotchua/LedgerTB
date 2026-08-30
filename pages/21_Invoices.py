@@ -13,9 +13,11 @@ from database import init_database
 from database.connection import get_cursor
 from models.account import Account
 from money import to_cents, to_dollars
-from services.ar_ap import (create_customer, create_invoice, list_customer_credits,
-                            list_invoices, post_invoice, record_customer_payment,
-                            void_invoice, void_payment)
+from services.ar_ap import (apply_credit_memo, create_credit_memo, create_customer,
+                            create_invoice, list_credit_memos, list_customer_credits,
+                            list_invoices, post_credit_memo, post_invoice,
+                            record_customer_payment, void_credit_memo, void_invoice,
+                            void_payment)
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 
@@ -67,6 +69,7 @@ if customers and revenue:
             description = st.text_input("Description")
             quantity = st.number_input("Quantity", min_value=1, step=1)
             unit_price = st.number_input("Unit price", min_value=0.01, step=0.01)
+            tax_rate = st.text_input("Tax rate (optional decimal, e.g. 0.0650)")
             revenue_id = st.selectbox("Revenue account", [a.id for a in revenue],
                                       format_func=lambda aid: next(f"{a.account_number} — {a.name}" for a in revenue if a.id == aid))
             inventory_item_id = st.selectbox(
@@ -79,7 +82,8 @@ if customers and revenue:
                     create_invoice(client_id, customer_id, [{"description": description,
                         "quantity": int(quantity), "unit_price_cents": to_cents(unit_price),
                         "revenue_account_id": revenue_id,
-                        "inventory_item_id": inventory_item_id}], invoice_date, due_date)
+                        "inventory_item_id": inventory_item_id}], invoice_date, due_date,
+                        tax_rate or None)
                 except Exception as exc:
                     st.error(str(exc))
                 else:
@@ -96,9 +100,15 @@ if rows and assets:
     selected = st.selectbox("Invoice", [row["id"] for row in rows])
     asset_label = lambda aid: next(f"{a.account_number} — {a.name}" for a in assets if a.id == aid)
     control_id = st.selectbox("A/R control account", [a.id for a in assets], format_func=asset_label)
+    liabilities = Account.get_by_type(client_id, "Liability")
+    tax_account_id = st.selectbox(
+        "Sales tax liability account (for taxed invoices)", [None, *[a.id for a in liabilities]],
+        format_func=lambda aid: "Not taxed" if aid is None else next(
+            f"{a.account_number} — {a.name}" for a in liabilities if a.id == aid),
+    )
     if st.button("Post invoice"):
         try:
-            post_invoice(selected, control_id)
+            post_invoice(selected, control_id, tax_account_id)
         except Exception as exc:
             st.error(str(exc))
         else:
@@ -138,6 +148,64 @@ if credits:
     if st.button("Void customer payment"):
         try:
             void_payment(credit_payment, date.today())
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.rerun()
+
+st.subheader("Credit memos")
+credit_memos = list_credit_memos(client_id)
+if customers and revenue:
+    with st.expander("Create credit memo"):
+        with st.form("create_credit_memo"):
+            customer_id = st.selectbox("Credit customer", list(customers), format_func=customers.get)
+            memo_date = st.date_input("Credit memo date", date.today())
+            original_invoice_id = st.selectbox(
+                "Original invoice (optional)", [None, *[row["id"] for row in rows]],
+                format_func=lambda invoice_id: "None" if invoice_id is None else f"Invoice {invoice_id}",
+            )
+            description = st.text_input("Credit description")
+            quantity = st.number_input("Credit quantity", min_value=1, step=1)
+            unit_price = st.number_input("Credit unit price", min_value=0.01, step=0.01)
+            revenue_id = st.selectbox("Credit revenue account", [a.id for a in revenue])
+            tax_rate = st.text_input("Credit tax rate (optional decimal)")
+            if st.form_submit_button("Create credit memo"):
+                try:
+                    create_credit_memo(client_id, customer_id, [{"description": description,
+                        "quantity": int(quantity), "unit_price_cents": to_cents(unit_price),
+                        "revenue_account_id": revenue_id}], memo_date, tax_rate or None,
+                        original_invoice_id)
+                except Exception as exc:
+                    st.error(str(exc))
+                else:
+                    st.rerun()
+if credit_memos and assets:
+    memo_id = st.selectbox("Credit memo", [row["id"] for row in credit_memos])
+    memo = next(row for row in credit_memos if row["id"] == memo_id)
+    memo_control_id = st.selectbox("Credit memo A/R control", [a.id for a in assets])
+    liabilities = Account.get_by_type(client_id, "Liability")
+    memo_tax_id = st.selectbox("Credit memo tax account", [None, *[a.id for a in liabilities]])
+    if st.button("Post credit memo"):
+        try:
+            post_credit_memo(memo_id, memo_control_id, memo_tax_id)
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.rerun()
+    eligible = [row for row in rows if row["customer_id"] == memo["customer_id"]]
+    if eligible:
+        apply_invoice_id = st.selectbox("Apply credit to invoice", [row["id"] for row in eligible])
+        apply_amount = st.number_input("Credit amount to apply", min_value=0.01, step=0.01)
+        if st.button("Apply credit memo"):
+            try:
+                apply_credit_memo(memo_id, apply_invoice_id, to_cents(apply_amount))
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                st.rerun()
+    if st.button("Void credit memo"):
+        try:
+            void_credit_memo(memo_id, date.today())
         except Exception as exc:
             st.error(str(exc))
         else:

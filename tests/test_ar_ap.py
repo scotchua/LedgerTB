@@ -9,12 +9,14 @@ from models.account import Account
 from models.client import Client
 from models.journal_entry import JournalEntry
 import services.ar_ap as ar_ap
-from services.ar_ap import (apply_customer_credit, create_bill, create_customer,
-                            create_invoice, create_vendor, get_ar_aging,
+from services.ar_ap import (apply_credit_memo, apply_customer_credit, create_bill,
+                            create_credit_memo, create_customer, create_invoice,
+                            create_vendor, get_ar_aging,
                             list_customer_credits, list_invoices, post_bill,
-                            post_invoice, record_customer_payment,
+                            post_credit_memo, post_invoice, record_customer_payment,
+                            record_sales_tax_remittance,
                             record_vendor_payment, refund_customer_credit,
-                            void_invoice, void_payment)
+                            void_credit_memo, void_invoice, void_payment)
 from services.inventory import create_item, inventory_position, record_movement
 
 
@@ -25,10 +27,11 @@ def ar_ap_accounts(client_id, accounts):
     ap = Account(client_id=client_id, account_number="2100", name="Accounts Payable", type="Liability")
     revenue_2 = Account(client_id=client_id, account_number="4100", name="Project Revenue", type="Revenue")
     expense_2 = Account(client_id=client_id, account_number="6100", name="Supplies Expense", type="Expense")
-    for account in (ar, ar2, ap, revenue_2, expense_2):
+    tax = Account(client_id=client_id, account_number="2200", name="Sales Tax Payable", type="Liability")
+    for account in (ar, ar2, ap, revenue_2, expense_2, tax):
         account.save()
     return {**accounts, "ar": ar.id, "ar2": ar2.id, "ap": ap.id,
-            "revenue_2": revenue_2.id, "expense_2": expense_2.id}
+            "revenue_2": revenue_2.id, "expense_2": expense_2.id, "tax": tax.id}
 
 
 def _invoice(client_id, customer_id, accounts, amount=10000, due=date(2026, 8, 31), post=True,
@@ -498,3 +501,125 @@ def test_bill_flow_uses_v2_tables(client_id, ar_ap_accounts):
     assert _scalar("SELECT COUNT(*) FROM bill_payments_v2 WHERE id = ?", (payment_id,)) == 1
     assert _scalar("SELECT COUNT(*) FROM bill_payments") == 0
     assert _scalar("SELECT status FROM bills WHERE id = ?", (bill.id,)) == "paid"
+
+
+def test_taxed_and_untaxed_invoice_entries_and_tax_inclusive_allocations(
+    client_id, ar_ap_accounts,
+):
+    customer = create_customer(client_id, "Tax Customer")
+    taxed = create_invoice(client_id, customer.id, [{"description": "Taxed work", "quantity": 1,
+        "unit_price_cents": 10000, "revenue_account_id": ar_ap_accounts["revenue"]}],
+        tax_rate="0.0650")
+    posted = post_invoice(taxed.id, ar_ap_accounts["ar"], ar_ap_accounts["tax"])
+    assert _entry_lines(posted.journal_entry_id) == [
+        (ar_ap_accounts["ar"], 10650, 0),
+        (ar_ap_accounts["revenue"], 0, 10000),
+        (ar_ap_accounts["tax"], 0, 650),
+    ]
+    assert _scalar("SELECT tax_rate FROM invoices WHERE id = ?", (taxed.id,)) == "0.0650"
+    record_customer_payment(client_id, customer.id, date.today(), 10000,
+                            ar_ap_accounts["cash"],
+                            [{"invoice_id": taxed.id, "amount_cents": 10000}])
+    assert _scalar("SELECT status FROM invoices WHERE id = ?", (taxed.id,)) == "partially_paid"
+    assert next(row for row in list_invoices(client_id) if row["id"] == taxed.id)[
+        "open_balance_cents"] == 650
+
+    paid = create_invoice(client_id, customer.id, [{"description": "Paid taxed work", "quantity": 1,
+        "unit_price_cents": 10000, "revenue_account_id": ar_ap_accounts["revenue"]}],
+        tax_rate="0.0650")
+    post_invoice(paid.id, ar_ap_accounts["ar"], ar_ap_accounts["tax"])
+    record_customer_payment(client_id, customer.id, date.today(), 10650,
+                            ar_ap_accounts["cash"],
+                            [{"invoice_id": paid.id, "amount_cents": 10650}])
+    assert _scalar("SELECT status FROM invoices WHERE id = ?", (paid.id,)) == "paid"
+
+    untaxed = create_invoice(client_id, customer.id, [{"description": "Untaxed", "quantity": 1,
+        "unit_price_cents": 10000, "revenue_account_id": ar_ap_accounts["revenue"]}])
+    untaxed = post_invoice(untaxed.id, ar_ap_accounts["ar"])
+    assert _entry_lines(untaxed.journal_entry_id) == [
+        (ar_ap_accounts["ar"], 10000, 0),
+        (ar_ap_accounts["revenue"], 0, 10000),
+    ]
+
+
+def test_taxed_bill_and_sales_tax_remittance_entries_and_audit(client_id, ar_ap_accounts):
+    vendor = create_vendor(client_id, "Taxed Vendor")
+    bill = create_bill(client_id, vendor.id, [{"description": "Supplies", "quantity": 1,
+        "unit_price_cents": 10000, "expense_account_id": ar_ap_accounts["expense"]}],
+        tax_rate="0.0650")
+    posted = post_bill(bill.id, ar_ap_accounts["ap"], ar_ap_accounts["tax"])
+    assert _entry_lines(posted.journal_entry_id) == [
+        (ar_ap_accounts["expense"], 10000, 0),
+        (ar_ap_accounts["tax"], 650, 0),
+        (ar_ap_accounts["ap"], 0, 10650),
+    ]
+    before = _scalar("SELECT COALESCE(MAX(id), 0) FROM audit_log")
+    entry_id = record_sales_tax_remittance(client_id, ar_ap_accounts["tax"],
+                                           ar_ap_accounts["cash"], 650, date.today(), "Q3")
+    assert _entry_lines(entry_id) == [
+        (ar_ap_accounts["tax"], 650, 0), (ar_ap_accounts["cash"], 0, 650),
+    ]
+    assert _audit_actions(before) == [
+        ("journal_entries", "INSERT"), ("sales_tax_remittances", "INSERT"),
+    ]
+
+
+def test_credit_memo_posts_applies_without_entry_and_void_guards(client_id, ar_ap_accounts):
+    customer = create_customer(client_id, "Memo Customer")
+    invoices = [_invoice(client_id, customer.id, ar_ap_accounts, amount)
+                for amount in (6000, 4650)]
+    memo = create_credit_memo(client_id, customer.id, [{"description": "Allowance", "quantity": 1,
+        "unit_price_cents": 10000, "revenue_account_id": ar_ap_accounts["revenue"]}],
+        tax_rate="0.0650", original_invoice_id=invoices[0].id)
+    posted = post_credit_memo(memo.id, ar_ap_accounts["ar"], ar_ap_accounts["tax"])
+    assert _entry_lines(posted.journal_entry_id) == [
+        (ar_ap_accounts["revenue"], 10000, 0),
+        (ar_ap_accounts["tax"], 650, 0),
+        (ar_ap_accounts["ar"], 0, 10650),
+    ]
+    entries = _scalar("SELECT COUNT(*) FROM journal_entries")
+    apply_credit_memo(memo.id, invoices[0].id, 6000)
+    apply_credit_memo(memo.id, invoices[1].id, 4650)
+    assert _scalar("SELECT COUNT(*) FROM journal_entries") == entries
+    assert [_scalar("SELECT status FROM invoices WHERE id = ?", (invoice.id,))
+            for invoice in invoices] == ["paid", "paid"]
+    assert _scalar("SELECT status FROM credit_memos WHERE id = ?", (memo.id,)) == "applied"
+    with pytest.raises(ValueError, match="void blocked"):
+        void_credit_memo(memo.id)
+    with pytest.raises(ValueError, match="void blocked"):
+        void_invoice(invoices[0].id)
+
+    clean = create_credit_memo(client_id, customer.id, [{"description": "Clean", "quantity": 1,
+        "unit_price_cents": 1000, "revenue_account_id": ar_ap_accounts["revenue"]}])
+    clean = post_credit_memo(clean.id, ar_ap_accounts["ar"])
+    reversal = void_credit_memo(clean.id)
+    assert _entry_lines(reversal) == [(account, credit, debit)
+                                      for account, debit, credit in _entry_lines(clean.journal_entry_id)]
+
+
+def test_taxed_invoice_void_reverses_tax_line_and_credit_memo_aging_ties_out(
+    client_id, ar_ap_accounts,
+):
+    customer = create_customer(client_id, "Tax Void Customer")
+    taxed = create_invoice(client_id, customer.id, [{"description": "Taxed", "quantity": 1,
+        "unit_price_cents": 10000, "revenue_account_id": ar_ap_accounts["revenue"]}],
+        tax_rate="0.0650")
+    taxed = post_invoice(taxed.id, ar_ap_accounts["ar"], ar_ap_accounts["tax"])
+    reversal = void_invoice(taxed.id, date(2026, 8, 20))
+    assert _entry_lines(reversal) == [(account, credit, debit)
+                                      for account, debit, credit in _entry_lines(taxed.journal_entry_id)]
+
+    invoice = _invoice(client_id, customer.id, ar_ap_accounts, 10000, date(2026, 8, 31))
+    memo = create_credit_memo(client_id, customer.id, [{"description": "Unapplied", "quantity": 1,
+        "unit_price_cents": 2500, "revenue_account_id": ar_ap_accounts["revenue"]}],
+        memo_date=date(2026, 8, 15))
+    post_credit_memo(memo.id, ar_ap_accounts["ar"])
+    aging = get_ar_aging(client_id, date(2026, 8, 31))
+    gl = _scalar(
+        "SELECT COALESCE(SUM(jel.debit - jel.credit), 0) FROM journal_entry_lines jel "
+        "JOIN journal_entries je ON je.id = jel.journal_entry_id "
+        "WHERE je.client_id = ? AND jel.account_id = ? AND je.entry_date <= ?",
+        (client_id, ar_ap_accounts["ar"], "2026-08-31"),
+    )
+    assert sum(row["amount_cents"] for row in aging) == gl == 7500
+    assert {row["kind"] for row in aging} == {"invoice", "credit_memo"}

@@ -1,13 +1,14 @@
 """Accounts receivable and payable workflows."""
 
 from datetime import date
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Iterable, Optional
 
 from database.connection import get_connection, get_cursor
 from models.audit_log import AuditLog
 from models.journal_entry import JournalEntry, JournalEntryLine
 from models.payables import Bill, BillLine, Vendor
-from models.receivables import Customer, Invoice, InvoiceLine
+from models.receivables import CreditMemo, CreditMemoLine, Customer, Invoice, InvoiceLine
 from money import to_dollars
 from services.inventory import _record_movement
 
@@ -34,6 +35,22 @@ def _normalize_name(value: str) -> str:
 
 def _line_value(line, name, default=None):
     return line.get(name, default) if isinstance(line, dict) else getattr(line, name, default)
+
+
+def _tax_values(lines, tax_rate):
+    if tax_rate in (None, ""):
+        return None, 0
+    rate_text = str(tax_rate).strip()
+    try:
+        rate = Decimal(rate_text)
+    except (InvalidOperation, ValueError):
+        raise ValueError("Tax rate must be a decimal rate, such as 0.0650.")
+    if not rate.is_finite() or rate < 0:
+        raise ValueError("Tax rate must be a non-negative decimal rate.")
+    subtotal = sum(line.amount_cents for line in lines)
+    # One flat, header-level, tax-exclusive rate; line tax codes and stacking are out of scope.
+    amount = int((Decimal(subtotal) * rate).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return rate_text, amount
 
 
 def _coerce_lines(lines: Iterable, line_type, account_field: str):
@@ -106,7 +123,7 @@ def create_vendor(client_id: int, name: str, email: Optional[str] = None) -> Ven
 
 
 def _create_document(client_id: int, party_id: int, lines: Iterable, document_date,
-                     due_date, is_invoice: bool):
+                     due_date, is_invoice: bool, tax_rate=None):
     table = "invoices" if is_invoice else "bills"
     party_table = "customers" if is_invoice else "vendors"
     party_field = "customer_id" if is_invoice else "vendor_id"
@@ -117,6 +134,7 @@ def _create_document(client_id: int, party_id: int, lines: Iterable, document_da
     document_date = _iso(document_date or date.today(), date_field)
     due_date = _iso(due_date or document_date, "due_date")
     document_lines = _coerce_lines(lines, line_type, account_field)
+    tax_rate, tax_amount_cents = _tax_values(document_lines, tax_rate)
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -135,8 +153,8 @@ def _create_document(client_id: int, party_id: int, lines: Iterable, document_da
                 if not cursor.fetchone():
                     raise ValueError("The inventory item must belong to this client.")
         cursor.execute(
-            f"INSERT INTO {table} (client_id, {party_field}, {date_field}, due_date) VALUES (?, ?, ?, ?)",
-            (client_id, party_id, document_date, due_date),
+            f"INSERT INTO {table} (client_id, {party_field}, {date_field}, due_date, tax_rate, tax_amount_cents) VALUES (?, ?, ?, ?, ?, ?)",
+            (client_id, party_id, document_date, due_date, tax_rate, tax_amount_cents),
         )
         record_id = cursor.lastrowid
         for line in document_lines:
@@ -159,7 +177,7 @@ def _create_document(client_id: int, party_id: int, lines: Iterable, document_da
         document = document_type(
             id=record_id, client_id=client_id, **{party_field: party_id},
             **{date_field: date.fromisoformat(document_date)}, due_date=date.fromisoformat(due_date),
-            lines=document_lines,
+            tax_rate=tax_rate, tax_amount_cents=tax_amount_cents, lines=document_lines,
         )
         AuditLog.write(cursor, client_id, table, record_id, "INSERT",
                        new_values={party_field: party_id, date_field: document_date,
@@ -175,13 +193,13 @@ def _create_document(client_id: int, party_id: int, lines: Iterable, document_da
 
 
 def create_invoice(client_id: int, customer_id: int, lines: Iterable,
-                   invoice_date=None, due_date=None) -> Invoice:
-    return _create_document(client_id, customer_id, lines, invoice_date, due_date, True)
+                   invoice_date=None, due_date=None, tax_rate=None) -> Invoice:
+    return _create_document(client_id, customer_id, lines, invoice_date, due_date, True, tax_rate)
 
 
 def create_bill(client_id: int, vendor_id: int, lines: Iterable,
-                bill_date=None, due_date=None) -> Bill:
-    return _create_document(client_id, vendor_id, lines, bill_date, due_date, False)
+                bill_date=None, due_date=None, tax_rate=None) -> Bill:
+    return _create_document(client_id, vendor_id, lines, bill_date, due_date, False, tax_rate)
 
 
 def _load_document(cursor, record_id: int, is_invoice: bool):
@@ -208,11 +226,13 @@ def _load_document(cursor, record_id: int, is_invoice: bool):
         **{date_field: date.fromisoformat(row[date_field])}, due_date=date.fromisoformat(row["due_date"]),
         status=row["status"], journal_entry_id=row["journal_entry_id"],
         voided_journal_entry_id=row["voided_journal_entry_id"],
-        control_account_id=row["control_account_id"], lines=lines,
+        control_account_id=row["control_account_id"], tax_rate=row["tax_rate"],
+        tax_amount_cents=row["tax_amount_cents"], tax_account_id=row["tax_account_id"], lines=lines,
     )
 
 
-def _post_document(record_id: int, control_account_id: int, is_invoice: bool):
+def _post_document(record_id: int, control_account_id: int, is_invoice: bool,
+                   tax_account_id: Optional[int] = None):
     table = "invoices" if is_invoice else "bills"
     date_field = "invoice_date" if is_invoice else "bill_date"
     account_field = "revenue_account_id" if is_invoice else "expense_account_id"
@@ -227,6 +247,14 @@ def _post_document(record_id: int, control_account_id: int, is_invoice: bool):
         line_account_ids = {getattr(line, account_field) for line in document.lines}
         if control_account_id in line_account_ids:
             raise ValueError("The control account must differ from every document line account.")
+        if document.tax_amount_cents > 0:
+            if tax_account_id is None:
+                raise ValueError("A tax account is required for a taxed document.")
+            _assert_account(cursor, document.client_id, tax_account_id, "Liability")
+            if tax_account_id == control_account_id or tax_account_id in line_account_ids:
+                raise ValueError("The tax account must differ from the control and line accounts.")
+        else:
+            tax_account_id = None
         for line in document.lines:
             _assert_account(cursor, document.client_id, getattr(line, account_field),
                             "Revenue" if is_invoice else "Expense")
@@ -236,10 +264,16 @@ def _post_document(record_id: int, control_account_id: int, is_invoice: bool):
             lines.extend(JournalEntryLine(account_id=line.revenue_account_id,
                                           credit=to_dollars(line.amount_cents), memo=line.description)
                          for line in document.lines)
+            if document.tax_amount_cents:
+                lines.append(JournalEntryLine(account_id=tax_account_id,
+                                              credit=to_dollars(document.tax_amount_cents)))
         else:
             lines = [JournalEntryLine(account_id=line.expense_account_id,
                                       debit=to_dollars(line.amount_cents), memo=line.description)
                      for line in document.lines]
+            if document.tax_amount_cents:
+                lines.append(JournalEntryLine(account_id=tax_account_id,
+                                              debit=to_dollars(document.tax_amount_cents)))
             lines.append(JournalEntryLine(account_id=control_account_id, credit=to_dollars(total)))
         entry = JournalEntry(
             client_id=document.client_id, entry_date=getattr(document, date_field),
@@ -298,18 +332,20 @@ def _post_document(record_id: int, control_account_id: int, is_invoice: bool):
                         new_values={"journal_entry_id": cogs_entry.id},
                     )
         cursor.execute(
-            f"UPDATE {table} SET status = 'posted', journal_entry_id = ?, control_account_id = ? WHERE id = ?",
-            (entry.id, control_account_id, record_id),
+            f"UPDATE {table} SET status = 'posted', journal_entry_id = ?, control_account_id = ?, tax_account_id = ? WHERE id = ?",
+            (entry.id, control_account_id, tax_account_id, record_id),
         )
         AuditLog.write(cursor, document.client_id, table, record_id, "UPDATE",
                        old_values={"status": "draft", "journal_entry_id": None,
                                    "control_account_id": None},
                        new_values={"status": "posted", "journal_entry_id": entry.id,
-                                   "control_account_id": control_account_id})
+                                   "control_account_id": control_account_id,
+                                   "tax_account_id": tax_account_id})
         conn.commit()
         document.status = "posted"
         document.journal_entry_id = entry.id
         document.control_account_id = control_account_id
+        document.tax_account_id = tax_account_id
         return document
     except Exception:
         conn.rollback()
@@ -318,12 +354,14 @@ def _post_document(record_id: int, control_account_id: int, is_invoice: bool):
         conn.close()
 
 
-def post_invoice(invoice_id: int, ar_account_id: int) -> Invoice:
-    return _post_document(invoice_id, ar_account_id, True)
+def post_invoice(invoice_id: int, ar_account_id: int,
+                 tax_account_id: Optional[int] = None) -> Invoice:
+    return _post_document(invoice_id, ar_account_id, True, tax_account_id)
 
 
-def post_bill(bill_id: int, ap_account_id: int) -> Bill:
-    return _post_document(bill_id, ap_account_id, False)
+def post_bill(bill_id: int, ap_account_id: int,
+              tax_account_id: Optional[int] = None) -> Bill:
+    return _post_document(bill_id, ap_account_id, False, tax_account_id)
 
 
 def _open_balance(cursor, record_id: int, is_invoice: bool) -> int:
@@ -333,11 +371,13 @@ def _open_balance(cursor, record_id: int, is_invoice: bool) -> int:
     payments_table = "payments" if is_invoice else "bill_payments_v2"
     cursor.execute(
         f"""SELECT COALESCE((SELECT SUM(quantity * unit_price_cents) FROM {lines_table}
-                              WHERE {table[:-1]}_id = ?), 0) -
+                              WHERE {table[:-1]}_id = ?), 0) + d.tax_amount_cents -
                    COALESCE((SELECT SUM(a.amount_cents) FROM {allocations_table} a
                               JOIN {payments_table} p ON p.id = a.payment_id
-                              WHERE a.{table[:-1]}_id = ? AND p.status = 'recorded'), 0) balance""",
-        (record_id, record_id),
+                              WHERE a.{table[:-1]}_id = ? AND p.status = 'recorded'), 0) -
+                   {"COALESCE((SELECT SUM(amount_cents) FROM credit_applications WHERE invoice_id = d.id), 0)" if is_invoice else "0"} balance
+            FROM {table} d WHERE d.id = ?""",
+        (record_id, record_id, record_id),
     )
     return int(cursor.fetchone()["balance"])
 
@@ -491,6 +531,42 @@ def record_vendor_payment(client_id: int, vendor_id: int, payment_date,
                           memo: Optional[str] = None) -> int:
     return _record_payment(client_id, vendor_id, payment_date, amount_cents,
                            payment_account_id, allocations, memo, False)
+
+
+def record_sales_tax_remittance(client_id: int, tax_account_id: int, bank_account_id: int,
+                                amount_cents: int, payment_date, memo: Optional[str] = None) -> int:
+    amount_cents = int(amount_cents)
+    if amount_cents <= 0:
+        raise ValueError("Remittance amount must be greater than zero.")
+    payment_date = _iso(payment_date, "payment_date")
+    conn = _transaction()
+    try:
+        cursor = conn.cursor()
+        _assert_account(cursor, client_id, tax_account_id, "Liability")
+        _assert_account(cursor, client_id, bank_account_id, "Asset")
+        if tax_account_id == bank_account_id:
+            raise ValueError("The tax and bank accounts must differ.")
+        entry = JournalEntry(
+            client_id=client_id, entry_date=date.fromisoformat(payment_date),
+            description="Sales tax remittance", source_reference="Sales tax remittance",
+            lines=[
+                JournalEntryLine(account_id=tax_account_id, debit=to_dollars(amount_cents)),
+                JournalEntryLine(account_id=bank_account_id, credit=to_dollars(amount_cents)),
+            ],
+        )
+        entry.save(conn=conn)
+        AuditLog.write(cursor, client_id, "sales_tax_remittances", entry.id, "INSERT",
+                       new_values={"tax_account_id": tax_account_id,
+                                   "bank_account_id": bank_account_id,
+                                   "amount_cents": amount_cents, "payment_date": payment_date,
+                                   "memo": (memo or "").strip() or None})
+        conn.commit()
+        return entry.id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _credit_balance(cursor, payment_id: int, is_invoice: bool) -> int:
@@ -725,6 +801,11 @@ def _void_document(record_id: int, void_date, is_invoice: bool):
         )
         if cursor.fetchone():
             raise ValueError(f"Void the payment first before voiding this {table[:-1]}.")
+        if is_invoice:
+            cursor.execute("SELECT 1 FROM credit_applications WHERE invoice_id = ? LIMIT 1",
+                           (record_id,))
+            if cursor.fetchone():
+                raise ValueError("Unapply is not supported; void blocked by a credit application.")
         reversal = _reversal_entry(
             cursor, document.client_id, document.journal_entry_id, void_date,
             f"Void {table[:-1]} #{record_id}", f"Void {table[:-1]} {record_id}",
@@ -812,6 +893,259 @@ def void_bill(bill_id: int, void_date=None) -> int:
     return _void_document(bill_id, void_date or date.today(), False)
 
 
+def _load_credit_memo(cursor, memo_id: int) -> CreditMemo:
+    cursor.execute("SELECT * FROM credit_memos WHERE id = ?", (memo_id,))
+    row = cursor.fetchone()
+    if not row:
+        raise ValueError("Credit memo not found.")
+    cursor.execute("SELECT * FROM credit_memo_lines WHERE credit_memo_id = ? ORDER BY id",
+                   (memo_id,))
+    lines = [CreditMemoLine(
+        id=line["id"], credit_memo_id=memo_id, description=line["description"],
+        quantity=line["quantity"], unit_price_cents=line["unit_price_cents"],
+        revenue_account_id=line["revenue_account_id"],
+    ) for line in cursor.fetchall()]
+    return CreditMemo(
+        id=row["id"], client_id=row["client_id"], customer_id=row["customer_id"],
+        memo_date=date.fromisoformat(row["memo_date"]), status=row["status"],
+        original_invoice_id=row["original_invoice_id"], tax_rate=row["tax_rate"],
+        tax_amount_cents=row["tax_amount_cents"], control_account_id=row["control_account_id"],
+        tax_account_id=row["tax_account_id"], journal_entry_id=row["journal_entry_id"],
+        voided_journal_entry_id=row["voided_journal_entry_id"], lines=lines,
+    )
+
+
+def create_credit_memo(client_id: int, customer_id: int, lines: Iterable, memo_date=None,
+                       tax_rate=None, original_invoice_id: Optional[int] = None) -> CreditMemo:
+    memo_date = _iso(memo_date or date.today(), "memo_date")
+    memo_lines = _coerce_lines(lines, CreditMemoLine, "revenue_account_id")
+    tax_rate, tax_amount_cents = _tax_values(memo_lines, tax_rate)
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM customers WHERE id = ? AND client_id = ?",
+                       (customer_id, client_id))
+        if not cursor.fetchone():
+            raise ValueError("The customer must belong to this client.")
+        if original_invoice_id is not None:
+            cursor.execute("SELECT client_id, customer_id FROM invoices WHERE id = ?",
+                           (original_invoice_id,))
+            original = cursor.fetchone()
+            if not original or original["client_id"] != client_id or original["customer_id"] != customer_id:
+                raise ValueError("The original invoice must belong to the same client and customer.")
+        for line in memo_lines:
+            _assert_account(cursor, client_id, line.revenue_account_id, "Revenue")
+        cursor.execute(
+            "INSERT INTO credit_memos (client_id, customer_id, memo_date, original_invoice_id, tax_rate, tax_amount_cents) VALUES (?, ?, ?, ?, ?, ?)",
+            (client_id, customer_id, memo_date, original_invoice_id, tax_rate, tax_amount_cents),
+        )
+        memo_id = cursor.lastrowid
+        for line in memo_lines:
+            cursor.execute(
+                "INSERT INTO credit_memo_lines (credit_memo_id, description, quantity, unit_price_cents, revenue_account_id) VALUES (?, ?, ?, ?, ?)",
+                (memo_id, line.description, line.quantity, line.unit_price_cents,
+                 line.revenue_account_id),
+            )
+            line.id = cursor.lastrowid
+            line.credit_memo_id = memo_id
+        memo = CreditMemo(
+            id=memo_id, client_id=client_id, customer_id=customer_id,
+            memo_date=date.fromisoformat(memo_date), original_invoice_id=original_invoice_id,
+            tax_rate=tax_rate, tax_amount_cents=tax_amount_cents, lines=memo_lines,
+        )
+        AuditLog.write(cursor, client_id, "credit_memos", memo_id, "INSERT",
+                       new_values={"customer_id": customer_id, "memo_date": memo_date,
+                                   "original_invoice_id": original_invoice_id,
+                                   "tax_rate": tax_rate, "tax_amount_cents": tax_amount_cents,
+                                   "total_cents": memo.total_cents})
+        conn.commit()
+        return memo
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def post_credit_memo(memo_id: int, control_account_id: int,
+                     tax_account_id: Optional[int] = None) -> CreditMemo:
+    conn = _transaction()
+    try:
+        cursor = conn.cursor()
+        memo = _load_credit_memo(cursor, memo_id)
+        if memo.status != "draft" or memo.journal_entry_id is not None:
+            raise ValueError("This credit memo has already been posted.")
+        _assert_account(cursor, memo.client_id, control_account_id, "Asset")
+        line_accounts = {line.revenue_account_id for line in memo.lines}
+        if control_account_id in line_accounts:
+            raise ValueError("The control account must differ from every credit memo line account.")
+        if memo.original_invoice_id is not None:
+            cursor.execute("SELECT control_account_id FROM invoices WHERE id = ?",
+                           (memo.original_invoice_id,))
+            original_control = cursor.fetchone()["control_account_id"]
+            if original_control is None or original_control != control_account_id:
+                raise ValueError("The credit memo control account must equal the original invoice control account.")
+        for line in memo.lines:
+            _assert_account(cursor, memo.client_id, line.revenue_account_id, "Revenue")
+        if memo.tax_amount_cents:
+            if tax_account_id is None:
+                raise ValueError("A tax account is required for a taxed credit memo.")
+            _assert_account(cursor, memo.client_id, tax_account_id, "Liability")
+            if tax_account_id == control_account_id or tax_account_id in line_accounts:
+                raise ValueError("The tax account must differ from the control and line accounts.")
+        else:
+            tax_account_id = None
+        lines = [JournalEntryLine(account_id=line.revenue_account_id,
+                                  debit=to_dollars(line.amount_cents), memo=line.description)
+                 for line in memo.lines]
+        if memo.tax_amount_cents:
+            lines.append(JournalEntryLine(account_id=tax_account_id,
+                                          debit=to_dollars(memo.tax_amount_cents)))
+        lines.append(JournalEntryLine(account_id=control_account_id,
+                                      credit=to_dollars(memo.total_cents)))
+        entry = JournalEntry(
+            client_id=memo.client_id, entry_date=memo.memo_date,
+            description=f"Posted credit memo #{memo_id}",
+            source_reference=f"Credit memo {memo_id}", lines=lines,
+        )
+        entry.save(conn=conn)
+        cursor.execute(
+            "UPDATE credit_memos SET status = 'posted', journal_entry_id = ?, control_account_id = ?, tax_account_id = ? WHERE id = ?",
+            (entry.id, control_account_id, tax_account_id, memo_id),
+        )
+        AuditLog.write(cursor, memo.client_id, "credit_memos", memo_id, "UPDATE",
+                       old_values={"status": "draft", "journal_entry_id": None},
+                       new_values={"status": "posted", "journal_entry_id": entry.id,
+                                   "control_account_id": control_account_id,
+                                   "tax_account_id": tax_account_id})
+        conn.commit()
+        memo.status = "posted"
+        memo.journal_entry_id = entry.id
+        memo.control_account_id = control_account_id
+        memo.tax_account_id = tax_account_id
+        return memo
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _credit_memo_balance(cursor, memo_id: int) -> int:
+    cursor.execute(
+        """SELECT COALESCE((SELECT SUM(quantity * unit_price_cents)
+                              FROM credit_memo_lines WHERE credit_memo_id = cm.id), 0) +
+                       cm.tax_amount_cents - COALESCE((SELECT SUM(amount_cents)
+                           FROM credit_applications WHERE credit_memo_id = cm.id), 0) balance
+             FROM credit_memos cm WHERE cm.id = ?""", (memo_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        raise ValueError("Credit memo not found.")
+    return int(row["balance"])
+
+
+def apply_credit_memo(memo_id: int, invoice_id: int, amount_cents: int) -> int:
+    amount_cents = int(amount_cents)
+    if amount_cents <= 0:
+        raise ValueError("Application amount must be greater than zero.")
+    conn = _transaction()
+    try:
+        cursor = conn.cursor()
+        memo = _load_credit_memo(cursor, memo_id)
+        if memo.status not in ("posted", "applied") or memo.journal_entry_id is None:
+            raise ValueError("The credit memo must be posted and not voided.")
+        invoice = _load_document(cursor, invoice_id, True)
+        if invoice.status in ("draft", "voided") or invoice.journal_entry_id is None:
+            raise ValueError("The invoice must be posted with an open balance.")
+        if invoice.client_id != memo.client_id or invoice.customer_id != memo.customer_id:
+            raise ValueError("The invoice must belong to the same client and customer.")
+        if invoice.control_account_id != memo.control_account_id:
+            raise ValueError("The credit memo and invoice must use the same control account.")
+        remaining = _credit_memo_balance(cursor, memo_id)
+        invoice_balance = _open_balance(cursor, invoice_id, True)
+        if amount_cents > remaining:
+            raise ValueError("The application cannot exceed the credit memo's remaining balance.")
+        if amount_cents > invoice_balance:
+            raise ValueError("The application cannot exceed the invoice's open balance.")
+        cursor.execute(
+            "INSERT INTO credit_applications (credit_memo_id, invoice_id, amount_cents) VALUES (?, ?, ?)",
+            (memo_id, invoice_id, amount_cents),
+        )
+        application_id = cursor.lastrowid
+        AuditLog.write(cursor, memo.client_id, "credit_applications", application_id, "INSERT",
+                       new_values={"credit_memo_id": memo_id, "invoice_id": invoice_id,
+                                   "amount_cents": amount_cents})
+        _set_document_status(cursor, memo.client_id, invoice_id, True, invoice.status)
+        if _credit_memo_balance(cursor, memo_id) == 0:
+            cursor.execute("UPDATE credit_memos SET status = 'applied' WHERE id = ?", (memo_id,))
+            AuditLog.write(cursor, memo.client_id, "credit_memos", memo_id, "UPDATE",
+                           old_values={"status": memo.status}, new_values={"status": "applied"})
+        conn.commit()
+        return application_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def void_credit_memo(memo_id: int, void_date=None) -> int:
+    conn = _transaction()
+    try:
+        cursor = conn.cursor()
+        memo = _load_credit_memo(cursor, memo_id)
+        if memo.status == "draft" or memo.journal_entry_id is None:
+            raise ValueError("A draft credit memo has nothing posted to reverse.")
+        if memo.status == "voided":
+            raise ValueError("This credit memo has already been voided.")
+        cursor.execute("SELECT 1 FROM credit_applications WHERE credit_memo_id = ? LIMIT 1",
+                       (memo_id,))
+        if cursor.fetchone():
+            raise ValueError("Unapply is not supported; void blocked while applications exist.")
+        reversal = _reversal_entry(
+            cursor, memo.client_id, memo.journal_entry_id, void_date or date.today(),
+            f"Void credit memo #{memo_id}", f"Void credit memo {memo_id}",
+        )
+        reversal.save(conn=conn)
+        cursor.execute(
+            "UPDATE credit_memos SET status = 'voided', voided_journal_entry_id = ? WHERE id = ?",
+            (reversal.id, memo_id),
+        )
+        AuditLog.write(cursor, memo.client_id, "credit_memos", memo_id, "UPDATE",
+                       old_values={"status": memo.status, "voided_journal_entry_id": None},
+                       new_values={"status": "voided",
+                                   "voided_journal_entry_id": reversal.id})
+        conn.commit()
+        return reversal.id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def list_credit_memos(client_id: int):
+    with get_cursor() as cursor:
+        cursor.execute(
+            """SELECT cm.*, c.name party_name,
+                       COALESCE((SELECT SUM(quantity * unit_price_cents)
+                           FROM credit_memo_lines WHERE credit_memo_id = cm.id), 0) +
+                           cm.tax_amount_cents total_cents,
+                       COALESCE((SELECT SUM(amount_cents) FROM credit_applications
+                           WHERE credit_memo_id = cm.id), 0) applied_cents
+                 FROM credit_memos cm JOIN customers c ON c.id = cm.customer_id
+                WHERE cm.client_id = ? ORDER BY cm.memo_date DESC, cm.id DESC""",
+            (client_id,),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["remaining_balance_cents"] = item["total_cents"] - item["applied_cents"]
+            rows.append(item)
+        return rows
+
+
 def _list_documents(client_id: int, is_invoice: bool):
     table = "invoices" if is_invoice else "bills"
     lines_table = "invoice_lines" if is_invoice else "bill_lines"
@@ -824,7 +1158,7 @@ def _list_documents(client_id: int, is_invoice: bool):
         cursor.execute(
             f"""SELECT d.*, p.name party_name,
                        COALESCE((SELECT SUM(quantity * unit_price_cents) FROM {lines_table}
-                                 WHERE {table[:-1]}_id = d.id), 0) total_cents,
+                                 WHERE {table[:-1]}_id = d.id), 0) + d.tax_amount_cents total_cents,
                        COALESCE((SELECT SUM(a.amount_cents) FROM {allocations_table} a
                                  JOIN {payments_table} pm ON pm.id = a.payment_id
                                  WHERE a.{table[:-1]}_id = d.id AND pm.status = 'recorded'), 0) allocated_cents
@@ -835,7 +1169,13 @@ def _list_documents(client_id: int, is_invoice: bool):
         rows = []
         for row in cursor.fetchall():
             item = dict(row)
-            item["open_balance_cents"] = item["total_cents"] - item["allocated_cents"]
+            credit_applications = 0
+            if is_invoice:
+                cursor.execute("SELECT COALESCE(SUM(amount_cents), 0) amount FROM credit_applications WHERE invoice_id = ?",
+                               (item["id"],))
+                credit_applications = cursor.fetchone()["amount"]
+            item["open_balance_cents"] = (item["total_cents"] - item["allocated_cents"] -
+                                           credit_applications)
             rows.append(item)
         return rows
 
@@ -892,22 +1232,25 @@ def _aging(client_id: int, as_of, is_invoice: bool):
         cursor.execute(
             f"""SELECT d.id, d.{party_field}, party.name party_name, d.due_date,
                        COALESCE((SELECT SUM(quantity * unit_price_cents) FROM {lines_table}
-                                 WHERE {table[:-1]}_id = d.id), 0) -
+                                 WHERE {table[:-1]}_id = d.id), 0) + d.tax_amount_cents -
                        COALESCE((SELECT SUM(a.amount_cents) FROM {allocations_table} a
                                  JOIN {payments_table} p ON p.id = a.payment_id
                                  WHERE a.{table[:-1]}_id = d.id AND p.payment_date <= ?
                                    AND NOT (p.status = 'voided' AND EXISTS (
                                        SELECT 1 FROM journal_entries pv
                                        WHERE pv.id = p.voided_journal_entry_id
-                                         AND pv.entry_date <= ?))), 0) open_balance_cents
+                                   AND pv.entry_date <= ?))), 0) -
+                       {"COALESCE((SELECT SUM(ca.amount_cents) FROM credit_applications ca JOIN credit_memos cm ON cm.id = ca.credit_memo_id WHERE ca.invoice_id = d.id AND cm.memo_date <= ? AND cm.status != 'voided'), 0)" if is_invoice else "0"} open_balance_cents
                 FROM {table} d JOIN {party_table} party ON party.id = d.{party_field}
                 WHERE d.client_id = ? AND d.status != 'draft' AND d.{date_field} <= ?
                   AND NOT (d.status = 'voided' AND EXISTS (
                       SELECT 1 FROM journal_entries vje
                       WHERE vje.id = d.voided_journal_entry_id AND vje.entry_date <= ?))
                 ORDER BY d.due_date, d.id""",
-            (as_of.isoformat(), as_of.isoformat(), client_id, as_of.isoformat(),
-             as_of.isoformat()),
+            ((as_of.isoformat(), as_of.isoformat(), as_of.isoformat(), client_id,
+              as_of.isoformat(), as_of.isoformat()) if is_invoice else
+             (as_of.isoformat(), as_of.isoformat(), client_id, as_of.isoformat(),
+              as_of.isoformat())),
         )
         documents = [dict(row) for row in cursor.fetchall()]
     for document in documents:
@@ -947,6 +1290,32 @@ def _aging(client_id: int, as_of, is_invoice: bool):
                 "due_date": credit["payment_date"], "bucket": "current",
                 "amount_cents": -credit["open_credit_cents"],
             })
+    if is_invoice:
+        with get_cursor() as cursor:
+            cursor.execute(
+                """SELECT cm.id, cm.customer_id, c.name party_name, cm.memo_date,
+                           COALESCE((SELECT SUM(quantity * unit_price_cents)
+                               FROM credit_memo_lines WHERE credit_memo_id = cm.id), 0) +
+                           cm.tax_amount_cents - COALESCE((SELECT SUM(ca.amount_cents)
+                               FROM credit_applications ca JOIN invoices i ON i.id = ca.invoice_id
+                               WHERE ca.credit_memo_id = cm.id AND cm.memo_date <= ?), 0) remaining
+                     FROM credit_memos cm JOIN customers c ON c.id = cm.customer_id
+                    WHERE cm.client_id = ? AND cm.memo_date <= ? AND cm.status != 'draft'
+                      AND NOT (cm.status = 'voided' AND EXISTS (
+                          SELECT 1 FROM journal_entries vje
+                          WHERE vje.id = cm.voided_journal_entry_id AND vje.entry_date <= ?))
+                    ORDER BY cm.memo_date, cm.id""",
+                (as_of.isoformat(), client_id, as_of.isoformat(), as_of.isoformat()),
+            )
+            memo_credits = [dict(row) for row in cursor.fetchall()]
+        for credit in memo_credits:
+            if credit["remaining"] > 0:
+                rows.append({
+                    "party_id": credit["customer_id"], "party_name": credit["party_name"],
+                    "document_id": credit["id"], "kind": "credit_memo",
+                    "due_date": credit["memo_date"], "bucket": "current",
+                    "amount_cents": -credit["remaining"],
+                })
     return rows
 
 

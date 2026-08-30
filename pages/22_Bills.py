@@ -15,7 +15,8 @@ from models.account import Account
 from money import to_cents, to_dollars
 from services.ar_ap import (create_bill, create_vendor, list_bills,
                             list_vendor_credits, post_bill, record_vendor_payment,
-                            void_bill, void_vendor_payment)
+                            record_sales_tax_remittance, void_bill,
+                            void_vendor_payment)
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 
@@ -57,13 +58,15 @@ if vendors and expenses:
             description = st.text_input("Description")
             quantity = st.number_input("Quantity", min_value=1, step=1)
             unit_price = st.number_input("Unit price", min_value=0.01, step=0.01)
+            tax_rate = st.text_input("Tax rate (optional decimal, e.g. 0.0650)")
             expense_id = st.selectbox("Expense account", [a.id for a in expenses],
                                       format_func=lambda aid: next(f"{a.account_number} — {a.name}" for a in expenses if a.id == aid))
             if st.form_submit_button("Create bill"):
                 try:
                     create_bill(client_id, vendor_id, [{"description": description,
                         "quantity": int(quantity), "unit_price_cents": to_cents(unit_price),
-                        "expense_account_id": expense_id}], bill_date, due_date)
+                        "expense_account_id": expense_id}], bill_date, due_date,
+                        tax_rate or None)
                 except Exception as exc:
                     st.error(str(exc))
                 else:
@@ -81,9 +84,12 @@ if rows and liabilities and assets:
     liability_label = lambda aid: next(f"{a.account_number} — {a.name}" for a in liabilities if a.id == aid)
     asset_label = lambda aid: next(f"{a.account_number} — {a.name}" for a in assets if a.id == aid)
     control_id = st.selectbox("A/P control account", [a.id for a in liabilities], format_func=liability_label)
+    tax_account_id = st.selectbox("Sales tax liability account (for taxed bills)",
+                                  [None, *[a.id for a in liabilities]],
+                                  format_func=lambda aid: "Not taxed" if aid is None else liability_label(aid))
     if st.button("Post bill"):
         try:
-            post_bill(selected, control_id)
+            post_bill(selected, control_id, tax_account_id)
         except Exception as exc:
             st.error(str(exc))
         else:
@@ -127,3 +133,20 @@ if credits:
             st.error(str(exc))
         else:
             st.rerun()
+
+if liabilities and assets:
+    with st.expander("Record sales tax remittance"):
+        remittance_tax_id = st.selectbox("Tax liability account", [a.id for a in liabilities])
+        remittance_bank_id = st.selectbox("Bank account", [a.id for a in assets])
+        remittance_amount = st.number_input("Remittance amount", min_value=0.01, step=0.01)
+        remittance_date = st.date_input("Remittance date", date.today())
+        remittance_memo = st.text_input("Remittance memo")
+        if st.button("Record sales tax remittance"):
+            try:
+                record_sales_tax_remittance(client_id, remittance_tax_id, remittance_bank_id,
+                                            to_cents(remittance_amount), remittance_date,
+                                            remittance_memo)
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                st.rerun()
