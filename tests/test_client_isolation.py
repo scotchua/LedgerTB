@@ -62,15 +62,11 @@ def test_entry_get_by_id_rejects_cross_client(two_clients):
     assert JournalEntry.get_by_id(d["b_entry"], client_id=d["b"]).id == d["b_entry"]
 
 
-def test_delete_scoped_to_wrong_client_is_noop(two_clients):
+def test_delete_is_refused_regardless_of_scope(two_clients):
     d = two_clients
-    # Attempt to delete B's entry as client A -- must NOT delete it.
-    JournalEntry.delete(d["b_entry"], client_id=d["a"])
+    with pytest.raises(ValueError, match="Posted entries cannot be deleted"):
+        JournalEntry.delete(d["b_entry"], client_id=d["a"])
     assert JournalEntry.get_by_id(d["b_entry"]) is not None
-
-    # The rightful client can delete it.
-    JournalEntry.delete(d["b_entry"], client_id=d["b"])
-    assert JournalEntry.get_by_id(d["b_entry"]) is None
 
 
 def test_general_ledger_scoped_to_wrong_client_is_empty(two_clients):

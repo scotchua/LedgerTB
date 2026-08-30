@@ -125,7 +125,7 @@ def test_correction_proposal_retains_original_to_posted_chain(client_id, account
     assert stored.posted_entry_id == correction_id
     assert JournalEntry.get_by_id(original.id, client_id=client_id) is not None
 
-    with pytest.raises(ValueError, match=f"correction draft #{draft.id}"):
+    with pytest.raises(ValueError, match="Posted entries cannot be deleted"):
         JournalEntry.delete(original.id, client_id=client_id)
 
 

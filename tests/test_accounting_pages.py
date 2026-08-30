@@ -923,9 +923,7 @@ def test_hand_keyed_adjusting_entry_gets_aje_reference(client_id, accounts, monk
     assert entry.aje_reference == "AJE-001"
 
 
-def test_edit_button_lands_on_the_form(client_id, accounts, monkeypatch):
-    """Edit must switch to the New Entry view — with st.tabs it loaded the
-    form invisibly and the click appeared to do nothing."""
+def test_reverse_and_correct_prefills_new_entry(client_id, accounts, monkeypatch):
     _select_client(monkeypatch, client_id)
     entry = post_entry(
         client_id, date(2026, 3, 21),
@@ -936,15 +934,18 @@ def test_edit_button_lands_on_the_form(client_id, accounts, monkeypatch):
     journal.session_state["journal_active_tab"] = "View Entries"
     journal.run()
 
-    journal.button(key=f"edit_entry_{entry.id}").click().run()
+    journal.button(key=f"reverse_correct_entry_{entry.id}").click().run()
+    assert not journal.exception
+    assert journal.session_state["journal_active_tab"] == "Reverse Entry"
+    journal.checkbox(key="confirm_reversal").check().run()
+    journal.button(key="post_reversal").click().run()
     assert not journal.exception
     assert journal.session_state["journal_active_tab"] == "New Entry"
-    assert journal.session_state["editing_entry_id"] == entry.id
-    assert any("Edit Journal Entry" in h.value for h in journal.subheader)
+    assert journal.session_state["correction_source_entry_id"] == entry.id
+    assert journal.selectbox(key="account_0_g1").value == accounts["cash"]
 
 
-def test_editing_an_aje_preserves_its_reference(client_id, accounts, monkeypatch):
-    """The update statement overwrites aje_reference; editing must carry it."""
+def test_correction_copy_of_aje_preserves_its_reference(client_id, accounts, monkeypatch):
     from models.journal_entry import JournalEntryLine
 
     entry = JournalEntry(
@@ -963,13 +964,17 @@ def test_editing_an_aje_preserves_its_reference(client_id, accounts, monkeypatch
     _select_client(monkeypatch, client_id)
     journal = AppTest.from_file(page_path("pages/2_Journal_Entries.py"), default_timeout=30
     )
-    journal.session_state["edit_entry_id"] = entry.id
+    journal.session_state["reverse_and_correct_entry_id"] = entry.id
+    journal.session_state["reversal_entry_id"] = entry.id
+    journal.session_state["journal_active_tab"] = "Reverse Entry"
     journal.run()
     assert not journal.exception
+    journal.checkbox(key="confirm_reversal").check().run()
+    journal.button(key="post_reversal").click().run()
     next(b for b in journal.button if b.label == "Save Entry").click().run()
 
     assert not journal.exception
-    saved = JournalEntry.get_by_id(entry.id, client_id=client_id)
+    saved = JournalEntry.get_all(client_id)[0]
     assert saved.aje_reference == "AJE-007"
 
 
@@ -1015,7 +1020,7 @@ def test_dashboard_balances_show_totals_and_equation(client_id, accounts, monkey
     assert "As of" in captions
 
 
-def test_journal_delete_requires_confirmation(client_id, accounts, monkeypatch):
+def test_journal_reverse_posts_linked_entry(client_id, accounts, monkeypatch):
     _select_client(monkeypatch, client_id)
     entry = post_entry(
         client_id,
@@ -1027,12 +1032,11 @@ def test_journal_delete_requires_confirmation(client_id, accounts, monkeypatch):
     journal.session_state["journal_active_tab"] = "View Entries"
     journal.run()
 
-    journal.button(key=f"delete_entry_{entry.id}").click().run()
-    assert JournalEntry.get_by_id(entry.id) is not None
-    assert journal.button(key=f"confirm_delete_entry_{entry.id}")
-
-    journal.button(key=f"confirm_delete_entry_{entry.id}").click().run()
-    assert JournalEntry.get_by_id(entry.id) is None
+    journal.button(key=f"reverse_entry_{entry.id}").click().run()
+    journal.checkbox(key="confirm_reversal").check().run()
+    journal.button(key="post_reversal").click().run()
+    original = JournalEntry.get_by_id(entry.id)
+    assert original.reversed_by_journal_entry_id is not None
 
 
 def test_correction_draft_shows_original_and_retains_visible_chain(
