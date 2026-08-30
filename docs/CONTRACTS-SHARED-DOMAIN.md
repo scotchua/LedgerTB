@@ -7,3 +7,7 @@ A voidable document has a status that includes `voided` and a nullable `voided_j
 Any subledger-only row dated in a closed fiscal period must be rejected by its service before it is saved, even when no journal entry is involved. This includes inventory movements, staged imports, and payroll staging. Services use `FiscalPeriod.get_closed_period_for_date` for this check. `JournalEntry.save` already gates paths that post a journal entry.
 
 Departments are the shared, module-neutral dimension. The `departments` table belongs to a client and requires department names to be unique within that client. Payroll uses it first; AR/AP and inventory may use the same table in later builds.
+
+## AR/AP payment allocations
+
+From migration 036 onward, `invoice_payments` and `bill_payments` from migration 032 are legacy-read-only. New receipts and disbursements use the party-level payment and allocation tables; services never write the legacy tables.
