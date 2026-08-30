@@ -103,17 +103,21 @@ def test_deposit_correction_moves_credit_to_new_revenue(client_id, accounts):
     assert Account.get_balance(other_revenue, client_id=client_id) == 125
 
 
-def test_imported_posting_cannot_be_edited_in_place(client_id, accounts):
+def test_imported_posting_cannot_be_edited_or_generically_reversed(
+    client_id, accounts
+):
     original, _ = _post(client_id, accounts, -20, accounts["expense"])
     saved = JournalEntry.get_by_id(original.id, client_id=client_id)
     saved.description = "silently changed"
 
-    with pytest.raises(ValueError, match="Correct category"):
+    with pytest.raises(ValueError, match="Posted entries cannot be edited"):
         saved.save()
+    with pytest.raises(ValueError, match="Correct the category"):
+        JournalEntry.reverse(original.id, client_id)
 
-    assert JournalEntry.get_by_id(original.id, client_id=client_id).description == (
-        "Imported merchant"
-    )
+    unchanged = JournalEntry.get_by_id(original.id, client_id=client_id)
+    assert unchanged.description == "Imported merchant"
+    assert unchanged.reversed_by_journal_entry_id is None
 
 
 def test_correction_preserves_completed_bank_reconciliation(client_id, accounts):

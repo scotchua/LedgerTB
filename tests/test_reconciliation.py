@@ -59,9 +59,15 @@ def test_asset_reconciliation_clears_gl_lines_and_completes(client_id, accounts)
     assert imported[0].is_cleared
     assert imported[0].statement_end_date == date(2026, 1, 31)
 
-    opening.lines = JournalEntry.get_by_id(opening.id, client_id).lines
-    with pytest.raises(ValueError, match="selected in a bank reconciliation"):
+    opening.description = "must remain unchanged"
+    with pytest.raises(ValueError, match="Posted entries cannot be edited"):
         opening.save()
+    with pytest.raises(ValueError, match="selected in a bank reconciliation"):
+        JournalEntry.reverse(opening.id, client_id)
+
+    unchanged = JournalEntry.get_by_id(opening.id, client_id)
+    assert unchanged.description == "test entry"
+    assert unchanged.reversed_by_journal_entry_id is None
 
 
 def test_completion_requires_exact_statement_balance(client_id, accounts):

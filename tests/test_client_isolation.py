@@ -62,15 +62,11 @@ def test_entry_get_by_id_rejects_cross_client(two_clients):
     assert JournalEntry.get_by_id(d["b_entry"], client_id=d["b"]).id == d["b_entry"]
 
 
-def test_delete_scoped_to_wrong_client_is_noop(two_clients):
+def test_delete_is_refused_regardless_of_scope(two_clients):
     d = two_clients
-    # Attempt to delete B's entry as client A -- must NOT delete it.
-    JournalEntry.delete(d["b_entry"], client_id=d["a"])
+    with pytest.raises(ValueError, match="Posted entries cannot be deleted"):
+        JournalEntry.delete(d["b_entry"], client_id=d["a"])
     assert JournalEntry.get_by_id(d["b_entry"]) is not None
-
-    # The rightful client can delete it.
-    JournalEntry.delete(d["b_entry"], client_id=d["b"])
-    assert JournalEntry.get_by_id(d["b_entry"]) is None
 
 
 def test_general_ledger_scoped_to_wrong_client_is_empty(two_clients):
@@ -101,7 +97,7 @@ def test_entry_save_rejects_cross_client_accounts(two_clients):
     assert JournalEntry.count(d["b"]) == 1
 
 
-def test_entry_update_rejects_cross_client_id(two_clients):
+def test_entry_save_with_id_and_reverse_reject_cross_client_id(two_clients):
     d = two_clients
     entry = JournalEntry(
         id=d["b_entry"],
@@ -113,9 +109,14 @@ def test_entry_update_rejects_cross_client_id(two_clients):
             JournalEntryLine(account_id=d["a_rev"], credit=100),
         ],
     )
-    with pytest.raises(ValueError, match="not found"):
+    with pytest.raises(ValueError, match="Posted entries cannot be edited"):
         entry.save()
+    with pytest.raises(ValueError, match="not found for the selected client"):
+        JournalEntry.reverse(d["b_entry"], d["a"])
     assert JournalEntry.get_by_id(d["b_entry"]).description == "test entry"
+    assert JournalEntry.get_by_id(d["b_entry"]).reversed_by_journal_entry_id is None
+    assert JournalEntry.count(d["a"]) == 1
+    assert JournalEntry.count(d["b"]) == 1
 
 
 def test_account_update_rejects_cross_client_id(two_clients):

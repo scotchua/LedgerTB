@@ -8,7 +8,9 @@ from models.fiscal_period import FiscalPeriod
 from models.transaction import ImportedTransaction
 
 
-def test_delete_entry_linked_to_imported_transaction_is_blocked(client_id, accounts):
+def test_delete_entry_linked_to_imported_transaction_uses_blanket_refusal(
+    client_id, accounts
+):
     """Imported source history must never be left marked Posted without its entry."""
     entry = post_entry(client_id, date(2025, 5, 1), [
         (accounts["cash"], 100, 0),
@@ -28,7 +30,7 @@ def test_delete_entry_linked_to_imported_transaction_is_blocked(client_id, accou
     )
     txn.save()
 
-    with pytest.raises(ValueError, match="Reverse it instead"):
+    with pytest.raises(ValueError, match="Posted entries cannot be deleted"):
         JournalEntry.delete(entry.id)
 
     assert JournalEntry.get_by_id(entry.id) is not None
@@ -38,14 +40,135 @@ def test_delete_entry_linked_to_imported_transaction_is_blocked(client_id, accou
     assert posted[0].journal_entry_id == entry.id
 
 
-def test_delete_plain_entry_still_works(client_id, accounts):
-    """A manually-created entry with no import link deletes cleanly (unchanged behavior)."""
+def test_saved_entry_cannot_be_edited_or_deleted(client_id, accounts):
     entry = post_entry(client_id, date(2025, 5, 2), [
         (accounts["cash"], 50, 0),
         (accounts["revenue"], 0, 50),
     ])
-    JournalEntry.delete(entry.id)
-    assert JournalEntry.get_by_id(entry.id) is None
+    before = JournalEntry.get_by_id(entry.id)
+    entry.description = "Rewritten"
+
+    with pytest.raises(ValueError, match="Posted entries cannot be edited"):
+        entry.save()
+    with pytest.raises(ValueError, match="Posted entries cannot be deleted"):
+        JournalEntry.delete(entry.id)
+
+    after = JournalEntry.get_by_id(entry.id)
+    assert after.description == before.description
+    assert [(line.debit, line.credit) for line in after.lines] == [
+        (line.debit, line.credit) for line in before.lines
+    ]
+
+
+def test_reverse_swaps_lines_links_audits_and_refuses_second(client_id, accounts):
+    entry = post_entry(client_id, date(2025, 5, 4), [
+        (accounts["cash"], 125, 0),
+        (accounts["revenue"], 0, 125),
+    ])
+
+    reversal = JournalEntry.reverse(entry.id, client_id)
+    original = JournalEntry.get_by_id(entry.id)
+    reversal = JournalEntry.get_by_id(reversal.id)
+
+    assert reversal.entry_date == entry.entry_date
+    assert [(line.debit, line.credit) for line in reversal.lines] == [
+        (0, 125), (125, 0)
+    ]
+    assert reversal.reverses_journal_entry_id == entry.id
+    assert original.reversed_by_journal_entry_id == reversal.id
+
+    from database.connection import get_cursor
+    with get_cursor() as cursor:
+        cursor.execute(
+            "SELECT action FROM audit_log WHERE table_name = 'journal_entries' "
+            "AND record_id IN (?, ?) ORDER BY id",
+            (entry.id, reversal.id),
+        )
+        assert [row["action"] for row in cursor.fetchall()][-2:] == ["INSERT", "REVERSE"]
+
+    with pytest.raises(ValueError, match="already reversed"):
+        JournalEntry.reverse(entry.id, client_id)
+
+
+def test_reverse_participates_in_caller_transaction(client_id, accounts):
+    from database.connection import get_connection, get_cursor
+
+    entry = post_entry(client_id, date(2025, 5, 4), [
+        (accounts["cash"], 125, 0),
+        (accounts["revenue"], 0, 125),
+    ])
+    with get_cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) FROM audit_log")
+        audit_count = cursor.fetchone()[0]
+
+    conn = get_connection()
+    try:
+        JournalEntry.reverse(entry.id, client_id, conn=conn)
+        raise RuntimeError("fault between reversal and correction")
+    except RuntimeError:
+        conn.rollback()
+    finally:
+        conn.close()
+
+    assert JournalEntry.count(client_id) == 1
+    assert JournalEntry.get_by_id(entry.id).reversed_by_journal_entry_id is None
+    with get_cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) FROM audit_log")
+        assert cursor.fetchone()[0] == audit_count
+
+
+def test_closed_period_reversal_requires_and_uses_open_date(client_id, accounts):
+    entry = post_entry(client_id, date(2025, 12, 31), [
+        (accounts["cash"], 80, 0),
+        (accounts["revenue"], 0, 80),
+    ])
+    FiscalPeriod(
+        client_id=client_id, period_name="FY 2025", period_type="Year",
+        start_date=date(2025, 1, 1), end_date=date(2025, 12, 31), is_closed=True,
+    ).save()
+
+    with pytest.raises(ValueError, match="Choose a reversal date"):
+        JournalEntry.reverse(entry.id, client_id)
+    reversal = JournalEntry.reverse(entry.id, client_id, date(2026, 1, 2))
+    assert reversal.entry_date == date(2026, 1, 2)
+
+
+def test_document_controlled_entry_cannot_be_reversed(client_id, accounts):
+    from database.connection import get_connection
+    from models.fixed_asset import FixedAsset, FixedAssetType
+
+    entry = post_entry(client_id, date(2025, 5, 5), [
+        (accounts["expense"], 20, 0),
+        (accounts["cash"], 0, 20),
+    ])
+    asset_type = FixedAssetType(
+        client_id=client_id, name="Computer", asset_account_id=accounts["cash"],
+        accumulated_depreciation_account_id=accounts["equity"],
+        depreciation_expense_account_id=accounts["expense"],
+        effective_life_months=36,
+    )
+    asset_type.save()
+    asset = FixedAsset(
+        client_id=client_id, fixed_asset_type_id=asset_type.id,
+        description="Laptop", acquisition_date=date(2025, 1, 1),
+        in_service_date=date(2025, 1, 1), cost_cents=120000,
+    )
+    asset.save()
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO depreciation_runs "
+            "(fixed_asset_id, period_start, period_end, amount_cents, journal_entry_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (asset.id, "2025-05-01", "2025-05-31", 2000, entry.id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(ValueError, match="depreciation run"):
+        JournalEntry.reverse(entry.id, client_id)
 
 
 def test_negative_journal_amounts_are_rejected(client_id, accounts):
@@ -62,7 +185,7 @@ def test_negative_journal_amounts_are_rejected(client_id, accounts):
         entry.save()
 
 
-def test_closed_year_entry_cannot_be_moved_to_open_year(client_id, accounts):
+def test_closed_year_entry_cannot_be_edited(client_id, accounts):
     entry = post_entry(client_id, date(2025, 12, 31), [
         (accounts["cash"], 100, 0),
         (accounts["revenue"], 0, 100),
@@ -77,7 +200,7 @@ def test_closed_year_entry_cannot_be_moved_to_open_year(client_id, accounts):
     ).save()
 
     entry.entry_date = date(2026, 1, 1)
-    with pytest.raises(ValueError, match="FY 2025 is closed"):
+    with pytest.raises(ValueError, match="Posted entries cannot be edited"):
         entry.save()
 
     assert JournalEntry.get_by_id(entry.id).entry_date == date(2025, 12, 31)
@@ -89,8 +212,16 @@ def test_entry_list_filters_by_search_and_account(client_id, accounts):
         client_id, date(2026, 3, 21),
         [(accounts["cash"], 1200, 0), (accounts["equity"], 0, 1200)],
     )
-    transfer.description = "Transfer from Relay #7313"
-    transfer.save()
+    from database.connection import get_connection
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE journal_entries SET description = ? WHERE id = ?",
+            ("Transfer from Relay #7313", transfer.id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     post_entry(
         client_id, date(2026, 2, 1),
         [(accounts["expense"], 15, 0), (accounts["credit_card"], 0, 15)],

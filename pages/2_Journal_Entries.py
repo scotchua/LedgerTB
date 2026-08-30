@@ -86,13 +86,14 @@ if journal_scope.changed:
     # browser re-impose the previous client's values on the next render.
     start_new_form_generation()
     st.session_state.je_lines = _empty_je_lines()
-    st.session_state.editing_entry_id = None
+    st.session_state.correction_source_entry_id = None
     st.session_state.journal_active_tab = "New Entry"
     st.session_state.pop("_journal_active_tab_rendered", None)
     for key in (
         "edit_entry_id",
         "correct_import_entry_id",
-        "confirm_delete_entry_id",
+        "reverse_entry_id",
+        "reverse_and_correct_entry_id",
         "je_entry_date",
         "je_entry_type",
         "je_source_reference",
@@ -155,68 +156,12 @@ if st.session_state.pop("_prune_je_form_widgets", False):
         if key.startswith(_FORM_WIDGET_PREFIXES):
             del st.session_state[key]
 
-if 'editing_entry_id' not in st.session_state:
-    st.session_state.editing_entry_id = None
-
-# Check if we're coming from General Ledger drill-down
-if 'edit_entry_id' in st.session_state:
-    # A context change already rotated the form before the valid, tagged
-    # navigation intent was applied. Same-context drill-downs still need a new
-    # generation so an unsaved form cannot overwrite the loaded entry.
-    if not journal_scope.changed:
-        start_new_form_generation()
-    entry_to_edit = JournalEntry.get_by_id(st.session_state.edit_entry_id, client_id=client_id)
-    if entry_to_edit:
-        import_link = ImportedTransaction.get_links_for_journal_entries(
-            client_id, [entry_to_edit.id]
-        ).get(entry_to_edit.id)
-        if import_link:
-            st.session_state.correct_import_entry_id = entry_to_edit.id
-            st.info(
-                "Imported postings use a category correction so their source "
-                "and reconciliation history remain intact."
-            )
-        else:
-            st.session_state.journal_active_tab = "New Entry"
-            st.session_state.editing_entry_id = entry_to_edit.id
-            st.session_state.je_lines = [
-                {
-                    'account_id': line.account_id,
-                    'debit': line.debit,
-                    'credit': line.credit,
-                    'memo': line.memo or ''
-                }
-                for line in entry_to_edit.lines
-            ]
-            # Also store header fields
-            st.session_state.je_entry_date = entry_to_edit.entry_date
-            st.session_state.je_entry_type = entry_to_edit.entry_type
-            st.session_state.je_source_reference = entry_to_edit.source_reference or ''
-            st.session_state.je_description = entry_to_edit.description or ''
-            st.session_state.je_aje_reference = entry_to_edit.aje_reference
-            st.success(f"Loaded Journal Entry #{entry_to_edit.id} for editing")
-    del st.session_state.edit_entry_id
+if 'correction_source_entry_id' not in st.session_state:
+    st.session_state.correction_source_entry_id = None
 
 
-def reset_entry_form():
-    start_new_form_generation()
-    st.session_state.je_lines = _empty_je_lines()
-    st.session_state.editing_entry_id = None
-    # Clear header fields
-    if 'je_entry_date' in st.session_state:
-        del st.session_state.je_entry_date
-    if 'je_entry_type' in st.session_state:
-        del st.session_state.je_entry_type
-    if 'je_source_reference' in st.session_state:
-        del st.session_state.je_source_reference
-    if 'je_description' in st.session_state:
-        del st.session_state.je_description
-    if 'je_aje_reference' in st.session_state:
-        del st.session_state.je_aje_reference
-
-
-def load_entry_for_edit(entry: JournalEntry):
-    st.session_state.editing_entry_id = entry.id
+def load_entry_as_correction(entry: JournalEntry):
+    st.session_state.correction_source_entry_id = entry.id
     st.session_state.je_lines = [
         {
             'account_id': line.account_id,
@@ -231,33 +176,50 @@ def load_entry_for_edit(entry: JournalEntry):
     st.session_state.je_source_reference = entry.source_reference or ''
     st.session_state.je_description = entry.description or ''
     st.session_state.je_aje_reference = entry.aje_reference
+    if not journal_scope.changed:
+        start_new_form_generation()
+
+
+# Check if we're coming from General Ledger drill-down
+if 'edit_entry_id' in st.session_state:
+    # A context change already rotated the form before the valid, tagged
+    # navigation intent was applied. Same-context drill-downs still need a new
+    # generation so an unsaved form cannot overwrite the loaded entry.
+    entry_to_edit = JournalEntry.get_by_id(st.session_state.edit_entry_id, client_id=client_id)
+    if entry_to_edit:
+        import_link = ImportedTransaction.get_links_for_journal_entries(
+            client_id, [entry_to_edit.id]
+        ).get(entry_to_edit.id)
+        if import_link:
+            st.session_state.correct_import_entry_id = entry_to_edit.id
+            st.info(
+                "Imported postings use a category correction so their source "
+                "and reconciliation history remain intact."
+            )
+        else:
+            load_entry_as_correction(entry_to_edit)
+            st.session_state.reverse_and_correct_entry_id = entry_to_edit.id
+            st.session_state.journal_active_tab = "New Entry"
+            st.info(f"Correcting journal entry #{entry_to_edit.id}.")
+    del st.session_state.edit_entry_id
+
+
+def reset_entry_form():
     start_new_form_generation()
-
-
-def render_delete_control(entry_id: int):
-    """Require a second, explicit action before permanently deleting an entry."""
-    confirmation_key = "confirm_delete_entry_id"
-    if st.session_state.get(confirmation_key) != entry_id:
-        if st.button("Delete", key=f"delete_entry_{entry_id}"):
-            st.session_state[confirmation_key] = entry_id
-            st.rerun()
-        return
-
-    st.warning("Permanently delete this entry?")
-    confirm_col, cancel_col = st.columns(2)
-    with confirm_col:
-        if st.button("Confirm delete", key=f"confirm_delete_entry_{entry_id}"):
-            try:
-                JournalEntry.delete(entry_id, client_id=client_id)
-                st.session_state.pop(confirmation_key, None)
-                st.success("Entry deleted!")
-                st.rerun()
-            except ValueError as exc:
-                st.error(str(exc))
-    with cancel_col:
-        if st.button("Cancel", key=f"cancel_delete_entry_{entry_id}"):
-            st.session_state.pop(confirmation_key, None)
-            st.rerun()
+    st.session_state.je_lines = _empty_je_lines()
+    st.session_state.correction_source_entry_id = None
+    st.session_state.pop("reverse_and_correct_entry_id", None)
+    # Clear header fields
+    if 'je_entry_date' in st.session_state:
+        del st.session_state.je_entry_date
+    if 'je_entry_type' in st.session_state:
+        del st.session_state.je_entry_type
+    if 'je_source_reference' in st.session_state:
+        del st.session_state.je_source_reference
+    if 'je_description' in st.session_state:
+        del st.session_state.je_description
+    if 'je_aje_reference' in st.session_state:
+        del st.session_state.je_aje_reference
 
 
 def render_entry_controls(entry: JournalEntry, import_link: dict | None):
@@ -268,12 +230,18 @@ def render_entry_controls(entry: JournalEntry, import_link: dict | None):
             st.rerun()
         return
 
-    if st.button("Edit", key=f"edit_entry_{entry.id}"):
-        load_entry_for_edit(entry)
-        # Land the user on the form, or the click appears to do nothing.
+    if st.button("Reverse", key=f"reverse_entry_{entry.id}"):
+        st.session_state.reversal_entry_id = entry.id
+        st.session_state.journal_active_tab = "Reverse Entry"
+        st.rerun()
+    if st.button(
+        "Reverse and duplicate as correction",
+        key=f"reverse_correct_entry_{entry.id}",
+    ):
+        load_entry_as_correction(entry)
+        st.session_state.reverse_and_correct_entry_id = entry.id
         st.session_state.journal_active_tab = "New Entry"
         st.rerun()
-    render_delete_control(entry.id)
 
 
 def render_correction_chain(entry_id: int, drafts: list[DraftEntry]):
@@ -409,6 +377,11 @@ active_view = view_switcher(
     ["New Entry", "View Entries", "Reverse Entry", "Drafts"],
     key="journal_active_tab"
 )
+if (
+    active_view != "New Entry"
+    and st.session_state.get("reverse_and_correct_entry_id")
+):
+    reset_entry_form()
 
 # Point at pending assistant proposals from anywhere on the page.
 _pending_drafts = DraftEntry.pending_count(client_id)
@@ -424,7 +397,12 @@ if _pending_drafts and active_view != "Drafts":
             st.rerun()
 
 if active_view == "New Entry":
-    st.subheader("Create Journal Entry" if not st.session_state.editing_entry_id else "Edit Journal Entry")
+    st.subheader("Create Journal Entry")
+    if st.session_state.correction_source_entry_id:
+        st.caption(
+            f"Correction copy of JE #{st.session_state.correction_source_entry_id}. "
+            "Review and post this as a new entry."
+        )
 
     # Shown after the post-save rerun; a plain st.success before st.rerun()
     # renders for one frame and is wiped before anyone can read it.
@@ -438,10 +416,10 @@ if active_view == "New Entry":
     # text, so typing an account number appends to it and matches nothing.
     # An unset line is represented by selectbox index=None instead.
     account_options = {a.id: a.display_name() for a in accounts}
-    # Preserve an entry's historical account selections while editing even if
+    # Preserve a correction copy's historical account selections even if
     # an account has since been deactivated. Inactive accounts remain unavailable
     # for brand-new lines, but editing must not silently reset an existing line.
-    if st.session_state.editing_entry_id:
+    if st.session_state.correction_source_entry_id:
         for account_id in {line['account_id'] for line in st.session_state.je_lines}:
             if account_id and account_id not in account_options:
                 inactive = Account.get_by_id(account_id, client_id=client_id)
@@ -606,7 +584,6 @@ if active_view == "New Entry":
                 aje_reference = None
 
             entry = JournalEntry(
-                id=st.session_state.editing_entry_id,
                 client_id=client_id,
                 entry_date=entry_date,
                 description=description,
@@ -622,11 +599,27 @@ if active_view == "New Entry":
                     st.error(error)
             else:
                 try:
-                    entry.save()
+                    correction_source_id = st.session_state.get(
+                        "reverse_and_correct_entry_id"
+                    )
+                    if correction_source_id:
+                        conn = dbconn.get_connection()
+                        try:
+                            JournalEntry.reverse(
+                                correction_source_id, client_id, entry_date,
+                                conn=conn,
+                            )
+                            entry.save(conn=conn)
+                            conn.commit()
+                        except Exception:
+                            conn.rollback()
+                            raise
+                        finally:
+                            conn.close()
+                    else:
+                        entry.save()
                     st.session_state.je_saved_message = (
-                        f"Journal entry #{entry.id} updated!"
-                        if st.session_state.editing_entry_id
-                        else f"Journal entry #{entry.id} created!"
+                        f"Journal entry #{entry.id} created!"
                     )
                     reset_entry_form()
                     st.rerun()
@@ -656,8 +649,8 @@ elif active_view == "View Entries":
                     if import_link:
                         st.session_state.correct_import_entry_id = found_entry.id
                     else:
-                        load_entry_for_edit(found_entry)
-                        st.session_state.journal_active_tab = "New Entry"
+                        st.session_state.reversal_entry_id = found_entry.id
+                        st.session_state.journal_active_tab = "Reverse Entry"
                     st.rerun()
                 else:
                     st.error(f"Entry #{search_id} not found for this client.")
@@ -774,6 +767,16 @@ elif active_view == "View Entries":
             elif entry.entry_type != 'Regular':
                 header += f" ({entry.entry_type})"
             header += f" | {entry.entry_date} | {entry.description or 'No description'} | ${entry.total_debits():,.2f}"
+
+            if entry.reverses_journal_entry_id:
+                st.caption(
+                    f"JE #{entry.id} reverses JE #{entry.reverses_journal_entry_id}."
+                )
+            if entry.reversed_by_journal_entry_id:
+                st.caption(
+                    f"JE #{entry.id} was reversed by JE "
+                    f"#{entry.reversed_by_journal_entry_id}."
+                )
 
             # Use different styling for special entry types
             if entry.entry_type == 'Beginning Balance':
@@ -903,6 +906,15 @@ elif active_view == "Reverse Entry":
         ):
             try:
                 reversal = JournalEntry.reverse(original.id, client_id, reversal_date)
+                if st.session_state.get("reverse_and_correct_entry_id") == original.id:
+                    load_entry_as_correction(original)
+                    st.session_state.je_entry_date = reversal.entry_date
+                    st.session_state.reverse_and_correct_entry_id = None
+                    st.session_state.journal_active_tab = "New Entry"
+                    st.session_state.je_saved_message = (
+                        f"Reversal posted as JE #{reversal.id}. Post the corrected copy below."
+                    )
+                    st.rerun()
                 st.success(f"Reversal posted as JE #{reversal.id}.")
                 st.session_state.confirm_reversal = False
             except ValueError as exc:

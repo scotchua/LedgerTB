@@ -28,6 +28,8 @@ class JournalEntry:
     source_reference: Optional[str] = None
     entry_type: str = "Regular"  # Regular, Adjusting, Closing
     aje_reference: Optional[str] = None  # AJE-001, AJE-002, etc. for adjusting entries
+    reverses_journal_entry_id: Optional[int] = None
+    reversed_by_journal_entry_id: Optional[int] = None
     lines: List[JournalEntryLine] = field(default_factory=list)
 
     def is_balanced(self) -> bool:
@@ -86,6 +88,12 @@ class JournalEntry:
         """
         from models.audit_log import AuditLog
 
+        if self.id is not None:
+            raise ValueError(
+                "Posted entries cannot be edited. Reverse this entry, then post a "
+                "corrected one."
+            )
+
         errors = self.validate()
         if errors:
             raise ValueError("; ".join(errors))
@@ -104,8 +112,7 @@ class JournalEntry:
             conn = get_connection()
         cursor = conn.cursor()
 
-        is_new = self.id is None
-        old_values = None
+        is_new = True
 
         try:
             # SQLite foreign keys ensure referenced accounts exist, but cannot
@@ -121,99 +128,21 @@ class JournalEntry:
             if owned_account_ids != account_ids:
                 raise ValueError("Every journal entry account must belong to the selected client.")
 
-            if is_new:
-                # Insert new entry
-                from utils.actor import current_actor
-                cursor.execute(
-                    """
-                    INSERT INTO journal_entries (client_id, entry_date, description, source_reference, entry_type, aje_reference, created_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (self.client_id, self.entry_date.isoformat(), self.description,
-                     self.source_reference, self.entry_type, self.aje_reference,
-                     current_actor())
-                )
-                self.id = cursor.lastrowid
-            else:
-                # Get old values for audit log
-                cursor.execute(
-                    "SELECT * FROM journal_entries WHERE id = ? AND client_id = ?",
-                    (self.id, self.client_id),
-                )
-                old_row = cursor.fetchone()
-                if not old_row:
-                    raise ValueError("Journal entry not found for the selected client.")
-                cursor.execute(
-                    "SELECT 1 FROM imported_transactions "
-                    "WHERE journal_entry_id = ? AND client_id = ? LIMIT 1",
-                    (self.id, self.client_id),
-                )
-                if cursor.fetchone():
-                    raise ValueError(
-                        "Imported postings cannot be edited in place. "
-                        "Use Correct category so the source and ledger history stay intact."
-                    )
-                old_entry_date = date.fromisoformat(old_row['entry_date'])
-                old_closed = FiscalPeriod.get_closed_period_for_date(
-                    self.client_id, old_entry_date
-                )
-                if old_closed:
-                    raise ValueError(
-                        f"{old_closed.period_name} is closed. Reopen the year before "
-                        f"editing entries dated {old_entry_date.isoformat()}."
-                    )
-                old_values = {
-                    'entry_date': old_row['entry_date'],
-                    'description': old_row['description'],
-                    'source_reference': old_row['source_reference'],
-                    'entry_type': old_row['entry_type'],
-                    'aje_reference': old_row['aje_reference'] if 'aje_reference' in old_row.keys() else None
-                }
-                cursor.execute(
-                    """
-                    SELECT account_id, debit, credit, memo
-                    FROM journal_entry_lines WHERE journal_entry_id = ? ORDER BY id
-                    """,
-                    (self.id,),
-                )
-                old_values["lines"] = [
-                    {
-                        "account_id": row["account_id"],
-                        "debit": to_dollars(row["debit"]),
-                        "credit": to_dollars(row["credit"]),
-                        "memo": row["memo"],
-                    }
-                    for row in cursor.fetchall()
-                ]
-
-                cursor.execute(
-                    """
-                    SELECT 1
-                    FROM bank_reconciliation_items bri
-                    JOIN journal_entry_lines jel ON jel.id = bri.journal_entry_line_id
-                    WHERE jel.journal_entry_id = ?
-                    LIMIT 1
-                    """,
-                    (self.id,),
-                )
-                if cursor.fetchone():
-                    raise ValueError(
-                        "This entry is selected in a bank reconciliation. "
-                        "Unselect it (or reopen the completed reconciliation) before editing."
-                    )
-
-                # Update existing entry
-                cursor.execute(
-                    """
-                    UPDATE journal_entries
-                    SET entry_date = ?, description = ?, source_reference = ?, entry_type = ?, aje_reference = ?
-                    WHERE id = ? AND client_id = ?
-                    """,
-                    (self.entry_date.isoformat(), self.description, self.source_reference,
-                     self.entry_type, self.aje_reference, self.id, self.client_id)
-                )
-                # Delete existing lines
-                cursor.execute("DELETE FROM journal_entry_lines WHERE journal_entry_id = ?", (self.id,))
+            from utils.actor import current_actor
+            cursor.execute(
+                """
+                INSERT INTO journal_entries
+                    (client_id, entry_date, description, source_reference,
+                     entry_type, aje_reference, created_by,
+                     reverses_journal_entry_id, reversed_by_journal_entry_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (self.client_id, self.entry_date.isoformat(), self.description,
+                 self.source_reference, self.entry_type, self.aje_reference,
+                 current_actor(), self.reverses_journal_entry_id,
+                 self.reversed_by_journal_entry_id)
+            )
+            self.id = cursor.lastrowid
 
             # Insert lines
             for line in self.lines:
@@ -247,8 +176,7 @@ class JournalEntry:
             }
             AuditLog.write(
                 cursor, self.client_id, 'journal_entries', self.id,
-                'INSERT' if is_new else 'UPDATE',
-                old_values=old_values, new_values=new_values,
+                'INSERT', new_values=new_values,
             )
 
             if owns_conn:
@@ -316,7 +244,16 @@ class JournalEntry:
             description=row['description'],
             source_reference=row['source_reference'],
             entry_type=row['entry_type'],
-            aje_reference=row['aje_reference'] if 'aje_reference' in row.keys() else None
+            aje_reference=(row['aje_reference']
+                           if 'aje_reference' in row.keys() else None),
+            reverses_journal_entry_id=(
+                row['reverses_journal_entry_id']
+                if 'reverses_journal_entry_id' in row.keys() else None
+            ),
+            reversed_by_journal_entry_id=(
+                row['reversed_by_journal_entry_id']
+                if 'reversed_by_journal_entry_id' in row.keys() else None
+            ),
         )
 
     @staticmethod
@@ -525,116 +462,27 @@ class JournalEntry:
 
     @staticmethod
     def delete(entry_id: int, client_id: Optional[int] = None):
-        """Delete a journal entry and its lines.
+        """Refuse deletion of posted ledger history."""
+        raise ValueError(
+            "Posted entries cannot be deleted. Reverse this entry instead."
+        )
 
-        If ``client_id`` is given, only an entry belonging to that client is
-        deleted; a cross-client id is a no-op (the row is treated as not found).
+    @staticmethod
+    def reverse(
+        entry_id: int, client_id: int, reversal_date: Optional[date] = None,
+        memo: Optional[str] = None,
+        conn=None,
+    ) -> 'JournalEntry':
+        """Post an equal-and-opposite entry without altering accounting history.
+
+        If ``conn`` is provided, participate in the caller's transaction without
+        committing, rolling back, or closing the connection.
         """
         from models.audit_log import AuditLog
 
-        conn = get_connection()
-        try:
-            cursor = conn.cursor()
-
-            # Get the entry info for audit logging (scoped to the client when given)
-            if client_id is None:
-                cursor.execute("SELECT * FROM journal_entries WHERE id = ?", (entry_id,))
-            else:
-                cursor.execute(
-                    "SELECT * FROM journal_entries WHERE id = ? AND client_id = ?",
-                    (entry_id, client_id)
-                )
-            row = cursor.fetchone()
-
-            if row:
-                old_values = {
-                    'entry_date': row['entry_date'],
-                    'description': row['description'],
-                    'source_reference': row['source_reference'],
-                    'entry_type': row['entry_type'],
-                    'aje_reference': row['aje_reference'] if 'aje_reference' in row.keys() else None
-                }
-                client_id = row['client_id']
-                cursor.execute(
-                    """
-                    SELECT account_id, debit, credit, memo
-                    FROM journal_entry_lines WHERE journal_entry_id = ? ORDER BY id
-                    """,
-                    (entry_id,),
-                )
-                old_values["lines"] = [
-                    {
-                        "account_id": line["account_id"],
-                        "debit": to_dollars(line["debit"]),
-                        "credit": to_dollars(line["credit"]),
-                        "memo": line["memo"],
-                    }
-                    for line in cursor.fetchall()
-                ]
-
-                # Block deleting entries dated within a closed fiscal year
-                from models.fiscal_period import FiscalPeriod
-                entry_date = date.fromisoformat(row['entry_date'])
-                closed = FiscalPeriod.get_closed_period_for_date(client_id, entry_date)
-                if closed:
-                    raise ValueError(
-                        f"{closed.period_name} is closed. Reopen the year before deleting "
-                        f"entries dated {entry_date.isoformat()}."
-                    )
-
-                cursor.execute(
-                    """
-                    SELECT 1
-                    FROM bank_reconciliation_items bri
-                    JOIN journal_entry_lines jel ON jel.id = bri.journal_entry_line_id
-                    WHERE jel.journal_entry_id = ?
-                    LIMIT 1
-                    """,
-                    (entry_id,),
-                )
-                if cursor.fetchone():
-                    raise ValueError(
-                        "This entry is selected in a bank reconciliation. "
-                        "Unselect it (or reopen the completed reconciliation) before deleting."
-                    )
-
-                cursor.execute(
-                    "SELECT 1 FROM imported_transactions WHERE journal_entry_id = ? LIMIT 1",
-                    (entry_id,),
-                )
-                if cursor.fetchone():
-                    raise ValueError(
-                        "This entry was created from an imported transaction. "
-                        "Reverse it instead so the source history remains intact."
-                    )
-
-                cursor.execute(
-                    "SELECT id FROM draft_entries "
-                    "WHERE original_entry_id = ? ORDER BY id LIMIT 1",
-                    (entry_id,),
-                )
-                linked_draft = cursor.fetchone()
-                if linked_draft:
-                    raise ValueError(
-                        f"This entry is linked to correction draft #{linked_draft['id']}. "
-                        "Reverse it instead so the correction chain remains intact."
-                    )
-
-                cursor.execute("DELETE FROM journal_entries WHERE id = ?", (entry_id,))
-                AuditLog.write(
-                    cursor, client_id, 'journal_entries', entry_id, 'DELETE',
-                    old_values=old_values,
-                )
-                conn.commit()
-        finally:
-            conn.close()
-
-    @staticmethod
-    def reverse(entry_id: int, client_id: int, reversal_date: date) -> 'JournalEntry':
-        """Post an equal-and-opposite entry without altering accounting history."""
-        from models.audit_log import AuditLog
-
-        conn = get_connection()
+        owns_conn = conn is None
+        if owns_conn:
+            conn = get_connection()
         try:
             cursor = conn.cursor()
             cursor.execute(
@@ -644,14 +492,81 @@ class JournalEntry:
             row = cursor.fetchone()
             if not row:
                 raise ValueError("Journal entry not found for the selected client.")
-            reference = f"Reversal of JE #{entry_id}"
+            if row["reversed_by_journal_entry_id"] is not None:
+                raise ValueError(
+                    f"This entry was already reversed by JE "
+                    f"#{row['reversed_by_journal_entry_id']}."
+                )
+
             cursor.execute(
-                "SELECT id FROM journal_entries WHERE client_id = ? AND source_reference = ? LIMIT 1",
-                (client_id, reference),
+                """SELECT 1
+                   FROM bank_reconciliation_items bri
+                   JOIN journal_entry_lines jel
+                     ON jel.id = bri.journal_entry_line_id
+                   WHERE jel.journal_entry_id = ? LIMIT 1""",
+                (entry_id,),
             )
-            existing = cursor.fetchone()
-            if existing:
-                raise ValueError(f"This entry was already reversed by JE #{existing['id']}.")
+            if cursor.fetchone():
+                raise ValueError(
+                    "This entry is selected in a bank reconciliation. Unselect it, "
+                    "or reopen the completed reconciliation, before reversing it."
+                )
+
+            cursor.execute(
+                """SELECT id FROM imported_transactions
+                   WHERE client_id = ? AND journal_entry_id = ? LIMIT 1""",
+                (client_id, entry_id),
+            )
+            if cursor.fetchone():
+                raise ValueError(
+                    "Imported postings cannot be reversed here. Correct the category, "
+                    "or reverse the import batch from Import History."
+                )
+
+            controlled_tables = (
+                ("invoices", "invoice"), ("bills", "bill"),
+                ("payments", "customer payment"),
+                ("bill_payments_v2", "vendor payment"),
+                ("payment_refunds", "customer payment refund"),
+                ("bill_payment_refunds", "vendor payment refund"),
+                ("credit_memos", "credit memo"), ("pay_runs", "pay run"),
+                ("depreciation_runs", "depreciation run"),
+                ("inventory_movements", "inventory movement"),
+            )
+            for table_name, flow_name in controlled_tables:
+                cursor.execute(
+                    f"SELECT id FROM {table_name} WHERE journal_entry_id = ? LIMIT 1",
+                    (entry_id,),
+                )
+                owner = cursor.fetchone()
+                if owner:
+                    raise ValueError(
+                        f"This entry is controlled by {flow_name} #{owner['id']}. "
+                        f"Reverse it from the {flow_name} flow."
+                    )
+
+            from models.fiscal_period import FiscalPeriod
+            original_date = date.fromisoformat(row["entry_date"])
+            closed = FiscalPeriod.get_closed_period_for_date(client_id, original_date)
+            if closed:
+                if reversal_date is None:
+                    raise ValueError(
+                        f"{closed.period_name} is closed. Choose a reversal date in an "
+                        "open period."
+                    )
+                effective_date = reversal_date
+            else:
+                effective_date = original_date
+            reversal_closed = FiscalPeriod.get_closed_period_for_date(
+                client_id, effective_date
+            )
+            if reversal_closed:
+                raise ValueError(
+                    f"{reversal_closed.period_name} is closed. Choose a reversal date "
+                    "in an open period."
+                )
+
+            reference = f"Reversal of JE #{entry_id}"
             cursor.execute(
                 """
                 SELECT account_id, debit, credit, memo
@@ -662,37 +577,49 @@ class JournalEntry:
             source_lines = cursor.fetchall()
             reversal = JournalEntry(
                 client_id=client_id,
-                entry_date=reversal_date,
+                entry_date=effective_date,
                 description=f"Reversal: {row['description'] or f'Journal Entry #{entry_id}'}"[:200],
                 source_reference=reference,
                 entry_type="Regular",
+                reverses_journal_entry_id=entry_id,
                 lines=[
                     JournalEntryLine(
                         account_id=line["account_id"],
                         debit=to_dollars(line["credit"]),
                         credit=to_dollars(line["debit"]),
-                        memo=f"Reversal of JE #{entry_id}",
+                        memo=memo or line["memo"] or f"Reversal of JE #{entry_id}",
                     )
                     for line in source_lines
                 ],
             )
             reversal.save(conn=conn)
+            cursor.execute(
+                """UPDATE journal_entries SET reversed_by_journal_entry_id = ?
+                   WHERE id = ? AND client_id = ?
+                     AND reversed_by_journal_entry_id IS NULL""",
+                (reversal.id, entry_id, client_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("This entry has already been reversed.")
             AuditLog.write(
                 cursor, client_id, "journal_entries", entry_id, "REVERSE",
                 old_values={"reversed": False},
                 new_values={
                     "reversed": True,
                     "reversal_entry_id": reversal.id,
-                    "reversal_date": reversal_date.isoformat(),
+                    "reversal_date": effective_date.isoformat(),
                 },
             )
-            conn.commit()
+            if owns_conn:
+                conn.commit()
             return reversal
         except Exception:
-            conn.rollback()
+            if owns_conn:
+                conn.rollback()
             raise
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
 
     @staticmethod
     def get_next_aje_reference(client_id: int, period_start: date, period_end: date) -> str:
