@@ -188,6 +188,26 @@ def close_package_snapshot_hash(payload: Dict) -> str:
     return sha256(canonicalize_close_package_snapshot(payload)).hexdigest()
 
 
+def close_package_audit(
+    client_id: int,
+    client_name: str,
+    period_start: date,
+    period_end: date,
+    tb_rows: List[TrialBalanceWorksheetRow],
+    snapshot: ClosePackageSnapshot,
+) -> ClosePackageAudit:
+    """Describe the source snapshot before reserving its audit identity."""
+    content_hash = close_package_snapshot_hash(close_package_snapshot_payload(
+        client_id, client_name, period_start, period_end, tb_rows, snapshot
+    ))
+    return ClosePackageAudit(
+        client_id=client_id,
+        doc_key=f"{client_id}:{period_start.isoformat()}:{period_end.isoformat()}",
+        content_hash=content_hash,
+        canonicalization_version=SNAPSHOT_CANONICALIZATION_VERSION,
+    )
+
+
 def write_close_package_audit(audit: ClosePackageAudit, conn=None) -> int:
     """Write one close-package snapshot audit and its linked export event."""
     own_connection = conn is None
@@ -227,6 +247,22 @@ def write_close_package_audit(audit: ClosePackageAudit, conn=None) -> int:
     finally:
         if own_connection:
             conn.close()
+
+
+def complete_close_package_audit(document_audit_id: int, audit: ClosePackageAudit,
+                                 pdf_name: str, xlsx_name: str) -> int:
+    """Append the marker that says both final-named export files were issued."""
+    return AuditLog.log_event(
+        audit.client_id, "EXPORT", "close_package_issued",
+        {
+            "status": "completed",
+            "doc_key": audit.doc_key,
+            "content_hash": audit.content_hash,
+            "pdf": pdf_name,
+            "xlsx": xlsx_name,
+        },
+        record_id=document_audit_id,
+    )
 
 
 def recompute_document_audit(document_audit_id: int) -> Dict:
@@ -1238,6 +1274,7 @@ def build_close_package_pdf(
     tb_rows: List[TrialBalanceWorksheetRow],
     snapshot: Optional[ClosePackageSnapshot] = None,
     defer_audit: bool = False,
+    document_audit_id: Optional[int] = None,
 ):
     """One presentable PDF: Summary, statements, TB, transactions, AJEs."""
     snapshot = snapshot or load_close_package_snapshot(
@@ -1255,16 +1292,10 @@ def build_close_package_pdf(
     comparative_tb = snapshot.comparative_trial_balance
     close_map = snapshot.close_map
     period_label = f"{long_date(period_start)} to {long_date(period_end)}"
-    snapshot_payload = close_package_snapshot_payload(
+    audit = close_package_audit(
         client_id, client_name, period_start, period_end, tb_rows, snapshot
     )
-    content_hash = close_package_snapshot_hash(snapshot_payload)
-    audit = ClosePackageAudit(
-        client_id=client_id,
-        doc_key=f"{client_id}:{period_start.isoformat()}:{period_end.isoformat()}",
-        content_hash=content_hash,
-        canonicalization_version=SNAPSHOT_CANONICALIZATION_VERSION,
-    )
+    content_hash = audit.content_hash
 
     client_branding = snapshot.client_branding
     firm_branding = snapshot.branding
@@ -1289,7 +1320,8 @@ def build_close_package_pdf(
     if firm_branding.firm_name:
         footer_left = f"{footer_left} · Prepared by {firm_branding.firm_name}"
 
-    document_audit_id = None
+    if defer_audit and document_audit_id is None:
+        raise ValueError("deferred PDF rendering requires a document audit id")
 
     def _footer(canvas, _doc):
         canvas.saveState()

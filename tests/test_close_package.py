@@ -665,6 +665,7 @@ def test_pdf_package_contains_every_section(booked_period, accounts):
         assert len(doc) >= 6
         assert "Snapshot ID:" in text
         assert "Document Audits, ID" in text
+        assert "Document Audits, ID None" not in text
     finally:
         doc.close()
 

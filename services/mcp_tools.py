@@ -11,6 +11,7 @@ ledger arithmetic (the ledger itself stores integer cents).
 """
 import functools as _functools
 import os
+import tempfile
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -78,6 +79,29 @@ def _write_private(path: Path, payload: bytes) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass  # Windows has no POSIX mode; the user profile is the boundary
+
+
+def _write_private_temp(target: Path, payload: bytes) -> Path:
+    """Write a private sibling file suitable for atomic replacement."""
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+        try:
+            os.chmod(temp_path, 0o600)
+        except OSError:
+            pass
+        return temp_path
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _parse_date(value: Optional[str], name: str) -> Optional[date]:
@@ -945,12 +969,13 @@ def export_close_package(client_id: int, period_start: str, period_end: str,
     import re
     from pathlib import Path
 
-    from models.audit_log import AuditLog
     from models.client import Client
     from models.reports import ReportGenerator
     from services.close_package import (
         build_close_package,
         build_close_package_pdf,
+        close_package_audit,
+        complete_close_package_audit,
         consistent_export_window,
         load_close_package_snapshot,
         write_close_package_audit,
@@ -1000,26 +1025,54 @@ def export_close_package(client_id: int, period_start: str, period_end: str,
     stem = f"{safe_client} close package {start.isoformat()} to {end.isoformat()}"
     pdf_path = target / f"{stem}.pdf"
     xlsx_path = target / f"{stem}.xlsx"
+    for path in (pdf_path, xlsx_path):
+        if path.is_symlink():
+            raise ValueError(
+                f"{path.name} already exists as a symbolic link; refusing to "
+                "replace it. Remove it and try again."
+            )
     with consistent_export_window():
         tb_rows, _ = ReportGenerator.trial_balance_worksheet(client_id, start, end)
         snapshot = load_close_package_snapshot(client_id, start, end)
+        document_audit = close_package_audit(
+            client_id, client.name, start, end, tb_rows, snapshot
+        )
+
+    document_audit_id = write_close_package_audit(document_audit)
+    pdf_temp = None
+    xlsx_temp = None
+    published = []
+    try:
         pdf, document_audit = build_close_package_pdf(
             client_id, client.name, start, end, tb_rows, snapshot=snapshot,
-            defer_audit=True,
+            defer_audit=True, document_audit_id=document_audit_id,
         )
-        _write_private(pdf_path, pdf.read())
-        _write_private(
+        pdf_temp = _write_private_temp(pdf_path, pdf.read())
+        xlsx_temp = _write_private_temp(
             xlsx_path,
             build_close_package(
                 client_id, client.name, start, end, tb_rows, snapshot=snapshot
             ).read(),
         )
+        pdf_temp.replace(pdf_path)
+        published.append(pdf_path)
+        pdf_temp = None
+        xlsx_temp.replace(xlsx_path)
+        published.append(xlsx_path)
+        xlsx_temp = None
+    except Exception:
+        for path in published:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        if pdf_temp is not None:
+            pdf_temp.unlink(missing_ok=True)
+        if xlsx_temp is not None:
+            xlsx_temp.unlink(missing_ok=True)
 
-    write_close_package_audit(document_audit)
-    AuditLog.log_event(client_id, "EXPORT", "close_package_mcp", {
-        "start_date": start, "end_date": end,
-        "pdf": pdf_path.name, "xlsx": xlsx_path.name, "directory": str(target),
-    })
+    complete_close_package_audit(
+        document_audit_id, document_audit, pdf_path.name, xlsx_path.name
+    )
     return {
         "pdf": str(pdf_path),
         "xlsx": str(xlsx_path),
