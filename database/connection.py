@@ -21,6 +21,10 @@ from config import DATABASE_PATH
 from .crypto import key_pragma
 from .schema import create_tables
 
+# MCP tools are serialized end-to-end (mcp_server.py); these globals must not
+# be mutated concurrently. The full fix is a BookContext refactor, tabled with
+# entry condition: any need for parallel MCP tool execution.
+
 
 class DatabaseLocked(RuntimeError):
     """Raised when a connection is requested before the passphrase is set.
