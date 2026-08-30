@@ -14,6 +14,7 @@ class Employee:
     name: str = ""
     start_date: Optional[date] = None
     status: str = "active"
+    department_id: Optional[int] = None
     created_at: Optional[datetime] = None
 
     @staticmethod
@@ -21,6 +22,7 @@ class Employee:
         return Employee(
             id=row["id"], client_id=row["client_id"], name=row["name"],
             start_date=date.fromisoformat(row["start_date"]), status=row["status"],
+            department_id=row["department_id"],
             created_at=datetime.fromisoformat(row["created_at"]),
         )
 
@@ -46,11 +48,20 @@ class Employee:
         conn = get_connection()
         try:
             cursor = conn.cursor()
+            if self.department_id is not None:
+                cursor.execute(
+                    "SELECT 1 FROM departments WHERE id = ? AND client_id = ?",
+                    (self.department_id, self.client_id),
+                )
+                if not cursor.fetchone():
+                    raise ValueError("Department not found for the selected client.")
             if self.id is None:
                 cursor.execute(
-                    "INSERT INTO employees (client_id, name, start_date, status) "
-                    "VALUES (?, ?, ?, ?)",
-                    (self.client_id, self.name.strip(), self.start_date.isoformat(), self.status),
+                    "INSERT INTO employees "
+                    "(client_id, name, start_date, status, department_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (self.client_id, self.name.strip(), self.start_date.isoformat(),
+                     self.status, self.department_id),
                 )
                 self.id = cursor.lastrowid
                 action = "INSERT"
@@ -65,13 +76,14 @@ class Employee:
                     raise ValueError("Employee not found for the selected client.")
                 old_values = {
                     "name": old["name"], "start_date": old["start_date"],
-                    "status": old["status"],
+                    "status": old["status"], "department_id": old["department_id"],
                 }
                 cursor.execute(
-                    "UPDATE employees SET name = ?, start_date = ?, status = ? "
+                    "UPDATE employees SET name = ?, start_date = ?, status = ?, "
+                    "department_id = ? "
                     "WHERE id = ? AND client_id = ?",
                     (self.name.strip(), self.start_date.isoformat(), self.status,
-                     self.id, self.client_id),
+                     self.department_id, self.id, self.client_id),
                 )
                 action = "UPDATE"
             AuditLog.write(
@@ -79,7 +91,8 @@ class Employee:
                 old_values=old_values,
                 new_values={"name": self.name.strip(),
                             "start_date": self.start_date.isoformat(),
-                            "status": self.status},
+                            "status": self.status,
+                            "department_id": self.department_id},
             )
             conn.commit()
         except Exception:
@@ -154,4 +167,3 @@ class PayStub:
             employee_id=row["employee_id"], gross_pay_cents=row["gross_pay_cents"],
             deductions=json.loads(row["deductions"]), net_pay_cents=row["net_pay_cents"],
         ) for row in rows]
-
