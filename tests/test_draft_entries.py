@@ -75,6 +75,11 @@ def test_approve_posts_a_real_audited_entry(client_id, accounts):
     assert draft_logs[0].old_values["status"] == "pending"
     assert draft_logs[0].new_values["status"] == "approved"
     assert draft_logs[0].new_values["posted_entry_id"] == entry_id
+    with dbconn.get_cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) count FROM depreciation_runs"
+        )
+        assert cursor.fetchone()["count"] == 0
 
 
 def test_correction_proposal_retains_original_to_posted_chain(client_id, accounts):
