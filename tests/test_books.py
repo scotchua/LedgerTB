@@ -67,17 +67,6 @@ def test_local_book_detection_is_conservative(settings, tmp_path, monkeypatch):
     assert not books.is_local_book(tmp_path / "shared" / "Smith.db")
 
 
-@pytest.fixture(autouse=True)
-def release_test_leases():
-    yield
-    for token, fd in list(book_lock._leases.values()):
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    book_lock._leases.clear()
-
-
 def test_lock_acquire_conflict_takeover_release(settings, tmp_path):
     book = tmp_path / "shared.db"
 
@@ -112,8 +101,8 @@ def test_release_with_mismatched_token_preserves_replacement(settings, tmp_path)
     assert first["token"] != "replacement-token"
 
 
-def test_takeover_requires_stale_heartbeat_and_fences_old_owner(settings,
-                                                                tmp_path):
+def test_takeover_requires_stale_heartbeat_and_fences_old_owner(
+        settings, tmp_path, monkeypatch):
     book = tmp_path / "shared.db"
     first = book_lock.acquire(book)
     fresh = book_lock.read_lock(book)
@@ -133,9 +122,12 @@ def test_takeover_requires_stale_heartbeat_and_fences_old_owner(settings,
     assert replacement["acquired"] is True
     assert replacement["token"] != first["token"]
 
-    replacement_handle = book_lock._leases.pop(str(book_lock.lock_path(book)))
+    replacement_handle = book_lock._leases[str(book_lock.lock_path(book))]
     old_fd = os.open(book_lock.lock_path(book), os.O_WRONLY)
-    book_lock._leases[str(book_lock.lock_path(book))] = (first["token"], old_fd)
+    monkeypatch.setattr(
+        book_lock, "_leases",
+        {str(book_lock.lock_path(book)): (first["token"], old_fd)},
+    )
     with pytest.raises(RuntimeError, match="Another computer took over this book"):
         book_lock.verify_and_refresh(book)
     os.close(replacement_handle[1])
@@ -150,21 +142,19 @@ def test_missing_sidecar_fences_owner(settings, tmp_path):
         book_lock.verify_and_refresh(book)
 
 
-def test_switching_books_isolates_data(client_id, accounts, tmp_path):
+def test_switching_books_isolates_data(client_id, accounts, tmp_path,
+                                       monkeypatch):
     from database import init_database
     from models.client import Client
 
-    original = dbconn.DATABASE_PATH
     assert any(c.id == client_id for c in Client.get_all())
 
-    try:
-        dbconn.DATABASE_PATH = tmp_path / "book-b.db"
+    with monkeypatch.context() as book_b:
+        book_b.setattr(dbconn, "DATABASE_PATH", tmp_path / "book-b.db")
         init_database()
         assert Client.get_all() == []  # a fresh book knows nothing of book A
         Client(name="Book B Client").save(seed_accounts=False)
         assert len(Client.get_all()) == 1
-    finally:
-        dbconn.DATABASE_PATH = original
 
     names = [c.name for c in Client.get_all()]
     assert "Book B Client" not in names

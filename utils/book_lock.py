@@ -75,6 +75,16 @@ def _forget(book) -> None:
             pass
 
 
+def _reset() -> None:
+    """Close and forget all process-held leases."""
+    for _token, fd in list(_leases.values()):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _leases.clear()
+
+
 def _owned_token(book):
     lease = _leases.get(str(lock_path(book)))
     return lease[0] if lease else None
