@@ -876,10 +876,12 @@ def sync_bank_feed(client_id: int, bank_account_id: int) -> dict:
     account = Account.get_by_id(bank_account_id, client_id)
     if account is None or account.type not in ("Asset", "Liability"):
         raise ValueError("Choose a bank or credit-card account for this client.")
-    staged = _sync_bank_feed(client_id, bank_account_id)
+    result = _sync_bank_feed(client_id, bank_account_id)
     return {
-        "staged": len(staged),
-        "rows": staged,
+        "staged": len(result["rows"]),
+        "rows": result["rows"],
+        "unmapped_count": result["unmapped_count"],
+        "unmapped_accounts": result["unmapped_accounts"],
         "note": ("Staged for human review in Import Transactions. Nothing "
                  "was posted to the ledger."),
     }

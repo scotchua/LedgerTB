@@ -13,7 +13,8 @@ from tests.conftest import page_path
 
 
 PUBLIC_IP = "93.184.216.34"
-ACCESS_URL = "https://public.example/simplefin-access"
+ACCESS_URL = "https://feed-user:feed-pass@public.example/simplefin-access"
+CLEAN_ACCESS_URL = "https://public.example/simplefin-access"
 
 
 class Response:
@@ -50,7 +51,14 @@ def _link(client_id, bank_account_id, fake_credential_vault):
                VALUES (?, ?, 'simplefin', ?)""",
             (client_id, bank_account_id, secret_name),
         )
-        return cursor.lastrowid
+        connection_id = cursor.lastrowid
+        cursor.execute(
+            """INSERT INTO bank_connection_accounts
+               (connection_id, remote_account_id, remote_account_name, account_id)
+               VALUES (?, 'remote-checking', 'Checking', ?)""",
+            (connection_id, bank_account_id),
+        )
+        return connection_id
 
 
 def _payload(transaction_id="txn-1", posted=None):
@@ -73,15 +81,35 @@ def test_claim_simplefin_token_success(monkeypatch):
     calls = []
 
     def request(method, url, **kwargs):
-        calls.append((method, kwargs))
+        calls.append((method, url, kwargs))
         return Response(text=ACCESS_URL)
 
     monkeypatch.setattr(bank_feed.httpx, "request", request)
     assert bank_feed.claim_simplefin_token(_token()) == ACCESS_URL
-    assert calls == [("POST", {
+    assert calls == [("POST", "https://public.example/claim", {
         "follow_redirects": False,
         "timeout": bank_feed.REQUEST_TIMEOUT,
     })]
+
+
+def test_create_connection_stores_claimed_credential(
+    client_id, accounts, fake_credential_vault, monkeypatch,
+):
+    _public_dns(monkeypatch)
+    monkeypatch.setattr(
+        bank_feed.httpx, "request",
+        lambda *args, **kwargs: Response(text=ACCESS_URL),
+    )
+    connection_id = bank_feed.create_bank_connection(
+        client_id, accounts["cash"], _token(),
+    )
+    with get_cursor() as cursor:
+        cursor.execute(
+            "SELECT secret_name FROM bank_connections WHERE id = ?",
+            (connection_id,),
+        )
+        secret_name = cursor.fetchone()[0]
+    assert fake_credential_vault[secret_name] == ACCESS_URL
 
 
 def test_claim_simplefin_token_reclaim_is_user_safe(monkeypatch):
@@ -130,7 +158,7 @@ def test_second_sync_overlap_deduplicates_remote_transaction(
 
     _public_dns(monkeypatch)
     monkeypatch.setattr(bank_feed.httpx, "request", request)
-    assert len(bank_feed.sync_bank_feed(client_id, accounts["cash"])) == 1
+    assert len(bank_feed.sync_bank_feed(client_id, accounts["cash"])["rows"]) == 1
 
     prior_watermark = (datetime.now().astimezone() - timedelta(days=1)).isoformat(
         timespec="seconds"
@@ -138,12 +166,12 @@ def test_second_sync_overlap_deduplicates_remote_transaction(
     with get_cursor(commit=True) as cursor:
         cursor.execute(
             """INSERT INTO bank_connection_syncs
-               (connection_id, synced_at, sync_window_start)
-               VALUES (?, ?, ?)""",
+               (connection_id, remote_account_id, synced_at, sync_window_start)
+               VALUES (?, 'remote-checking', ?, ?)""",
             (connection_id, prior_watermark, starts[0]),
         )
 
-    assert bank_feed.sync_bank_feed(client_id, accounts["cash"]) == []
+    assert bank_feed.sync_bank_feed(client_id, accounts["cash"])["rows"] == []
     assert starts[1] == (
         datetime.fromisoformat(prior_watermark).date() - timedelta(days=7)
     ).isoformat()
@@ -295,7 +323,12 @@ def test_connection_and_sync_audits_contain_no_credentials(
     monkeypatch.setattr(
         bank_feed.httpx, "request", lambda *args, **kwargs: next(responses),
     )
-    bank_feed.create_bank_connection(client_id, accounts["cash"], _token())
+    connection_id = bank_feed.create_bank_connection(
+        client_id, accounts["cash"], _token(),
+    )
+    bank_feed.map_remote_account(
+        client_id, connection_id, "remote-checking", "Checking", accounts["cash"],
+    )
     bank_feed.sync_bank_feed(client_id, accounts["cash"])
     with get_cursor() as cursor:
         cursor.execute(
@@ -308,3 +341,137 @@ def test_connection_and_sync_audits_contain_no_credentials(
         )
     assert "https://" not in rendered
     assert ACCESS_URL not in rendered
+
+
+def test_sync_uses_basic_auth_and_clean_url(
+    client_id, accounts, fake_credential_vault, monkeypatch,
+):
+    _link(client_id, accounts["cash"], fake_credential_vault)
+    _public_dns(monkeypatch)
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((url, kwargs))
+        return Response(payload=_payload())
+
+    monkeypatch.setattr(bank_feed.httpx, "request", request)
+    bank_feed.sync_bank_feed(client_id, accounts["cash"])
+    url, kwargs = calls[0]
+    assert url == f"{CLEAN_ACCESS_URL}/accounts"
+    assert "feed-user" not in url and "feed-pass" not in url
+    assert isinstance(kwargs["auth"], httpx.BasicAuth)
+
+
+def test_unmapped_remote_account_is_reported_and_not_staged(
+    client_id, accounts, fake_credential_vault, monkeypatch,
+):
+    _link(client_id, accounts["cash"], fake_credential_vault)
+    payload = _payload()
+    payload["accounts"].append({
+        "id": "remote-savings", "name": "Rainy Day Savings",
+        "transactions": [{"id": "savings-1", "posted": int(datetime.now().timestamp()),
+                          "amount": "99.00", "description": "Transfer"}],
+    })
+    _public_dns(monkeypatch)
+    monkeypatch.setattr(
+        bank_feed.httpx, "request", lambda *args, **kwargs: Response(payload=payload),
+    )
+    result = bank_feed.sync_bank_feed(client_id, accounts["cash"])
+    assert len(result["rows"]) == 1
+    assert result["unmapped_count"] == 1
+    assert result["unmapped_accounts"] == ["Rainy Day Savings"]
+    with get_cursor() as cursor:
+        cursor.execute("SELECT source_id FROM imported_transactions")
+        assert all("remote-savings" not in row[0] for row in cursor.fetchall())
+
+
+def test_failed_sync_never_persists_or_reports_credential(
+    client_id, accounts, fake_credential_vault, monkeypatch,
+):
+    _link(client_id, accounts["cash"], fake_credential_vault)
+    _public_dns(monkeypatch)
+    monkeypatch.setattr(
+        bank_feed.httpx, "request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError(ACCESS_URL)),
+    )
+    with pytest.raises(bank_feed.BankFeedError) as exc:
+        bank_feed.sync_bank_feed(client_id, accounts["cash"])
+    assert "feed-user" not in str(exc.value)
+    assert "feed-pass" not in str(exc.value)
+    with get_cursor() as cursor:
+        cursor.execute("SELECT old_values, new_values FROM audit_log")
+        assert ACCESS_URL not in repr(cursor.fetchall())
+        cursor.execute("SELECT * FROM imported_transactions")
+        assert ACCESS_URL not in repr(cursor.fetchall())
+
+
+def test_remote_accounts_use_independent_append_only_watermarks(
+    client_id, accounts, fake_credential_vault, monkeypatch,
+):
+    connection_id = _link(client_id, accounts["cash"], fake_credential_vault)
+    with get_cursor(commit=True) as cursor:
+        cursor.execute(
+            """INSERT INTO bank_connection_accounts
+               (connection_id, remote_account_id, remote_account_name, account_id)
+               VALUES (?, 'remote-savings', 'Savings', ?)""",
+            (connection_id, accounts["cash"]),
+        )
+        recent = (datetime.now().astimezone() - timedelta(days=1)).isoformat(
+            timespec="seconds",
+        )
+        cursor.execute(
+            """INSERT INTO bank_connection_syncs
+               (connection_id, remote_account_id, synced_at, sync_window_start)
+               VALUES (?, 'remote-checking', ?, '2026-01-01')""",
+            (connection_id, recent),
+        )
+    starts = []
+    _public_dns(monkeypatch)
+
+    def request(method, url, **kwargs):
+        starts.append(kwargs["params"]["start-date"])
+        return Response(payload={"accounts": []})
+
+    monkeypatch.setattr(bank_feed.httpx, "request", request)
+    bank_feed.sync_bank_feed(client_id, accounts["cash"])
+    assert starts == [
+        (datetime.now().astimezone().date()
+         - timedelta(days=bank_feed.FIRST_SYNC_DAYS)).isoformat()
+    ]
+    with get_cursor() as cursor:
+        cursor.execute(
+            """SELECT remote_account_id, COUNT(*)
+               FROM bank_connection_syncs WHERE connection_id = ?
+               GROUP BY remote_account_id""", (connection_id,),
+        )
+        counts = dict(cursor.fetchall())
+    assert counts == {"remote-checking": 2, "remote-savings": 1}
+
+
+def test_simplefin_response_size_is_limited(
+    client_id, accounts, fake_credential_vault, monkeypatch,
+):
+    _link(client_id, accounts["cash"], fake_credential_vault)
+    _public_dns(monkeypatch)
+    response = Response()
+    response.content = b"x" * (bank_feed.MAX_RESPONSE_BYTES + 1)
+    monkeypatch.setattr(
+        bank_feed.httpx, "request", lambda *args, **kwargs: response,
+    )
+    with pytest.raises(bank_feed.BankFeedError, match="too much data"):
+        bank_feed.sync_bank_feed(client_id, accounts["cash"])
+
+
+def test_disconnect_deletes_secret_and_marks_connection_revoked(
+    client_id, accounts, fake_credential_vault,
+):
+    connection_id = _link(client_id, accounts["cash"], fake_credential_vault)
+    bank_feed.disconnect_bank_connection(client_id, connection_id)
+    assert not fake_credential_vault
+    with get_cursor() as cursor:
+        cursor.execute(
+            "SELECT revoked_at FROM bank_connections WHERE id = ?",
+            (connection_id,),
+        )
+        assert cursor.fetchone()[0] is not None
+    assert bank_feed.list_bank_connections(client_id) == []

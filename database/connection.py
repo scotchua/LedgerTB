@@ -79,12 +79,12 @@ _ASSISTANT_INSERT_TABLES = {
                           "document_audits",
                           "clients", "accounts", "close_review_proposals",
                           "client_branding_proposals", "bank_connections",
-                          "bank_connection_syncs"}),
+                          "bank_connection_accounts", "bank_connection_syncs"}),
     "post": frozenset({"draft_entries", "imported_transactions", "audit_log",
                        "document_audits",
                        "clients", "accounts", "close_review_proposals",
                        "client_branding_proposals", "bank_connections",
-                       "bank_connection_syncs",
+                       "bank_connection_accounts", "bank_connection_syncs",
                        "journal_entries", "journal_entry_lines"}),
 }
 

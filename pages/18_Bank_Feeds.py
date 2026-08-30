@@ -10,7 +10,10 @@ from models.account import Account
 from models.client import Client
 from services.bank_feed import (
     create_bank_connection,
+    disconnect_bank_connection,
+    discover_remote_accounts,
     list_bank_connections,
+    map_remote_account,
     sync_bank_feed,
 )
 from utils import icons
@@ -48,7 +51,7 @@ for connection in connections:
     label = (
         f"{connection['account_number']} · {connection['account_name']}"
     )
-    status_col, action_col = st.columns([4, 1])
+    status_col, action_col = st.columns([3, 2])
     with status_col:
         st.markdown(f"**{label}**")
         st.caption(
@@ -57,14 +60,71 @@ for connection in connections:
     with action_col:
         if st.button("Sync Now", key=f"sync_bank_feed_{connection['id']}"):
             try:
-                staged = sync_bank_feed(client_id, connection["bank_account_id"])
+                result = sync_bank_feed(client_id, connection["bank_account_id"])
             except Exception as exc:
                 st.error(str(exc))
             else:
                 st.success(
-                    f"Staged {len(staged)} transaction(s) for import review."
+                    f"Staged {len(result['rows'])} transaction(s) for import review."
                 )
+                if result["unmapped_count"]:
+                    st.warning(
+                        "Not imported until mapped: "
+                        + ", ".join(result["unmapped_accounts"])
+                    )
                 st.rerun()
+        if st.button("Disconnect", key=f"disconnect_bank_feed_{connection['id']}"):
+            try:
+                disconnect_bank_connection(client_id, connection["id"])
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                st.success("SimpleFIN connection disconnected.")
+                st.rerun()
+
+    with st.expander(f"Map remote accounts for {label}"):
+        remote_accounts = []
+        if st.button(
+            "Discover remote accounts",
+            key=f"discover_remote_{connection['id']}",
+        ):
+            try:
+                remote_accounts = discover_remote_accounts(
+                    client_id, connection["bank_account_id"],
+                )
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                st.session_state[f"remote_accounts_{connection['id']}"] = (
+                    remote_accounts
+                )
+        remote_accounts = st.session_state.get(
+            f"remote_accounts_{connection['id']}", remote_accounts,
+        )
+        for remote in remote_accounts:
+            local_id = st.selectbox(
+                f"Ledger account for {remote['name']}",
+                options=[account.id for account in accounts],
+                format_func=lambda account_id: next(
+                    account.display_name() for account in accounts
+                    if account.id == account_id
+                ),
+                key=f"remote_mapping_{connection['id']}_{remote['id']}",
+            )
+            if st.button(
+                f"Map {remote['name']}",
+                key=f"map_remote_{connection['id']}_{remote['id']}",
+            ):
+                try:
+                    map_remote_account(
+                        client_id, connection["id"], remote["id"],
+                        remote["name"], local_id,
+                    )
+                except Exception as exc:
+                    st.error(str(exc))
+                else:
+                    st.success(f"Mapped {remote['name']}.")
+                    st.rerun()
 
 st.divider()
 st.subheader("Link a SimpleFIN account")
