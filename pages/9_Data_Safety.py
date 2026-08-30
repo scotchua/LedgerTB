@@ -71,7 +71,7 @@ with _book_cols[0]:
         st.caption("Open **read-only**"
                    + (f" — in use by {_bl.describe(_holder)}" if _holder else ""))
     elif _holder:
-        st.caption(f"In use by **{_bl.describe(_holder)}** (that's this session)")
+        st.caption(f"Lease held by **{_bl.describe(_holder)}** (that's this session)")
 with _book_cols[1]:
     if st.button("Switch book…", help="Close this book and choose another "
                  "(shared-drive books included)"):

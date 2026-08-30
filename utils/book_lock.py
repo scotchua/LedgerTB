@@ -1,19 +1,24 @@
-"""In-use lock for book files.
+"""Held leases for shared book files.
 
-SQLite's own file locking is unreliable on network shares (SMB/NFS), so a
-shared-drive book is coordinated the way desktop accounting always has been:
-a visible sidecar lock file naming who has it open, with an explicit
-takeover. One writer at a time; a second opener chooses read-only or
-takeover. Locks do not expire on their own — a crash leaves a stale lock
-that the next opener takes over deliberately (a stale lock from THIS machine
-and user with a dead process is reclaimed automatically).
+SQLite's own locking is unreliable on network shares (SMB/NFS), so a shared
+book has a visible sidecar lease naming its writer. Acquisition uses exclusive
+file creation and each owner has a random token. ``O_EXCL`` is not perfectly
+atomic on every network filesystem. The heartbeat and owner-token checks
+reduce the resulting risk, but they are not a mathematical guarantee.
 """
 import getpass
 import json
 import os
 import socket
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+STALE_AFTER_SECONDS = 10 * 60
+TAKEN_OVER_MESSAGE = "Another computer took over this book"
+
+_leases = {}
 
 
 def lock_path(book) -> Path:
@@ -21,12 +26,19 @@ def lock_path(book) -> Path:
     return book.with_name(book.name + ".lock")
 
 
-def _me() -> dict:
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _me(token=None) -> dict:
+    now = _now().isoformat(timespec="seconds")
     return {
+        "token": token or uuid.uuid4().hex,
         "user": getpass.getuser(),
         "host": socket.gethostname(),
         "pid": os.getpid(),
-        "opened_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "acquired_at": now,
+        "heartbeat_at": now,
     }
 
 
@@ -38,58 +50,130 @@ def read_lock(book):
         return None
 
 
-def _pid_alive(pid: int) -> bool:
+def _write_handle(fd, holder: dict) -> None:
+    payload = (json.dumps(holder, indent=2) + "\n").encode("utf-8")
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, payload)
+    os.fsync(fd)
+
+
+def _remember(book, token: str, fd: int) -> None:
+    key = str(lock_path(book))
+    previous = _leases.pop(key, None)
+    if previous:
+        os.close(previous[1])
+    _leases[key] = (token, fd)
+
+
+def _forget(book) -> None:
+    lease = _leases.pop(str(lock_path(book)), None)
+    if lease:
+        try:
+            os.close(lease[1])
+        except OSError:
+            pass
+
+
+def _reset() -> None:
+    """Close and forget all process-held leases."""
+    for _token, fd in list(_leases.values()):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _leases.clear()
+
+
+def _owned_token(book):
+    lease = _leases.get(str(lock_path(book)))
+    return lease[0] if lease else None
+
+
+def is_stale(holder: dict, now=None) -> bool:
+    stamp = holder.get("heartbeat_at")
+    if not stamp:
+        return True
     try:
-        os.kill(pid, 0)
+        heartbeat = datetime.fromisoformat(stamp)
+        if heartbeat.tzinfo is None:
+            heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+        return ((now or _now()) - heartbeat).total_seconds() > STALE_AFTER_SECONDS
+    except (TypeError, ValueError):
         return True
-    except OSError:
-        return False
-    except Exception:
-        return True  # can't tell -> assume alive
-
-
-def _is_reclaimable(holder: dict) -> bool:
-    """True when the lock is ours already, or was ours and the process died.
-    Liveness is only checkable on the same machine; a lock from another host
-    is never reclaimed silently."""
-    me = _me()
-    if holder.get("host") != me["host"]:
-        return False
-    if holder.get("pid") == me["pid"]:
-        return True
-    return holder.get("user") == me["user"] and not _pid_alive(int(holder.get("pid", 0)))
 
 
 def acquire(book) -> dict:
-    """Try to take the book for writing.
-
-    Returns {"acquired": True} or {"acquired": False, "holder": {...}}.
-    """
+    """Atomically acquire a new lease, or report the current holder."""
+    path = lock_path(book)
+    token = _owned_token(book)
     holder = read_lock(book)
-    if holder and not _is_reclaimable(holder):
-        return {"acquired": False, "holder": holder}
-    return takeover(book)
+    if token and holder and holder.get("token") == token:
+        return {"acquired": True, "token": token}
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mine = _me()
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return {"acquired": False, "holder": read_lock(book) or {}}
+    try:
+        _write_handle(fd, mine)
+    except Exception:
+        os.close(fd)
+        path.unlink(missing_ok=True)
+        raise
+    _remember(book, mine["token"], fd)
+    return {"acquired": True, "token": mine["token"]}
 
 
 def takeover(book) -> dict:
-    """Write our lock regardless of any existing holder (the caller has
-    confirmed the takeover)."""
+    """Replace a stale lease with a newly tokened lease."""
     path = lock_path(book)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_me(), indent=2) + "\n")
-    return {"acquired": True}
+    holder = read_lock(book)
+    if holder and not is_stale(holder):
+        return {"acquired": False, "holder": holder}
+
+    observed_token = holder.get("token") if holder else None
+    if holder:
+        current = read_lock(book)
+        if not current or current.get("token") != observed_token:
+            return {"acquired": False, "holder": current or {}}
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    return acquire(book)
+
+
+def verify_and_refresh(book) -> bool:
+    """Fence a former owner and refresh the current owner's heartbeat."""
+    token = _owned_token(book)
+    if not token:
+        return
+    holder = read_lock(book)
+    if not holder or holder.get("token") != token:
+        _forget(book)
+        raise RuntimeError(TAKEN_OVER_MESSAGE)
+    holder["heartbeat_at"] = _now().isoformat(timespec="seconds")
+    _write_handle(_leases[str(lock_path(book))][1], holder)
+    return True
 
 
 def release(book) -> None:
-    """Remove the lock if it is ours (never someone else's)."""
-    holder = read_lock(book)
-    me = _me()
-    if holder and holder.get("host") == me["host"] and holder.get("pid") == me["pid"]:
-        lock_path(book).unlink(missing_ok=True)
+    """Remove the sidecar only while its token is still ours."""
+    path = lock_path(book)
+    token = _owned_token(book)
+    try:
+        holder = read_lock(book)
+        if token and holder and holder.get("token") == token:
+            path.unlink(missing_ok=True)
+    finally:
+        _forget(book)
 
 
 def describe(holder: dict) -> str:
-    opened = holder.get("opened_at", "")
+    opened = holder.get("acquired_at", holder.get("opened_at", ""))
     if opened:
         try:
             local = datetime.fromisoformat(opened).astimezone()

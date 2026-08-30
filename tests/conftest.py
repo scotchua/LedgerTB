@@ -30,6 +30,22 @@ def _human_actor_by_default(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _writable_database_by_default(monkeypatch):
+    """Read-only book sessions pin every later connection in this process."""
+    monkeypatch.setattr(db_connection, "READ_ONLY", False)
+
+
+@pytest.fixture(autouse=True)
+def _release_book_leases():
+    """Book leases are process-global and keep open sidecar file handles."""
+    from utils import book_lock
+
+    book_lock._reset()
+    yield
+    book_lock._reset()
+
+
+@pytest.fixture(autouse=True)
 def fake_credential_vault(request, monkeypatch):
     """No test may touch the real credential vault (see the env note above)."""
     if request.node.get_closest_marker("real_vault"):
