@@ -82,7 +82,11 @@ def test_invoice_and_bill_post_exact_balanced_entries_and_audits(client_id, ar_a
         (ar_ap_accounts["revenue"], 0, 25100, "Consulting"),
         (ar_ap_accounts["revenue_2"], 0, 4995, "Setup"),
     ]
-    assert _audit_actions()[-2:] == [("invoices", "INSERT"), ("invoices", "UPDATE")]
+    assert _audit_actions()[-3:] == [
+        ("invoices", "INSERT"),
+        ("journal_entries", "INSERT"),
+        ("invoices", "UPDATE"),
+    ]
 
     vendor = create_vendor(client_id, "Office Market")
     bill = create_bill(client_id, vendor.id, [
@@ -97,7 +101,11 @@ def test_invoice_and_bill_post_exact_balanced_entries_and_audits(client_id, ar_a
         (ar_ap_accounts["expense_2"], 4998, 0, "Ink"),
         (ar_ap_accounts["ap"], 0, 8700, None),
     ]
-    assert _audit_actions()[-2:] == [("bills", "INSERT"), ("bills", "UPDATE")]
+    assert _audit_actions()[-3:] == [
+        ("bills", "INSERT"),
+        ("journal_entries", "INSERT"),
+        ("bills", "UPDATE"),
+    ]
 
 
 def test_reposting_invoice_and_bill_is_refused(client_id, ar_ap_accounts):
