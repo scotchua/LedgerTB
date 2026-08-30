@@ -225,6 +225,30 @@ def propose_depreciation_run(fixed_asset_id: int, period_end: date,
                       credit_cents=amount_cents),
         ],
     )
-    return {"draft_id": draft.save(), "status": "pending",
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        draft_id = draft.save(conn=conn)
+        cursor.execute(
+            """INSERT INTO depreciation_draft_links
+               (draft_entry_id, fixed_asset_id, period_end, method, amount_cents)
+               VALUES (?, ?, ?, ?, ?)""",
+            (draft_id, asset.id, period_end.isoformat(), asset_type.method,
+             amount_cents),
+        )
+        from models.audit_log import AuditLog
+        AuditLog.write(
+            cursor, asset.client_id, "depreciation_draft_links", draft_id, "INSERT",
+            new_values={"draft_entry_id": draft_id, "fixed_asset_id": asset.id,
+                        "period_end": period_end, "method": asset_type.method,
+                        "amount_cents": amount_cents},
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"draft_id": draft_id, "status": "pending",
             "amount_cents": amount_cents,
             "note": "Filed for human review; this proposal did not post."}

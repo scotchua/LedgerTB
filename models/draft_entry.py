@@ -100,11 +100,15 @@ class DraftEntry:
             )
 
     # ---------------------------------------------------------------- io
-    def save(self) -> int:
+    def save(self, conn=None) -> int:
         from models.audit_log import AuditLog
 
         self.validate()
-        with get_cursor(commit=True) as cursor:
+        owns_conn = conn is None
+        if owns_conn:
+            conn = get_connection()
+        cursor = conn.cursor()
+        try:
             cursor.execute(
                 """INSERT INTO draft_entries
                    (client_id, proposed_by, entry_date, entry_type,
@@ -126,6 +130,15 @@ class DraftEntry:
                 cursor, self.client_id, "draft_entries", self.id, "INSERT",
                 new_values=self._audit_values(),
             )
+            if owns_conn:
+                conn.commit()
+        except Exception:
+            if owns_conn:
+                conn.rollback()
+            raise
+        finally:
+            if owns_conn:
+                conn.close()
         return self.id
 
     @staticmethod
@@ -268,6 +281,76 @@ class DraftEntry:
                 raise ValueError("Only a pending draft can be approved.")
 
             entry_id = entry.save(conn=conn)
+            cursor.execute(
+                """SELECT ddl.fixed_asset_id, ddl.period_end, ddl.method,
+                          ddl.amount_cents, fa.client_id,
+                          fat.method current_method,
+                          expense.account_number expense_account_number,
+                          accumulated.account_number accumulated_account_number
+                   FROM depreciation_draft_links ddl
+                   JOIN fixed_assets fa ON fa.id = ddl.fixed_asset_id
+                   JOIN fixed_asset_types fat ON fat.id = fa.fixed_asset_type_id
+                   JOIN accounts expense
+                     ON expense.id = fat.depreciation_expense_account_id
+                   JOIN accounts accumulated
+                     ON accumulated.id = fat.accumulated_depreciation_account_id
+                   WHERE ddl.draft_entry_id = ?""",
+                (self.id,),
+            )
+            depreciation = cursor.fetchone()
+            if depreciation:
+                if (depreciation["client_id"] != self.client_id
+                        or depreciation["period_end"] != self.entry_date
+                        or depreciation["method"] != depreciation["current_method"]
+                        or depreciation["amount_cents"] <= 0
+                        or len(self.lines) != 2
+                        or not any(
+                            str(line.account_number)
+                            == depreciation["expense_account_number"]
+                            and line.debit_cents == depreciation["amount_cents"]
+                            and line.credit_cents == 0
+                            for line in self.lines
+                        )
+                        or not any(
+                            str(line.account_number)
+                            == depreciation["accumulated_account_number"]
+                            and line.credit_cents == depreciation["amount_cents"]
+                            and line.debit_cents == 0
+                            for line in self.lines
+                        )):
+                    raise ValueError(
+                        "Depreciation draft metadata is invalid; nothing was posted."
+                    )
+                try:
+                    cursor.execute(
+                        """INSERT INTO depreciation_runs
+                           (fixed_asset_id, period_start, period_end, amount_cents,
+                            journal_entry_id) VALUES (?, ?, ?, ?, ?)""",
+                        (depreciation["fixed_asset_id"],
+                         _date.fromisoformat(depreciation["period_end"])
+                         .replace(day=1).isoformat(),
+                         depreciation["period_end"],
+                         depreciation["amount_cents"], entry_id),
+                    )
+                except Exception as exc:
+                    if "UNIQUE constraint failed" in str(exc):
+                        raise ValueError(
+                            "Depreciation has already been run for this asset and "
+                            "period; nothing was posted."
+                        ) from exc
+                    raise
+                run_id = cursor.lastrowid
+                AuditLog.write(
+                    cursor, self.client_id, "depreciation_runs", run_id, "INSERT",
+                    new_values={
+                        "fixed_asset_id": depreciation["fixed_asset_id"],
+                        "period_start": _date.fromisoformat(
+                            depreciation["period_end"]).replace(day=1),
+                        "period_end": _date.fromisoformat(depreciation["period_end"]),
+                        "amount_cents": depreciation["amount_cents"],
+                        "journal_entry_id": entry_id,
+                    },
+                )
             cursor.execute(
                 """UPDATE draft_entries SET posted_entry_id = ?
                    WHERE id = ? AND client_id = ? AND status = 'approved'""",

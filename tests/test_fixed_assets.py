@@ -2,12 +2,15 @@ from datetime import date
 
 import pytest
 
+from database import connection as dbconn
 from database.connection import get_cursor
+from models.audit_log import AuditLog
+from models.draft_entry import DraftEntry
 from models.account import Account
 from models.fixed_asset import FixedAsset, FixedAssetType
 from models.journal_entry import JournalEntry
 from services import mcp_tools
-from services.fixed_assets import dispose_asset, run_depreciation
+from services.fixed_assets import dispose_asset, propose_depreciation_run, run_depreciation
 
 
 @pytest.fixture
@@ -150,6 +153,90 @@ def test_propose_depreciation_creates_draft_only(client_id, fixed_accounts):
     assert result["amount_cents"] == 3000
     assert JournalEntry.count(client_id) == 0
     assert _run_amounts(asset.id) == []
+
+
+def test_approved_depreciation_draft_prevents_second_post(client_id, fixed_accounts):
+    asset = _make_asset(client_id, _make_type(client_id, fixed_accounts))
+    result = propose_depreciation_run(asset.id, date(2026, 1, 31))
+
+    DraftEntry.get_by_id(result["draft_id"], client_id).approve()
+
+    assert JournalEntry.count(client_id) == 1
+    assert _run_amounts(asset.id) == [3000]
+    with pytest.raises(ValueError, match="already been run"):
+        run_depreciation(asset.id, date(2026, 1, 31))
+    assert JournalEntry.count(client_id) == 1
+    assert _run_amounts(asset.id) == [3000]
+
+
+def test_depreciation_draft_approval_is_atomic(client_id, fixed_accounts, monkeypatch):
+    asset = _make_asset(client_id, _make_type(client_id, fixed_accounts))
+    result = propose_depreciation_run(asset.id, date(2026, 1, 31))
+    draft = DraftEntry.get_by_id(result["draft_id"], client_id)
+    original_write = AuditLog.write
+
+    def fail_run_audit(cursor, client_id, table_name, record_id, action, **kwargs):
+        if table_name == "depreciation_runs":
+            raise RuntimeError("forced run-record failure")
+        return original_write(
+            cursor, client_id, table_name, record_id, action, **kwargs
+        )
+
+    monkeypatch.setattr(AuditLog, "write", fail_run_audit)
+    with pytest.raises(RuntimeError, match="forced run-record failure"):
+        draft.approve()
+
+    assert JournalEntry.count(client_id) == 0
+    assert _run_amounts(asset.id) == []
+    stored = DraftEntry.get_by_id(draft.id, client_id)
+    assert stored.status == "pending"
+    assert stored.posted_entry_id is None
+
+
+def test_period_posted_between_proposal_and_approval_rolls_back(
+    client_id, fixed_accounts
+):
+    asset = _make_asset(client_id, _make_type(client_id, fixed_accounts))
+    result = propose_depreciation_run(asset.id, date(2026, 1, 31))
+    run_depreciation(asset.id, date(2026, 1, 31))
+
+    draft = DraftEntry.get_by_id(result["draft_id"], client_id)
+    with pytest.raises(ValueError, match="already been run.*nothing was posted"):
+        draft.approve()
+
+    assert JournalEntry.count(client_id) == 1
+    assert _run_amounts(asset.id) == [3000]
+    assert DraftEntry.get_by_id(draft.id, client_id).status == "pending"
+
+
+def test_depreciation_run_unique_index_rejects_direct_duplicate(
+    client_id, fixed_accounts
+):
+    asset = _make_asset(client_id, _make_type(client_id, fixed_accounts))
+    run_depreciation(asset.id, date(2026, 1, 31))
+    with get_cursor() as cursor:
+        cursor.execute("PRAGMA index_list('depreciation_runs')")
+        assert any(row["name"] == "uq_depreciation_runs_asset_period"
+                   and row["unique"] for row in cursor.fetchall())
+        cursor.execute(
+            "SELECT * FROM depreciation_runs WHERE fixed_asset_id = ?",
+            (asset.id,),
+        )
+        run = cursor.fetchone()
+
+    conn = dbconn.get_connection()
+    try:
+        with pytest.raises(dbconn._driver.IntegrityError):
+            conn.execute(
+                """INSERT INTO depreciation_runs
+                   (fixed_asset_id, period_start, period_end, amount_cents,
+                    journal_entry_id) VALUES (?, ?, ?, ?, ?)""",
+                (asset.id, run["period_start"], run["period_end"],
+                 run["amount_cents"], run["journal_entry_id"]),
+            )
+    finally:
+        conn.rollback()
+        conn.close()
 
 
 def test_fixed_asset_mutations_are_audited(client_id, fixed_accounts):
