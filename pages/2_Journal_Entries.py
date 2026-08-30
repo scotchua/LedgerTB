@@ -176,7 +176,8 @@ def load_entry_as_correction(entry: JournalEntry):
     st.session_state.je_source_reference = entry.source_reference or ''
     st.session_state.je_description = entry.description or ''
     st.session_state.je_aje_reference = entry.aje_reference
-    start_new_form_generation()
+    if not journal_scope.changed:
+        start_new_form_generation()
 
 
 # Check if we're coming from General Ledger drill-down
