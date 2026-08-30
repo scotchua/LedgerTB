@@ -13,10 +13,11 @@ from database import init_database
 from database.connection import get_cursor
 from models.account import Account
 from money import to_cents, to_dollars
-from services.ar_ap import (apply_credit_memo, create_credit_memo, create_customer,
+from services.ar_ap import (apply_credit_memo, build_invoice_pdf, create_credit_memo, create_customer,
                             create_invoice, list_credit_memos, list_customer_credits,
                             list_invoices, post_credit_memo, post_invoice,
-                            record_customer_payment, void_credit_memo, void_invoice,
+                            record_customer_payment, send_invoice_email,
+                            void_credit_memo, void_invoice,
                             void_payment)
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
@@ -98,6 +99,38 @@ st.dataframe(pd.DataFrame([{"Invoice": row["id"], "Customer": row["party_name"],
 
 if rows and assets:
     selected = st.selectbox("Invoice", [row["id"] for row in rows])
+    selected_row = next(row for row in rows if row["id"] == selected)
+    if selected_row["status"] != "draft":
+        pdf = build_invoice_pdf(selected)
+        st.download_button(
+            "Download invoice PDF", data=pdf.getvalue(),
+            file_name=f"invoice_{selected}.pdf", mime="application/pdf",
+        )
+        with st.expander("Email invoice"):
+            with get_cursor() as cursor:
+                customer_email = cursor.execute(
+                    "SELECT email FROM customers WHERE id = ?",
+                    (selected_row["customer_id"],),
+                ).fetchone()["email"] or ""
+            email_to = st.text_input(
+                "Recipient", value=customer_email,
+                key=f"invoice_email_to_{selected}",
+            )
+            email_subject = st.text_input(
+                "Subject", value=f"Invoice #{selected}",
+                key=f"invoice_email_subject_{selected}",
+            )
+            email_body = st.text_area(
+                "Message", value=f"Please find invoice #{selected} attached.",
+                key=f"invoice_email_body_{selected}",
+            )
+            if st.button("Send invoice", key=f"send_invoice_{selected}"):
+                try:
+                    send_invoice_email(selected, email_to, email_subject, email_body)
+                except Exception as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Invoice sent.")
     asset_label = lambda aid: next(f"{a.account_number} — {a.name}" for a in assets if a.id == aid)
     control_id = st.selectbox("A/R control account", [a.id for a in assets], format_func=asset_label)
     liabilities = Account.get_by_type(client_id, "Liability")
@@ -121,7 +154,6 @@ if rows and assets:
         else:
             st.rerun()
     st.subheader("Record customer payment")
-    selected_row = next(row for row in rows if row["id"] == selected)
     amount = st.number_input("Payment amount", min_value=0.01, step=0.01)
     allocation = st.number_input("Allocate to selected invoice", min_value=0.01,
                                  max_value=max(0.01, to_dollars(selected_row["open_balance_cents"])),

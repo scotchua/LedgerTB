@@ -17,6 +17,8 @@ from services.branding import (
     save_branding,
     save_client_branding,
 )
+from services.ar_ap import SMTP_SECRET_NAMES
+from utils import secure_store
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 from utils import icons
@@ -29,6 +31,33 @@ init_database()
 client_id = render_client_selector()
 
 st.title("Firm Settings")
+
+st.subheader("Invoice email")
+st.caption("SMTP credentials are stored only in the operating system credential vault.")
+smtp_host = st.text_input("SMTP host", value=secure_store.get_secret(SMTP_SECRET_NAMES["host"]) or "")
+smtp_port = st.text_input("SMTP port", value=secure_store.get_secret(SMTP_SECRET_NAMES["port"]) or "587")
+smtp_username = st.text_input("SMTP username", value=secure_store.get_secret(SMTP_SECRET_NAMES["username"]) or "")
+smtp_password = st.text_input("SMTP password", type="password", value="")
+smtp_from = st.text_input("From address", value=secure_store.get_secret(SMTP_SECRET_NAMES["from_address"]) or "")
+if st.button("Save SMTP settings"):
+    try:
+        values = {"host": smtp_host, "port": smtp_port, "username": smtp_username,
+                  "from_address": smtp_from}
+        if not all(value.strip() for value in values.values()):
+            raise ValueError("Host, port, username, and from address are required.")
+        int(smtp_port)
+        if not smtp_password and not secure_store.get_secret(SMTP_SECRET_NAMES["password"]):
+            raise ValueError("SMTP password is required the first time settings are saved.")
+        for key, value in values.items():
+            secure_store.set_secret(SMTP_SECRET_NAMES[key], value.strip())
+        if smtp_password:
+            secure_store.set_secret(SMTP_SECRET_NAMES["password"], smtp_password)
+    except (TypeError, ValueError) as exc:
+        st.error(str(exc))
+    else:
+        st.success("SMTP settings saved to the credential vault.")
+
+st.divider()
 
 st.subheader("Document branding")
 st.caption(

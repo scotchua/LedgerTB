@@ -2,7 +2,16 @@
 
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from email.message import EmailMessage
+from io import BytesIO
+import smtplib
 from typing import Iterable, Optional
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from database.connection import get_connection, get_cursor
 from models.audit_log import AuditLog
@@ -10,7 +19,18 @@ from models.journal_entry import JournalEntry, JournalEntryLine
 from models.payables import Bill, BillLine, Vendor
 from models.receivables import CreditMemo, CreditMemoLine, Customer, Invoice, InvoiceLine
 from money import to_dollars
+from services.branding import get_branding, get_client_branding
 from services.inventory import _record_movement
+from utils import secure_store
+
+
+SMTP_SECRET_NAMES = {
+    "host": "smtp.host",
+    "port": "smtp.port",
+    "username": "smtp.username",
+    "password": "smtp.password",
+    "from_address": "smtp.from_address",
+}
 
 
 def _iso(value, field_name: str) -> str:
@@ -1217,6 +1237,413 @@ def list_vendor_credits(client_id: int):
     return _list_open_credits(client_id, False)
 
 
+def get_sales_tax_report(client_id: int, start, end):
+    """Return an ACCRUAL-basis sales-tax workpaper using document dates.
+
+    Non-voided credit memos are negatives. Any filing figure requires CPA
+    review under firm policy.
+    """
+    start = _iso(start, "start")
+    end = _iso(end, "end")
+    if start > end:
+        raise ValueError("Start date must be on or before end date.")
+    with get_cursor() as cursor:
+        rows = cursor.execute(
+            """SELECT 'invoice' document_type, i.id document_id,
+                      i.invoice_date document_date, c.name party_name,
+                      COALESCE(SUM(il.quantity * il.unit_price_cents), 0) subtotal_cents,
+                      i.tax_rate, i.tax_amount_cents
+               FROM invoices i JOIN customers c ON c.id = i.customer_id
+               LEFT JOIN invoice_lines il ON il.invoice_id = i.id
+               WHERE i.client_id = ? AND i.invoice_date BETWEEN ? AND ?
+                 AND i.status NOT IN ('draft', 'voided') GROUP BY i.id
+               UNION ALL
+               SELECT 'credit_memo', cm.id, cm.memo_date, c.name,
+                      -COALESCE(SUM(cml.quantity * cml.unit_price_cents), 0),
+                      cm.tax_rate, -cm.tax_amount_cents
+               FROM credit_memos cm JOIN customers c ON c.id = cm.customer_id
+               LEFT JOIN credit_memo_lines cml ON cml.credit_memo_id = cm.id
+               WHERE cm.client_id = ? AND cm.memo_date BETWEEN ? AND ?
+                 AND cm.status NOT IN ('draft', 'voided') GROUP BY cm.id
+               ORDER BY document_date, document_type, document_id""",
+            (client_id, start, end, client_id, start, end),
+        ).fetchall()
+    documents = [dict(row) for row in rows]
+    total_sales = sum(row["subtotal_cents"] for row in documents)
+    total_taxable = sum(
+        row["subtotal_cents"] for row in documents if row["tax_rate"] is not None
+    )
+    return {
+        "basis": "ACCRUAL",
+        "total_sales_cents": total_sales,
+        "total_taxable_cents": total_taxable,
+        "total_non_taxable_cents": total_sales - total_taxable,
+        "total_tax_cents": sum(row["tax_amount_cents"] for row in documents),
+        "documents": documents,
+    }
+
+
+def get_1099_summary(client_id: int, year: int):
+    """Return a draft 1099 workpaper for CPA review, not a filing document.
+
+    Payment-method and vendor-classification exclusions, including corporation
+    and card-payment exclusions, are not modeled and must be applied by the
+    reviewer.
+    """
+    year = int(year)
+    with get_cursor() as cursor:
+        rows = cursor.execute(
+            """SELECT v.id vendor_id, v.name vendor_name,
+                      COALESCE(SUM(a.amount_cents), 0) total_paid_cents
+               FROM bill_payments_v2 p JOIN vendors v ON v.id = p.vendor_id
+               JOIN bill_payment_allocations a ON a.payment_id = p.id
+               WHERE p.client_id = ? AND p.status != 'voided'
+                 AND p.payment_date BETWEEN ? AND ?
+               GROUP BY v.id ORDER BY v.name, v.id""",
+            (client_id, f"{year:04d}-01-01", f"{year:04d}-12-31"),
+        ).fetchall()
+    return {"year": year, "vendors": [
+        {**dict(row), "review_threshold": row["total_paid_cents"] >= 60000}
+        for row in rows
+    ], "limitations": (
+        "Draft workpaper for CPA review, not a filing document; payment-method "
+        "and vendor-classification exclusions are not modeled."
+    )}
+
+
+def get_income_by_customer(client_id: int, start, end):
+    """Return accrual invoice activity and customer balances through ``end``."""
+    start = _iso(start, "start")
+    end = _iso(end, "end")
+    if start > end:
+        raise ValueError("Start date must be on or before end date.")
+    with get_cursor() as cursor:
+        rows = cursor.execute(
+            """SELECT c.id customer_id, c.name customer_name, COUNT(i.id) invoice_count,
+                      COALESCE(SUM((SELECT SUM(il.quantity * il.unit_price_cents)
+                                    FROM invoice_lines il WHERE il.invoice_id = i.id)), 0) subtotal_cents,
+                      COALESCE(SUM((SELECT SUM(il.quantity * il.unit_price_cents)
+                                    FROM invoice_lines il WHERE il.invoice_id = i.id)
+                                   + i.tax_amount_cents), 0) total_cents,
+                      COALESCE(SUM((SELECT SUM(a.amount_cents) FROM payment_allocations a
+                                    JOIN payments p ON p.id = a.payment_id
+                                    WHERE a.invoice_id = i.id AND p.status != 'voided'
+                                      AND p.payment_date BETWEEN ? AND ?)), 0)
+                      + COALESCE(SUM((SELECT SUM(ca.amount_cents) FROM credit_applications ca
+                                     JOIN credit_memos cm ON cm.id = ca.credit_memo_id
+                                     WHERE ca.invoice_id = i.id AND cm.status != 'voided'
+                                       AND cm.memo_date <= ?)), 0) total_paid_cents
+               FROM customers c JOIN invoices i ON i.customer_id = c.id
+               WHERE c.client_id = ? AND i.invoice_date BETWEEN ? AND ?
+                 AND i.status NOT IN ('draft', 'voided')
+               GROUP BY c.id ORDER BY c.name, c.id""",
+            (start, end, end, client_id, start, end),
+        ).fetchall()
+        result = []
+        for row in rows:
+            balance = cursor.execute(
+                """SELECT COALESCE(SUM(
+                          (SELECT SUM(il.quantity * il.unit_price_cents)
+                           FROM invoice_lines il WHERE il.invoice_id = i.id) + i.tax_amount_cents
+                          - COALESCE((SELECT SUM(a.amount_cents) FROM payment_allocations a
+                                      JOIN payments p ON p.id = a.payment_id
+                                      WHERE a.invoice_id = i.id AND p.status != 'voided'
+                                        AND p.payment_date <= ?), 0)
+                          - COALESCE((SELECT SUM(ca.amount_cents) FROM credit_applications ca
+                                      JOIN credit_memos cm ON cm.id = ca.credit_memo_id
+                                      WHERE ca.invoice_id = i.id AND cm.status != 'voided'
+                                        AND cm.memo_date <= ?), 0)), 0) balance
+                   FROM invoices i WHERE i.customer_id = ? AND i.client_id = ?
+                     AND i.invoice_date <= ? AND i.status NOT IN ('draft', 'voided')""",
+                (end, end, row["customer_id"], client_id, end),
+            ).fetchone()["balance"]
+            result.append({**dict(row), "open_balance_cents": balance})
+        open_credits = {}
+        for credit in _open_credit_rows(client_id, end, True):
+            open_credits[credit["party_id"]] = (
+                open_credits.get(credit["party_id"], 0) - credit["amount_cents"]
+            )
+        for row in result:
+            row["open_credit_cents"] = open_credits.get(row["customer_id"], 0)
+    return result
+
+
+def _invoice_pdf_data(invoice_id: int):
+    with get_cursor() as cursor:
+        invoice = cursor.execute(
+            """SELECT i.*, c.name customer_name, c.email customer_email,
+                      cl.name client_name, cl.address_line1, cl.address_city,
+                      cl.address_state, cl.address_zip
+               FROM invoices i JOIN customers c ON c.id = i.customer_id
+               JOIN clients cl ON cl.id = i.client_id WHERE i.id = ?""",
+            (invoice_id,),
+        ).fetchone()
+        if not invoice:
+            raise ValueError("Invoice not found.")
+        lines = cursor.execute(
+            "SELECT description, quantity, unit_price_cents FROM invoice_lines "
+            "WHERE invoice_id = ? ORDER BY id", (invoice_id,),
+        ).fetchall()
+        paid = cursor.execute(
+            """SELECT COALESCE(SUM(a.amount_cents), 0) amount
+               FROM payment_allocations a JOIN payments p ON p.id = a.payment_id
+               WHERE a.invoice_id = ? AND p.status != 'voided'""",
+            (invoice_id,),
+        ).fetchone()["amount"]
+        credits = cursor.execute(
+            """SELECT COALESCE(SUM(ca.amount_cents), 0) amount
+               FROM credit_applications ca JOIN credit_memos cm ON cm.id = ca.credit_memo_id
+               WHERE ca.invoice_id = ? AND cm.status != 'voided'""",
+            (invoice_id,),
+        ).fetchone()["amount"]
+    return dict(invoice), [dict(line) for line in lines], paid + credits
+
+
+def build_invoice_pdf(invoice_id: int) -> BytesIO:
+    """Render an invoice PDF without creating a close-package document audit."""
+    invoice, lines, paid = _invoice_pdf_data(invoice_id)
+    firm = get_branding()
+    client = get_client_branding(invoice["client_id"])
+    display_name = client.display_name or invoice["client_name"]
+    accent_hex = client.accent_hex or firm.accent_hex
+    accent = colors.HexColor(accent_hex) if accent_hex else colors.black
+    body_style = ParagraphStyle(
+        "invoice-body", fontName="Helvetica", fontSize=9, leading=12
+    )
+    heading = ParagraphStyle(
+        "invoice-heading", parent=body_style, fontName="Helvetica-Bold",
+        fontSize=20, leading=24, textColor=accent,
+    )
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=letter, leftMargin=0.55 * inch, rightMargin=0.55 * inch,
+        topMargin=0.6 * inch, bottomMargin=0.55 * inch,
+        title=f"Invoice {invoice_id} - {display_name}",
+        author=firm.firm_name or "LedgerTB", invariant=1,
+    )
+
+    def safe(value):
+        escaped = str(value or "").replace("&", "&amp;").replace("<", "&lt;")
+        return Paragraph(escaped, body_style)
+
+    def footer(canvas, _doc):
+        canvas.saveState()
+        if invoice["status"] == "voided":
+            canvas.setFillColor(colors.Color(0.85, 0.85, 0.85, alpha=0.45))
+            canvas.setFont("Helvetica-Bold", 64)
+            canvas.translate(letter[0] / 2, letter[1] / 2)
+            canvas.rotate(35)
+            canvas.drawCentredString(0, 0, "VOID")
+        canvas.restoreState()
+        canvas.saveState()
+        canvas.setFillColor(colors.HexColor("#666666"))
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawString(0.55 * inch, 0.28 * inch, display_name)
+        canvas.drawRightString(letter[0] - 0.55 * inch, 0.28 * inch,
+                               f"Page {canvas.getPageNumber()}")
+        canvas.restoreState()
+
+    city = " ".join(filter(None, [invoice["address_city"], invoice["address_state"],
+                                   invoice["address_zip"]]))
+    identity = [display_name, client.tagline, invoice["address_line1"], city]
+    if firm.firm_name:
+        identity += [f"Prepared by {firm.firm_name}", firm.tagline]
+    story = [safe(line) for line in identity if line]
+    story += [Spacer(1, 14), Paragraph("INVOICE", heading),
+              safe(f"Invoice #{invoice_id}"), Spacer(1, 8)]
+    metadata = Table([
+        ["Invoice date", invoice["invoice_date"], "Due date", invoice["due_date"]],
+        ["Terms", f"Due {invoice['due_date']}", "Status",
+         invoice["status"].replace("_", " ").title()],
+    ], colWidths=[0.9 * inch, 1.8 * inch, 0.8 * inch, 1.8 * inch])
+    metadata.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story += [metadata, Spacer(1, 14), safe("Bill to"), safe(invoice["customer_name"]),
+              Spacer(1, 12)]
+    item_rows = [[safe("Description"), "Qty", "Unit", "Amount"]]
+    subtotal = 0
+    for line in lines:
+        amount = line["quantity"] * line["unit_price_cents"]
+        subtotal += amount
+        item_rows.append([safe(line["description"]), str(line["quantity"]),
+                          f"${to_dollars(line['unit_price_cents']):,.2f}",
+                          f"${to_dollars(amount):,.2f}"])
+    items = Table(item_rows, colWidths=[3.65 * inch, 0.65 * inch, 1.1 * inch, 1.1 * inch],
+                  repeatRows=1)
+    item_style = [
+        ("BACKGROUND", (0, 0), (-1, 0), accent),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+    ]
+    for row_index in range(2, len(item_rows), 2):
+        item_style.append(("BACKGROUND", (0, row_index), (-1, row_index),
+                           colors.HexColor("#F4F4F4")))
+    items.setStyle(TableStyle(item_style))
+    total = subtotal + invoice["tax_amount_cents"]
+    totals = [["Subtotal", f"${to_dollars(subtotal):,.2f}"]]
+    if invoice["tax_amount_cents"]:
+        totals.append([f"Tax ({invoice['tax_rate']})",
+                       f"${to_dollars(invoice['tax_amount_cents']):,.2f}"])
+    totals += [["Total", f"${to_dollars(total):,.2f}"],
+               ["Paid to date", f"${to_dollars(paid):,.2f}"],
+               ["Balance due", f"${to_dollars(total - paid):,.2f}"]]
+    totals_table = Table(totals, colWidths=[1.35 * inch, 1.25 * inch], hAlign="RIGHT")
+    totals_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.8, accent),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story += [items, Spacer(1, 12), totals_table]
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    buffer.seek(0)
+    return buffer
+
+
+def _safe_smtp_error(exc: Exception) -> str:
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        return "SMTP authentication failed. Check the saved username and password."
+    if isinstance(exc, (OSError, smtplib.SMTPException)):
+        return "The invoice email could not be sent. Check the SMTP settings and try again."
+    return "The invoice email could not be sent. Please try again."
+
+
+def send_invoice_email(invoice_id: int, to_address: str, subject=None, body=None):
+    """Render and send one invoice, then audit the standalone email attempt."""
+    invoice, _, _ = _invoice_pdf_data(invoice_id)
+    to_address = (to_address or "").strip()
+    if not to_address:
+        raise ValueError("Recipient email address is required.")
+    settings = {
+        key: secure_store.get_secret(name) for key, name in SMTP_SECRET_NAMES.items()
+    }
+    if not all(settings.values()):
+        raise ValueError("SMTP settings are incomplete. Save them in Firm Settings first.")
+    try:
+        port = int(settings["port"])
+    except (TypeError, ValueError):
+        raise ValueError("SMTP port must be a number.")
+    subject = subject or f"Invoice #{invoice_id}"
+    body = body or f"Please find invoice #{invoice_id} attached."
+    message = EmailMessage()
+    message["From"] = settings["from_address"]
+    message["To"] = to_address
+    message["Subject"] = subject
+    message.set_content(body)
+    message.add_attachment(
+        build_invoice_pdf(invoice_id).read(), maintype="application", subtype="pdf",
+        filename=f"invoice_{invoice_id}.pdf",
+    )
+    status = "sent"
+    error = None
+    try:
+        with smtplib.SMTP(settings["host"], port) as smtp:
+            smtp.starttls()
+            smtp.login(settings["username"], settings["password"])
+            smtp.send_message(message)
+    except Exception as exc:
+        status = "failed"
+        error = _safe_smtp_error(exc)
+    try:
+        with get_cursor(commit=True) as cursor:
+            cursor.execute(
+                "INSERT INTO email_log (client_id, sent_to, subject, document_type, "
+                "document_id, status, error) VALUES (?, ?, ?, 'invoice', ?, ?, ?)",
+                (invoice["client_id"], to_address, subject, invoice_id, status, error),
+            )
+            log_id = cursor.lastrowid
+            AuditLog.write(
+                cursor, invoice["client_id"], "email_log", log_id, "INSERT",
+                new_values={"sent_to": to_address, "subject": subject,
+                            "document_type": "invoice", "document_id": invoice_id,
+                            "status": status, "error": error},
+            )
+    except Exception as exc:
+        raise RuntimeError(
+            "The email attempt could not be logged; delivery status is unknown."
+        ) from exc
+    if error:
+        raise RuntimeError(error)
+    return log_id
+
+
+def _open_credit_rows(client_id: int, as_of, is_invoice: bool):
+    as_of = _iso(as_of, "as_of")
+    table = "invoices" if is_invoice else "bills"
+    party_table = "customers" if is_invoice else "vendors"
+    party_field = "customer_id" if is_invoice else "vendor_id"
+    date_field = "invoice_date" if is_invoice else "bill_date"
+    allocations_table = "payment_allocations" if is_invoice else "bill_payment_allocations"
+    payments_table = "payments" if is_invoice else "bill_payments_v2"
+    refunds_table = "payment_refunds" if is_invoice else "bill_payment_refunds"
+    rows = []
+    with get_cursor() as cursor:
+        cursor.execute(
+            f"""SELECT p.id payment_id, p.{party_field}, party.name party_name, p.payment_date,
+                       p.amount_cents - COALESCE((SELECT SUM(a.amount_cents)
+                           FROM {allocations_table} a
+                           JOIN {table} ad ON ad.id = a.{table[:-1]}_id
+                           WHERE a.payment_id = p.id AND ad.{date_field} <= ?), 0) -
+                       COALESCE((SELECT SUM(r.amount_cents) FROM {refunds_table} r
+                           WHERE r.payment_id = p.id AND r.refund_date <= ?), 0) open_credit_cents
+                FROM {payments_table} p JOIN {party_table} party ON party.id = p.{party_field}
+                WHERE p.client_id = ? AND p.payment_date <= ?
+                  AND NOT (p.status = 'voided' AND EXISTS (
+                      SELECT 1 FROM journal_entries vje
+                      WHERE vje.id = p.voided_journal_entry_id AND vje.entry_date <= ?))
+                ORDER BY p.payment_date, p.id""",
+            (as_of, as_of, client_id, as_of, as_of),
+        )
+        credits = [dict(row) for row in cursor.fetchall()]
+    for credit in credits:
+        if credit["open_credit_cents"] > 0:
+            rows.append({
+                "party_id": credit[party_field], "party_name": credit["party_name"],
+                "document_id": credit["payment_id"], "kind": "credit",
+                "due_date": credit["payment_date"], "bucket": "current",
+                "amount_cents": -credit["open_credit_cents"],
+            })
+    if is_invoice:
+        with get_cursor() as cursor:
+            cursor.execute(
+                """SELECT cm.id, cm.customer_id, c.name party_name, cm.memo_date,
+                           COALESCE((SELECT SUM(quantity * unit_price_cents)
+                               FROM credit_memo_lines WHERE credit_memo_id = cm.id), 0) +
+                           cm.tax_amount_cents - COALESCE((SELECT SUM(ca.amount_cents)
+                               FROM credit_applications ca JOIN invoices i ON i.id = ca.invoice_id
+                               WHERE ca.credit_memo_id = cm.id AND cm.memo_date <= ?), 0) remaining
+                     FROM credit_memos cm JOIN customers c ON c.id = cm.customer_id
+                    WHERE cm.client_id = ? AND cm.memo_date <= ? AND cm.status != 'draft'
+                      AND NOT (cm.status = 'voided' AND EXISTS (
+                          SELECT 1 FROM journal_entries vje
+                          WHERE vje.id = cm.voided_journal_entry_id AND vje.entry_date <= ?))
+                    ORDER BY cm.memo_date, cm.id""",
+                (as_of, client_id, as_of, as_of),
+            )
+            memo_credits = [dict(row) for row in cursor.fetchall()]
+        for credit in memo_credits:
+            if credit["remaining"] > 0:
+                rows.append({
+                    "party_id": credit["customer_id"], "party_name": credit["party_name"],
+                    "document_id": credit["id"], "kind": "credit_memo",
+                    "due_date": credit["memo_date"], "bucket": "current",
+                    "amount_cents": -credit["remaining"],
+                })
+    return rows
+
+
 def _aging(client_id: int, as_of, is_invoice: bool):
     as_of = date.fromisoformat(_iso(as_of, "as_of"))
     table = "invoices" if is_invoice else "bills"
@@ -1226,7 +1653,6 @@ def _aging(client_id: int, as_of, is_invoice: bool):
     date_field = "invoice_date" if is_invoice else "bill_date"
     allocations_table = "payment_allocations" if is_invoice else "bill_payment_allocations"
     payments_table = "payments" if is_invoice else "bill_payments_v2"
-    refunds_table = "payment_refunds" if is_invoice else "bill_payment_refunds"
     rows = []
     with get_cursor() as cursor:
         cursor.execute(
@@ -1264,58 +1690,7 @@ def _aging(client_id: int, as_of, is_invoice: bool):
             "kind": "invoice" if is_invoice else "bill", "due_date": document["due_date"],
             "bucket": bucket, "amount_cents": document["open_balance_cents"],
         })
-    with get_cursor() as cursor:
-        cursor.execute(
-            f"""SELECT p.id payment_id, p.{party_field}, party.name party_name, p.payment_date,
-                       p.amount_cents - COALESCE((SELECT SUM(a.amount_cents)
-                           FROM {allocations_table} a
-                           JOIN {table} ad ON ad.id = a.{table[:-1]}_id
-                           WHERE a.payment_id = p.id AND ad.{date_field} <= ?), 0) -
-                       COALESCE((SELECT SUM(r.amount_cents) FROM {refunds_table} r
-                           WHERE r.payment_id = p.id AND r.refund_date <= ?), 0) open_credit_cents
-                FROM {payments_table} p JOIN {party_table} party ON party.id = p.{party_field}
-                WHERE p.client_id = ? AND p.payment_date <= ?
-                  AND NOT (p.status = 'voided' AND EXISTS (
-                      SELECT 1 FROM journal_entries vje
-                      WHERE vje.id = p.voided_journal_entry_id AND vje.entry_date <= ?))
-                ORDER BY p.payment_date, p.id""",
-            (as_of.isoformat(), as_of.isoformat(), client_id, as_of.isoformat(), as_of.isoformat()),
-        )
-        credits = [dict(row) for row in cursor.fetchall()]
-    for credit in credits:
-        if credit["open_credit_cents"] > 0:
-            rows.append({
-                "party_id": credit[party_field], "party_name": credit["party_name"],
-                "document_id": credit["payment_id"], "kind": "credit",
-                "due_date": credit["payment_date"], "bucket": "current",
-                "amount_cents": -credit["open_credit_cents"],
-            })
-    if is_invoice:
-        with get_cursor() as cursor:
-            cursor.execute(
-                """SELECT cm.id, cm.customer_id, c.name party_name, cm.memo_date,
-                           COALESCE((SELECT SUM(quantity * unit_price_cents)
-                               FROM credit_memo_lines WHERE credit_memo_id = cm.id), 0) +
-                           cm.tax_amount_cents - COALESCE((SELECT SUM(ca.amount_cents)
-                               FROM credit_applications ca JOIN invoices i ON i.id = ca.invoice_id
-                               WHERE ca.credit_memo_id = cm.id AND cm.memo_date <= ?), 0) remaining
-                     FROM credit_memos cm JOIN customers c ON c.id = cm.customer_id
-                    WHERE cm.client_id = ? AND cm.memo_date <= ? AND cm.status != 'draft'
-                      AND NOT (cm.status = 'voided' AND EXISTS (
-                          SELECT 1 FROM journal_entries vje
-                          WHERE vje.id = cm.voided_journal_entry_id AND vje.entry_date <= ?))
-                    ORDER BY cm.memo_date, cm.id""",
-                (as_of.isoformat(), client_id, as_of.isoformat(), as_of.isoformat()),
-            )
-            memo_credits = [dict(row) for row in cursor.fetchall()]
-        for credit in memo_credits:
-            if credit["remaining"] > 0:
-                rows.append({
-                    "party_id": credit["customer_id"], "party_name": credit["party_name"],
-                    "document_id": credit["id"], "kind": "credit_memo",
-                    "due_date": credit["memo_date"], "bucket": "current",
-                    "amount_cents": -credit["remaining"],
-                })
+    rows.extend(_open_credit_rows(client_id, as_of, is_invoice))
     return rows
 
 
