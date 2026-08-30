@@ -1358,6 +1358,13 @@ def get_income_by_customer(client_id: int, start, end):
                 (end, end, row["customer_id"], client_id, end),
             ).fetchone()["balance"]
             result.append({**dict(row), "open_balance_cents": balance})
+        open_credits = {}
+        for credit in _open_credit_rows(client_id, end, True):
+            open_credits[credit["party_id"]] = (
+                open_credits.get(credit["party_id"], 0) - credit["amount_cents"]
+            )
+        for row in result:
+            row["open_credit_cents"] = open_credits.get(row["customer_id"], 0)
     return result
 
 
@@ -1572,10 +1579,8 @@ def send_invoice_email(invoice_id: int, to_address: str, subject=None, body=None
     return log_id
 
 
-def _aging(client_id: int, as_of, is_invoice: bool):
-    as_of = date.fromisoformat(_iso(as_of, "as_of"))
+def _open_credit_rows(client_id: int, as_of, is_invoice: bool):
     table = "invoices" if is_invoice else "bills"
-    lines_table = "invoice_lines" if is_invoice else "bill_lines"
     party_table = "customers" if is_invoice else "vendors"
     party_field = "customer_id" if is_invoice else "vendor_id"
     date_field = "invoice_date" if is_invoice else "bill_date"
@@ -1583,42 +1588,6 @@ def _aging(client_id: int, as_of, is_invoice: bool):
     payments_table = "payments" if is_invoice else "bill_payments_v2"
     refunds_table = "payment_refunds" if is_invoice else "bill_payment_refunds"
     rows = []
-    with get_cursor() as cursor:
-        cursor.execute(
-            f"""SELECT d.id, d.{party_field}, party.name party_name, d.due_date,
-                       COALESCE((SELECT SUM(quantity * unit_price_cents) FROM {lines_table}
-                                 WHERE {table[:-1]}_id = d.id), 0) + d.tax_amount_cents -
-                       COALESCE((SELECT SUM(a.amount_cents) FROM {allocations_table} a
-                                 JOIN {payments_table} p ON p.id = a.payment_id
-                                 WHERE a.{table[:-1]}_id = d.id AND p.payment_date <= ?
-                                   AND NOT (p.status = 'voided' AND EXISTS (
-                                       SELECT 1 FROM journal_entries pv
-                                       WHERE pv.id = p.voided_journal_entry_id
-                                   AND pv.entry_date <= ?))), 0) -
-                       {"COALESCE((SELECT SUM(ca.amount_cents) FROM credit_applications ca JOIN credit_memos cm ON cm.id = ca.credit_memo_id WHERE ca.invoice_id = d.id AND cm.memo_date <= ? AND cm.status != 'voided'), 0)" if is_invoice else "0"} open_balance_cents
-                FROM {table} d JOIN {party_table} party ON party.id = d.{party_field}
-                WHERE d.client_id = ? AND d.status != 'draft' AND d.{date_field} <= ?
-                  AND NOT (d.status = 'voided' AND EXISTS (
-                      SELECT 1 FROM journal_entries vje
-                      WHERE vje.id = d.voided_journal_entry_id AND vje.entry_date <= ?))
-                ORDER BY d.due_date, d.id""",
-            ((as_of.isoformat(), as_of.isoformat(), as_of.isoformat(), client_id,
-              as_of.isoformat(), as_of.isoformat()) if is_invoice else
-             (as_of.isoformat(), as_of.isoformat(), client_id, as_of.isoformat(),
-              as_of.isoformat())),
-        )
-        documents = [dict(row) for row in cursor.fetchall()]
-    for document in documents:
-        if document["open_balance_cents"] <= 0:
-            continue
-        days = (as_of - date.fromisoformat(document["due_date"])).days
-        bucket = "current" if days <= 30 else "31-60" if days <= 60 else "61-90" if days <= 90 else "90+"
-        rows.append({
-            "party_id": document["customer_id" if is_invoice else "vendor_id"],
-            "party_name": document["party_name"], "document_id": document["id"],
-            "kind": "invoice" if is_invoice else "bill", "due_date": document["due_date"],
-            "bucket": bucket, "amount_cents": document["open_balance_cents"],
-        })
     with get_cursor() as cursor:
         cursor.execute(
             f"""SELECT p.id payment_id, p.{party_field}, party.name party_name, p.payment_date,
@@ -1671,6 +1640,56 @@ def _aging(client_id: int, as_of, is_invoice: bool):
                     "due_date": credit["memo_date"], "bucket": "current",
                     "amount_cents": -credit["remaining"],
                 })
+    return rows
+
+
+def _aging(client_id: int, as_of, is_invoice: bool):
+    as_of = date.fromisoformat(_iso(as_of, "as_of"))
+    table = "invoices" if is_invoice else "bills"
+    lines_table = "invoice_lines" if is_invoice else "bill_lines"
+    party_table = "customers" if is_invoice else "vendors"
+    party_field = "customer_id" if is_invoice else "vendor_id"
+    date_field = "invoice_date" if is_invoice else "bill_date"
+    allocations_table = "payment_allocations" if is_invoice else "bill_payment_allocations"
+    payments_table = "payments" if is_invoice else "bill_payments_v2"
+    rows = []
+    with get_cursor() as cursor:
+        cursor.execute(
+            f"""SELECT d.id, d.{party_field}, party.name party_name, d.due_date,
+                       COALESCE((SELECT SUM(quantity * unit_price_cents) FROM {lines_table}
+                                 WHERE {table[:-1]}_id = d.id), 0) + d.tax_amount_cents -
+                       COALESCE((SELECT SUM(a.amount_cents) FROM {allocations_table} a
+                                 JOIN {payments_table} p ON p.id = a.payment_id
+                                 WHERE a.{table[:-1]}_id = d.id AND p.payment_date <= ?
+                                   AND NOT (p.status = 'voided' AND EXISTS (
+                                       SELECT 1 FROM journal_entries pv
+                                       WHERE pv.id = p.voided_journal_entry_id
+                                   AND pv.entry_date <= ?))), 0) -
+                       {"COALESCE((SELECT SUM(ca.amount_cents) FROM credit_applications ca JOIN credit_memos cm ON cm.id = ca.credit_memo_id WHERE ca.invoice_id = d.id AND cm.memo_date <= ? AND cm.status != 'voided'), 0)" if is_invoice else "0"} open_balance_cents
+                FROM {table} d JOIN {party_table} party ON party.id = d.{party_field}
+                WHERE d.client_id = ? AND d.status != 'draft' AND d.{date_field} <= ?
+                  AND NOT (d.status = 'voided' AND EXISTS (
+                      SELECT 1 FROM journal_entries vje
+                      WHERE vje.id = d.voided_journal_entry_id AND vje.entry_date <= ?))
+                ORDER BY d.due_date, d.id""",
+            ((as_of.isoformat(), as_of.isoformat(), as_of.isoformat(), client_id,
+              as_of.isoformat(), as_of.isoformat()) if is_invoice else
+             (as_of.isoformat(), as_of.isoformat(), client_id, as_of.isoformat(),
+              as_of.isoformat())),
+        )
+        documents = [dict(row) for row in cursor.fetchall()]
+    for document in documents:
+        if document["open_balance_cents"] <= 0:
+            continue
+        days = (as_of - date.fromisoformat(document["due_date"])).days
+        bucket = "current" if days <= 30 else "31-60" if days <= 60 else "61-90" if days <= 90 else "90+"
+        rows.append({
+            "party_id": document["customer_id" if is_invoice else "vendor_id"],
+            "party_name": document["party_name"], "document_id": document["id"],
+            "kind": "invoice" if is_invoice else "bill", "due_date": document["due_date"],
+            "bucket": bucket, "amount_cents": document["open_balance_cents"],
+        })
+    rows.extend(_open_credit_rows(client_id, as_of, is_invoice))
     return rows
 
 

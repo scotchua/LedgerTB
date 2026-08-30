@@ -144,8 +144,9 @@ def test_ar_ap_reports_hand_computed_void_credit_and_on_account_cases(
     assert income == [{"customer_id": customer.id, "customer_name": "Report Customer",
                        "invoice_count": 2, "subtotal_cents": 15000,
                        "total_cents": 16000, "total_paid_cents": 7200,
-                       "open_balance_cents": 8800}]
-    assert sum(row["open_balance_cents"] for row in income) == sum(
+                       "open_balance_cents": 8800, "open_credit_cents": 2000}]
+    assert (sum(row["open_balance_cents"] for row in income)
+            - sum(row["open_credit_cents"] for row in income)) == sum(
         row["amount_cents"] for row in get_ar_aging(client_id, date(2026, 12, 31))
     )
 

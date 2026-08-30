@@ -157,9 +157,14 @@ if selected_report in {"Sales Tax", "Income by Customer"}:
         st.write({key: f"${to_dollars(value):,.2f}" for key, value in report.items()
                   if key.endswith("_cents")})
     else:
-        st.dataframe(pd.DataFrame(get_income_by_customer(
-            client_id, report_start, report_end
-        )), hide_index=True, width="stretch")
+        income = pd.DataFrame(get_income_by_customer(client_id, report_start, report_end))
+        for column in ("open_balance_cents", "open_credit_cents"):
+            if column in income:
+                income[column] = income[column].map(lambda value: f"${to_dollars(value):,.2f}")
+        st.dataframe(income.rename(columns={
+            "open_balance_cents": "Open invoice balance",
+            "open_credit_cents": "Open credits",
+        }), hide_index=True, width="stretch")
 elif selected_report == "1099 Summary":
     st.subheader("1099 Summary")
     year = st.number_input("Calendar year", min_value=2000, max_value=2100,
