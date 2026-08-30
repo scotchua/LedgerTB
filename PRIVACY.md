@@ -1,6 +1,6 @@
 # LedgerTB Privacy & Data Practices
 
-Effective: August 13, 2026
+Effective: August 30, 2026
 
 This notice explains the data practices of LedgerTB's official desktop builds,
 the LedgerTB marketing website, and the public LedgerTB repository maintained
@@ -38,16 +38,31 @@ your device or storage system.
 
 ## Optional AI categorization and document parsing
 
-LedgerTB operates without an AI API key. If you enable Anthropic-powered
-features, LedgerTB sends the data described in the consent or explanatory text
-shown beside that feature. Depending on the feature, that may include dates,
-descriptions, amounts, account names and numbers, transaction details, or text
-extracted from a statement. Your Anthropic API key is stored in the operating
-system credential vault when saved in the app.
+LedgerTB operates without an AI API key. If you enable AI-powered features,
+LedgerTB sends the data described in the consent or explanatory text shown
+beside that feature to the provider you select: Anthropic or OpenAI. Depending
+on the feature, that may include dates, descriptions, amounts, account names
+and numbers, transaction details, or text extracted from a statement. Provider
+API keys saved in the app are stored in the operating system credential vault.
 
-Those requests are made directly from your computer to Anthropic and are
-governed by your Anthropic account, agreement, and selected service settings.
-Ledger Labs LLC does not receive those requests.
+Those requests are made directly from your computer to the selected provider
+and are governed by your provider account, agreement, and selected service
+settings. Ledger Labs LLC does not receive those requests.
+
+## Optional SimpleFIN bank feeds
+
+To connect a SimpleFIN bank feed, LedgerTB sends the SimpleFIN access credential
+to the SimpleFIN bridge over HTTPS. SimpleFIN returns account and transaction
+data, which LedgerTB stages for your review. The access credential is stored in
+the operating system credential vault. Ledger Labs LLC does not receive or
+route the credential, account data, or transaction data.
+
+## Optional invoice email
+
+If you configure SMTP and send an invoice, LedgerTB sends the invoice PDF and
+message to the recipients you enter through your SMTP server. SMTP credentials
+saved in the app are stored in the operating system credential vault. Every
+send attempt, successful or failed, is logged in the local book.
 
 ## Optional MCP assistant access
 

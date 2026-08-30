@@ -63,6 +63,29 @@ def test_api_key_setup_lives_on_firm_settings_not_data_safety(db, monkeypatch):
     assert any("AI categorization" in s.value for s in firm.subheader)
 
 
+def test_ai_provider_selector_round_trips_through_vault(
+    db, monkeypatch, fake_credential_vault
+):
+    _patched(monkeypatch)
+    firm = AppTest.from_file(
+        page_path("pages/12_Firm_Settings.py"), default_timeout=30
+    ).run()
+
+    selector = firm.selectbox(key="firm_settings_ai_provider")
+    assert selector.value == "Anthropic"
+    selector.select("OpenAI").run()
+
+    assert not firm.exception
+    assert fake_credential_vault["firm:ai_provider"] == "openai"
+    assert firm.selectbox(key="firm_settings_ai_provider").value == "OpenAI"
+    from services.categorization import CategorizationService
+    service = CategorizationService()
+    assert service.provider.name == "openai"
+    warnings = " ".join(w.value for w in firm.warning)
+    assert "ACTIVE: OpenAI" in warnings
+    assert "no API key configured" in warnings
+
+
 def test_plaintext_migration_copy_can_be_removed_from_data_safety(db, monkeypatch):
     import sqlite3
 

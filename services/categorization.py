@@ -9,7 +9,23 @@ from config import (
 from constants import DEFAULT_MISC_EXPENSE_ACCOUNT, DEFAULT_OTHER_INCOME_ACCOUNT
 from models.account import Account
 from services.ai_providers import ProviderSpec, create_request, get_provider
+from utils import secure_store
 from utils.untrusted import flatten_untrusted, untrusted_block
+
+
+AI_PROVIDER_SECRET_NAME = "firm:ai_provider"
+
+
+def selected_ai_provider() -> str:
+    """Resolve the firm choice before the environment-backed default."""
+    return secure_store.get_secret(AI_PROVIDER_SECRET_NAME) or AI_PROVIDER or "anthropic"
+
+
+def provider_api_key(name: str) -> str:
+    """Read the selected provider's current environment or vault key."""
+    if name == "anthropic":
+        return ANTHROPIC_API_KEY or secure_store.get_secret("anthropic_api_key") or ""
+    return OPENAI_API_KEY or secure_store.get_secret("openai_api_key") or ""
 
 
 # Forces the model to return structured, schema-valid output instead of free
@@ -58,14 +74,12 @@ class CategorizationService:
         self.client = None
         self.configuration_error = None
         try:
-            registered = get_provider(AI_PROVIDER)
+            registered = get_provider(selected_ai_provider())
             model = ANTHROPIC_MODEL if registered.name == "anthropic" else OPENAI_MODEL
             self.provider = ProviderSpec(
                 registered.name, registered.wire_format, registered.base_url, model
             )
-            api_key = (
-                ANTHROPIC_API_KEY if registered.name == "anthropic" else OPENAI_API_KEY
-            )
+            api_key = provider_api_key(registered.name)
             if not api_key:
                 raise ValueError(
                     f"No API key is configured for selected AI provider "
