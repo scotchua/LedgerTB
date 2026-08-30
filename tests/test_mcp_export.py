@@ -12,6 +12,7 @@ from pathlib import Path
 
 import openpyxl
 import pytest
+import pypdfium2 as pdfium
 
 from database import connection as dbconn
 from database.connection import get_connection
@@ -32,6 +33,35 @@ def _seed(client_id, accounts):
                [(accounts["cash"], 500, 0), (accounts["revenue"], 0, 500)])
     post_entry(client_id, date(2026, 2, 3),
                [(accounts["expense"], 120, 0), (accounts["cash"], 0, 120)])
+
+
+def _pdf_text(payload):
+    document = pdfium.PdfDocument(payload)
+    try:
+        return "\n".join(
+            document[index].get_textpage().get_text_range()
+            for index in range(len(document))
+        )
+    finally:
+        document.close()
+
+
+def _export_state(client_id, directory):
+    conn = get_connection()
+    try:
+        audit = conn.execute(
+            "SELECT id FROM document_audits WHERE client_id = ?",
+            (client_id,),
+        ).fetchone()
+        completion = conn.execute(
+            "SELECT id FROM audit_log WHERE client_id = ? "
+            "AND table_name = 'close_package_issued'",
+            (client_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    final_files = list(directory.glob("*.pdf")) + list(directory.glob("*.xlsx"))
+    return audit, completion, final_files
 
 
 def test_export_refused_without_roots(client_id, accounts, tmp_path, monkeypatch):
@@ -119,11 +149,98 @@ def test_export_writes_both_files_at_read_level(client_id, accounts, tmp_path,
     assert audit["canonicalization_version"] == SNAPSHOT_CANONICALIZATION_VERSION
     assert audit_log is not None
     assert audit_log["record_id"] == audit["id"]
+    conn = get_connection()
+    try:
+        completion = conn.execute(
+            "SELECT record_id FROM audit_log "
+            "WHERE client_id = ? AND table_name = 'close_package_issued'",
+            (client_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert completion is not None
+    assert completion["record_id"] == audit["id"]
+
+    text = _pdf_text(pdf)
+    assert f"Document Audits, ID {audit['id']}" in text
+    assert "Document Audits, ID None" not in text
 
     # The export is audit-logged even at read level.
     monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", None)
     counts = AuditLog.get_filtered_counts(client_id)
     assert counts["total"] > 0
+
+
+def test_failure_after_audit_reservation_leaves_no_issued_files(
+    client_id, accounts, tmp_path, monkeypatch
+):
+    _seed(client_id, accounts)
+    monkeypatch.setenv("LEDGERTB_MCP_EXPORT_ROOTS", str(tmp_path))
+    target = tmp_path / "binder-src"
+
+    def fail_before_temp_write(*args, **kwargs):
+        raise RuntimeError("before file rename")
+
+    monkeypatch.setattr(mcp_tools, "_write_private_temp", fail_before_temp_write)
+    with pytest.raises(RuntimeError, match="before file rename"):
+        mcp_tools.export_close_package(
+            client_id, "2026-01-01", "2026-03-31", str(target)
+        )
+
+    audit, completion, final_files = _export_state(client_id, target)
+    assert audit is not None
+    assert completion is None
+    assert final_files == []
+
+
+def test_render_failure_leaves_no_final_or_temporary_files(
+    client_id, accounts, tmp_path, monkeypatch
+):
+    _seed(client_id, accounts)
+    monkeypatch.setenv("LEDGERTB_MCP_EXPORT_ROOTS", str(tmp_path))
+    target = tmp_path / "binder-src"
+
+    def failed_render(*args, **kwargs):
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(
+        "services.close_package.SimpleDocTemplate.build", failed_render
+    )
+    with pytest.raises(RuntimeError, match="render failed"):
+        mcp_tools.export_close_package(
+            client_id, "2026-01-01", "2026-03-31", str(target)
+        )
+
+    audit, completion, final_files = _export_state(client_id, target)
+    assert audit is not None
+    assert completion is None
+    assert final_files == []
+    assert list(target.glob(".*.tmp")) == []
+
+
+def test_second_rename_failure_removes_first_final_file(
+    client_id, accounts, tmp_path, monkeypatch
+):
+    _seed(client_id, accounts)
+    monkeypatch.setenv("LEDGERTB_MCP_EXPORT_ROOTS", str(tmp_path))
+    target = tmp_path / "binder-src"
+    original_replace = Path.replace
+
+    def fail_xlsx_rename(path, destination):
+        if Path(destination).suffix == ".xlsx":
+            raise RuntimeError("xlsx rename failed")
+        return original_replace(path, destination)
+
+    monkeypatch.setattr(Path, "replace", fail_xlsx_rename)
+    with pytest.raises(RuntimeError, match="xlsx rename failed"):
+        mcp_tools.export_close_package(
+            client_id, "2026-01-01", "2026-03-31", str(target)
+        )
+
+    audit, completion, final_files = _export_state(client_id, target)
+    assert audit is not None
+    assert completion is None
+    assert final_files == []
 
 
 def test_the_folder_chosen_in_the_app_beats_the_environment(client_id, accounts,
