@@ -116,9 +116,10 @@ def test_three_cycles_conserve_acquired_cost(client_id, accounts):
             purchase_date + timedelta(days=2),
         )
 
-    ending_inventory = inventory_position(item_id)["value_cents"]
+    ending_position = inventory_position(item_id)
+    assert ending_position["quantity"] == 0
     # 3 cycles * ((3 * 101 cents) + (3 * 100 cents)) = 1,809 cents acquired.
-    assert _control_balance(cogs_id) + ending_inventory == 1809
+    assert _control_balance(cogs_id) == 1809
 
 
 def test_deplete_then_repurchase_starts_a_new_cost_pool(client_id, accounts):
