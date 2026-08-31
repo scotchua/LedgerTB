@@ -35,8 +35,7 @@ def test_create_tables_records_migrations(db):
         "014_assistant_review", "015_review_action", "016_book_identity",
         "017_close_map", "018_client_branding", "019_draft_correction_links",
         "020_book_audit_events", "021_import_batch_reversal",
-        "022_account_grouping", "023_cash_flow_section",
-        "024_document_audits", "025_inventory", "026_bank_connections",
+        "025_inventory", "026_bank_connections",
         "027_bank_connection_syncs", "028_fixed_assets",
         "029_payroll_recording", "030_vendor_email",
         "031_vendor_created_at", "032_ar_ap",
@@ -44,7 +43,12 @@ def test_create_tables_records_migrations(db):
         "035_shared_domain_contracts", "036_ar_ap_allocations",
         "037_payroll_import_staging", "038_invoice_inventory",
         "039_sales_tax_credit_memos", "040_email_log", "041_immutable_journal_entries",
-        "042_ar_ap_chronology"]
+        "042_ar_ap_chronology",
+        # Fork-only migrations live in a reserved 900+ band so upstream's
+        # sequence can never collide with ours again. account_grouping was
+        # already renumbered once (020 -> 022) and crashed every launch.
+        "900_account_grouping", "901_cash_flow_section",
+        "902_document_audits"]
     conn.close()
 
 
@@ -165,21 +169,21 @@ def test_migration_failure_is_atomic(tmp_path, monkeypatch):
 def test_a_migration_renumbered_after_a_book_applied_it_heals_instead_of_crashing(db):
     """Reproduces a real failure: account_grouping shipped as
     020_account_grouping.sql, then that file was renamed to
-    022_account_grouping.sql before release. A book that already ran it
+    900_account_grouping.sql before release. A book that already ran it
     under the old name has the column but no tracking row for the new
     filename, so create_tables tried to add the column again and crashed
     every launch with "duplicate column name: account_grouping".
     """
     conn = get_connection()
     conn.execute(
-        "DELETE FROM schema_migrations WHERE version = '022_account_grouping'"
+        "DELETE FROM schema_migrations WHERE version = '900_account_grouping'"
     )
     conn.commit()
 
     create_tables(conn)  # must not raise
 
     cur = conn.execute(
-        "SELECT version FROM schema_migrations WHERE version = '022_account_grouping'"
+        "SELECT version FROM schema_migrations WHERE version = '900_account_grouping'"
     )
     assert cur.fetchone() is not None
     cur = conn.execute("PRAGMA table_info(accounts)")
