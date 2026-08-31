@@ -11,80 +11,114 @@ def _month_end(value: date) -> date:
     return value.replace(day=calendar.monthrange(value.year, value.month)[1])
 
 
-def depreciation_amount_cents(asset: FixedAsset, period_end: date) -> int:
+def _depreciation_amount_cents(conn, fixed_asset_id: int, period_end: date) -> int:
     """Return one month's depreciation using a full-month convention.
 
     An asset receives a full month in its in-service month, with its first
     eligible date being that calendar month-end. Day-level proration is not
     used; callers must supply a calendar month-end.
     """
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM fixed_assets WHERE id = ?", (fixed_asset_id,))
+    asset_row = cursor.fetchone()
+    if not asset_row:
+        raise ValueError("Fixed asset not found.")
+    asset = FixedAsset._from_row(asset_row)
+
     if period_end != _month_end(period_end):
         raise ValueError("Depreciation period_end must be a calendar month-end.")
     if asset.status != "registered":
         raise ValueError("Disposed assets cannot be depreciated.")
     if period_end < _month_end(asset.in_service_date):
         raise ValueError("Depreciation cannot precede the in-service month.")
-    with get_cursor() as cursor:
-        cursor.execute(
-            "SELECT MAX(period_end) latest, COUNT(*) run_count "
-            "FROM depreciation_runs "
-            "WHERE fixed_asset_id = ?", (asset.id,))
-        run_summary = cursor.fetchone()
-        latest = run_summary["latest"]
-    if latest and period_end <= date.fromisoformat(latest):
+    cursor.execute(
+        "SELECT MAX(period_end) latest, COUNT(*) run_count, "
+        "COALESCE(SUM(amount_cents), 0) accumulated_cents "
+        "FROM depreciation_runs WHERE fixed_asset_id = ?", (asset.id,))
+    run_summary = cursor.fetchone()
+    latest = run_summary["latest"]
+    if latest and period_end == date.fromisoformat(latest):
+        raise ValueError("Depreciation has already been run for this asset and period.")
+    if latest and period_end < date.fromisoformat(latest):
         raise ValueError("Depreciation periods must be run in chronological order.")
-    remaining = asset.book_value_cents - asset.salvage_value_cents
+    remaining = (asset.cost_cents - int(run_summary["accumulated_cents"])
+                 - asset.salvage_value_cents)
     if remaining <= 0:
         raise ValueError("Asset is already at its salvage value.")
-    asset_type = FixedAssetType.get_by_id(asset.fixed_asset_type_id, asset.client_id)
+    cursor.execute(
+        "SELECT * FROM fixed_asset_types WHERE id = ? AND client_id = ?",
+        (asset.fixed_asset_type_id, asset.client_id),
+    )
+    type_row = cursor.fetchone()
+    if not type_row:
+        raise ValueError("Fixed asset type not found.")
+    asset_type = FixedAssetType._from_row(type_row)
     if asset_type.method == "straight_line":
         if run_summary["run_count"] + 1 >= asset_type.effective_life_months:
             return remaining
         monthly = (Decimal(asset.cost_cents - asset.salvage_value_cents)
                    / Decimal(asset_type.effective_life_months))
     else:
-        monthly = (Decimal(asset.book_value_cents) * Decimal(str(asset_type.annual_rate))
+        book_value_cents = asset.cost_cents - int(run_summary["accumulated_cents"])
+        monthly = (Decimal(book_value_cents) * Decimal(str(asset_type.annual_rate))
                    / Decimal(12))
     amount = int(monthly.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
     return min(max(amount, 1), remaining)
+
+
+def depreciation_amount_cents(asset: FixedAsset, period_end: date, conn=None) -> int:
+    """Return the next depreciation amount from current persisted state."""
+    owns_connection = conn is None
+    conn = conn or get_connection()
+    try:
+        return _depreciation_amount_cents(conn, asset.id, period_end)
+    finally:
+        if owns_connection:
+            conn.close()
 
 
 def run_depreciation(fixed_asset_id: int, period_end: date) -> int:
     from models.audit_log import AuditLog
     from models.journal_entry import JournalEntry, JournalEntryLine
 
-    asset = FixedAsset.get_by_id(fixed_asset_id)
-    if asset is None:
-        raise ValueError("Fixed asset not found.")
-    with get_cursor() as cursor:
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM fixed_assets WHERE id = ?", (fixed_asset_id,))
+        asset_row = cursor.fetchone()
+        if not asset_row:
+            raise ValueError("Fixed asset not found.")
+        asset = FixedAsset._from_row(asset_row)
         cursor.execute(
             "SELECT 1 FROM depreciation_runs WHERE fixed_asset_id = ? AND period_end = ?",
             (fixed_asset_id, period_end.isoformat()),
         )
         if cursor.fetchone():
             raise ValueError("Depreciation has already been run for this asset and period.")
-    amount_cents = depreciation_amount_cents(asset, period_end)
-    asset_type = FixedAssetType.get_by_id(asset.fixed_asset_type_id, asset.client_id)
-    entry = JournalEntry(
-        client_id=asset.client_id,
-        entry_date=period_end,
-        description=f"Depreciation — {asset.description}",
-        entry_type="Adjusting",
-        source_reference=f"Fixed asset #{asset.id} depreciation",
-        lines=[
-            JournalEntryLine(
-                account_id=asset_type.depreciation_expense_account_id,
-                debit=to_dollars(amount_cents),
-            ),
-            JournalEntryLine(
-                account_id=asset_type.accumulated_depreciation_account_id,
-                credit=to_dollars(amount_cents),
-            ),
-        ],
-    )
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
+        amount_cents = depreciation_amount_cents(asset, period_end, conn=conn)
+        cursor.execute(
+            "SELECT * FROM fixed_asset_types WHERE id = ? AND client_id = ?",
+            (asset.fixed_asset_type_id, asset.client_id),
+        )
+        asset_type = FixedAssetType._from_row(cursor.fetchone())
+        entry = JournalEntry(
+            client_id=asset.client_id,
+            entry_date=period_end,
+            description=f"Depreciation — {asset.description}",
+            entry_type="Adjusting",
+            source_reference=f"Fixed asset #{asset.id} depreciation",
+            lines=[
+                JournalEntryLine(
+                    account_id=asset_type.depreciation_expense_account_id,
+                    debit=to_dollars(amount_cents),
+                ),
+                JournalEntryLine(
+                    account_id=asset_type.accumulated_depreciation_account_id,
+                    credit=to_dollars(amount_cents),
+                ),
+            ],
+        )
         entry_id = entry.save(conn=conn)
         cursor.execute(
             """INSERT INTO depreciation_runs
@@ -112,56 +146,81 @@ def run_depreciation(fixed_asset_id: int, period_end: date) -> int:
 
 def dispose_asset(fixed_asset_id: int, disposal_date: date, proceeds_cents: int,
                   deposit_account_id: int, gain_loss_account_id: int) -> int:
-    from models.account import Account
     from models.audit_log import AuditLog
     from models.journal_entry import JournalEntry, JournalEntryLine
 
-    asset = FixedAsset.get_by_id(fixed_asset_id)
-    if asset is None:
-        raise ValueError("Fixed asset not found.")
-    if asset.status == "disposed":
-        raise ValueError("Asset has already been disposed.")
-    if disposal_date < asset.in_service_date:
-        raise ValueError("Disposal date cannot precede the in-service date.")
-    if proceeds_cents < 0:
-        raise ValueError("Disposal proceeds cannot be negative.")
-    if (Account.get_by_id(deposit_account_id, asset.client_id) is None
-            or Account.get_by_id(gain_loss_account_id, asset.client_id) is None):
-        raise ValueError("Disposal accounts must belong to the asset's client.")
-    asset_type = FixedAssetType.get_by_id(asset.fixed_asset_type_id, asset.client_id)
-    accumulated = asset.accumulated_depreciation_cents
-    book_value = asset.cost_cents - accumulated
-    gain_loss = proceeds_cents - book_value
-    lines = [
-        JournalEntryLine(account_id=asset_type.asset_account_id,
-                         credit=to_dollars(asset.cost_cents)),
-    ]
-    if accumulated:
-        lines.append(JournalEntryLine(
-            account_id=asset_type.accumulated_depreciation_account_id,
-            debit=to_dollars(accumulated),
-        ))
-    if proceeds_cents:
-        lines.append(JournalEntryLine(
-            account_id=deposit_account_id, debit=to_dollars(proceeds_cents)))
-    if gain_loss > 0:
-        lines.append(JournalEntryLine(
-            account_id=gain_loss_account_id, credit=to_dollars(gain_loss)))
-    elif gain_loss < 0:
-        lines.append(JournalEntryLine(
-            account_id=gain_loss_account_id, debit=to_dollars(-gain_loss)))
-
-    entry = JournalEntry(
-        client_id=asset.client_id,
-        entry_date=disposal_date,
-        description=f"Disposal — {asset.description}",
-        entry_type="Adjusting",
-        source_reference=f"Fixed asset #{asset.id} disposal",
-        lines=lines,
-    )
     conn = get_connection()
-    cursor = conn.cursor()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM fixed_assets WHERE id = ?", (fixed_asset_id,))
+        asset_row = cursor.fetchone()
+        if not asset_row:
+            raise ValueError("Fixed asset not found.")
+        asset = FixedAsset._from_row(asset_row)
+        if asset.status == "disposed":
+            raise ValueError("Asset has already been disposed.")
+        if disposal_date < asset.in_service_date:
+            raise ValueError("Disposal date cannot precede the in-service date.")
+        if proceeds_cents < 0:
+            raise ValueError("Disposal proceeds cannot be negative.")
+        cursor.execute(
+            "SELECT COUNT(DISTINCT id) account_count FROM accounts "
+            "WHERE client_id = ? AND id IN (?, ?)",
+            (asset.client_id, deposit_account_id, gain_loss_account_id),
+        )
+        expected_accounts = 1 if deposit_account_id == gain_loss_account_id else 2
+        if cursor.fetchone()["account_count"] != expected_accounts:
+            raise ValueError("Disposal accounts must belong to the asset's client.")
+        cursor.execute(
+            "SELECT * FROM fixed_asset_types WHERE id = ? AND client_id = ?",
+            (asset.fixed_asset_type_id, asset.client_id),
+        )
+        type_row = cursor.fetchone()
+        if not type_row:
+            raise ValueError("Fixed asset type not found.")
+        asset_type = FixedAssetType._from_row(type_row)
+        cursor.execute(
+            "SELECT COALESCE(SUM(amount_cents), 0) accumulated_cents "
+            "FROM depreciation_runs WHERE fixed_asset_id = ? AND period_end <= ?",
+            (asset.id, disposal_date.isoformat()),
+        )
+        accumulated = int(cursor.fetchone()["accumulated_cents"])
+        cursor.execute(
+            "SELECT 1 FROM depreciation_runs WHERE fixed_asset_id = ? AND period_end > ? LIMIT 1",
+            (asset.id, disposal_date.isoformat()),
+        )
+        if cursor.fetchone():
+            raise ValueError("Disposal date cannot precede an existing depreciation run.")
+        book_value = asset.cost_cents - accumulated
+        gain_loss = proceeds_cents - book_value
+        lines = [
+            JournalEntryLine(account_id=asset_type.asset_account_id,
+                             credit=to_dollars(asset.cost_cents)),
+        ]
+        if accumulated:
+            lines.append(JournalEntryLine(
+                account_id=asset_type.accumulated_depreciation_account_id,
+                debit=to_dollars(accumulated),
+            ))
+        if proceeds_cents:
+            lines.append(JournalEntryLine(
+                account_id=deposit_account_id, debit=to_dollars(proceeds_cents)))
+        if gain_loss > 0:
+            lines.append(JournalEntryLine(
+                account_id=gain_loss_account_id, credit=to_dollars(gain_loss)))
+        elif gain_loss < 0:
+            lines.append(JournalEntryLine(
+                account_id=gain_loss_account_id, debit=to_dollars(-gain_loss)))
+
+        entry = JournalEntry(
+            client_id=asset.client_id,
+            entry_date=disposal_date,
+            description=f"Disposal — {asset.description}",
+            entry_type="Adjusting",
+            source_reference=f"Fixed asset #{asset.id} disposal",
+            lines=lines,
+        )
         cursor.execute(
             """UPDATE fixed_assets
                SET status = 'disposed', disposal_date = ?,

@@ -280,7 +280,6 @@ class DraftEntry:
             if cursor.rowcount != 1:
                 raise ValueError("Only a pending draft can be approved.")
 
-            entry_id = entry.save(conn=conn)
             cursor.execute(
                 """SELECT ddl.fixed_asset_id, ddl.period_end, ddl.method,
                           ddl.amount_cents, fa.client_id,
@@ -321,6 +320,24 @@ class DraftEntry:
                     raise ValueError(
                         "Depreciation draft metadata is invalid; nothing was posted."
                     )
+                from services.fixed_assets import _depreciation_amount_cents
+                try:
+                    current_amount = _depreciation_amount_cents(
+                        conn, depreciation["fixed_asset_id"],
+                        _date.fromisoformat(depreciation["period_end"]),
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Depreciation draft is stale: {exc} nothing was posted."
+                    ) from exc
+                if current_amount != depreciation["amount_cents"]:
+                    raise ValueError(
+                        "Depreciation draft is stale because the current amount changed; "
+                        "nothing was posted."
+                    )
+
+            entry_id = entry.save(conn=conn)
+            if depreciation:
                 try:
                     cursor.execute(
                         """INSERT INTO depreciation_runs

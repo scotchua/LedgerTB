@@ -40,10 +40,10 @@ def ar_ap_accounts(client_id, accounts):
 
 
 def _invoice(client_id, customer_id, accounts, amount=10000, due=date(2026, 8, 31), post=True,
-             control=None):
+             control=None, invoice_date=date(2026, 8, 1)):
     invoice = create_invoice(client_id, customer_id, [{"description": "Work", "quantity": 1,
         "unit_price_cents": amount, "revenue_account_id": accounts["revenue"]}],
-        date(2026, 8, 1), due)
+        invoice_date, due)
     if post:
         post_invoice(invoice.id, control or accounts["ar"])
     return invoice
@@ -105,10 +105,9 @@ def test_ar_ap_reports_hand_computed_void_credit_and_on_account_cases(
         "unit_price_cents": 10000, "revenue_account_id": ar_ap_accounts["revenue"]}],
         date(2026, 1, 10), date(2026, 2, 10), "0.10")
     post_invoice(taxed.id, ar_ap_accounts["ar"], ar_ap_accounts["tax"])
-    untaxed = _invoice(client_id, customer.id, ar_ap_accounts, 5000,
-                       date(2026, 2, 28))
+    untaxed = _invoice(client_id, customer.id, ar_ap_accounts, 5000)
     voided = _invoice(client_id, customer.id, ar_ap_accounts, 9000)
-    void_invoice(voided.id, date(2026, 1, 20))
+    void_invoice(voided.id, date(2026, 8, 20))
     payment = record_customer_payment(client_id, customer.id, date(2026, 1, 15),
         7000, ar_ap_accounts["cash"], [{"invoice_id": taxed.id, "amount_cents": 4000}])
     apply_customer_credit(payment, untaxed.id, 1000)
@@ -500,6 +499,110 @@ def test_credit_apply_and_refund_are_exact(client_id, ar_ap_accounts):
         (ar_ap_accounts["ar"], 500, 0), (ar_ap_accounts["cash"], 0, 500)]
 
 
+def test_ar_ap_chronology_rejects_impossible_dates_without_partial_writes(
+    client_id, ar_ap_accounts,
+):
+    customer = create_customer(client_id, "Chronology Customer")
+    vendor = create_vendor(client_id, "Chronology Vendor")
+    invoice_line = [{"description": "Work", "quantity": 1,
+                     "unit_price_cents": 1000,
+                     "revenue_account_id": ar_ap_accounts["revenue"]}]
+    bill_line = [{"description": "Supplies", "quantity": 1,
+                  "unit_price_cents": 1000,
+                  "expense_account_id": ar_ap_accounts["expense"]}]
+
+    with pytest.raises(ValueError, match="Due date cannot precede"):
+        create_invoice(client_id, customer.id, invoice_line,
+                       date(2026, 8, 10), date(2026, 8, 9))
+    with pytest.raises(ValueError, match="Due date cannot precede"):
+        create_bill(client_id, vendor.id, bill_line,
+                    date(2026, 8, 10), date(2026, 8, 9))
+    assert _scalar("SELECT COUNT(*) FROM invoices") == 0
+    assert _scalar("SELECT COUNT(*) FROM bills") == 0
+
+    invoice = create_invoice(client_id, customer.id, invoice_line,
+                             date(2026, 8, 10), date(2026, 9, 10))
+    invoice = post_invoice(invoice.id, ar_ap_accounts["ar"])
+    payment_id = record_customer_payment(
+        client_id, customer.id, date(2026, 8, 15), 1000,
+        ar_ap_accounts["cash"], [],
+    )
+    entries_before = _scalar("SELECT COUNT(*) FROM journal_entries")
+    audit_before = _scalar("SELECT COUNT(*) FROM audit_log")
+    with pytest.raises(ValueError, match="Refund date cannot precede"):
+        refund_customer_credit(payment_id, 100, ar_ap_accounts["cash"],
+                               date(2026, 8, 14))
+    with pytest.raises(ValueError, match="Void date cannot precede"):
+        void_payment(payment_id, date(2026, 8, 14))
+    with pytest.raises(ValueError, match="Void date cannot precede"):
+        void_invoice(invoice.id, date(2026, 8, 9))
+    assert _scalar("SELECT COUNT(*) FROM journal_entries") == entries_before
+    assert _scalar("SELECT COUNT(*) FROM payment_refunds") == 0
+    assert _scalar("SELECT COUNT(*) FROM audit_log") == audit_before
+    assert _scalar("SELECT status FROM payments WHERE id = ?", (payment_id,)) == "recorded"
+    assert _scalar("SELECT status FROM invoices WHERE id = ?", (invoice.id,)) == "posted"
+
+    with pytest.raises(ValueError, match="Credit memo date cannot precede"):
+        create_credit_memo(
+            client_id, customer.id, invoice_line, date(2026, 8, 9),
+            original_invoice_id=invoice.id,
+        )
+    assert _scalar("SELECT COUNT(*) FROM credit_memos") == 0
+
+
+def test_historical_aging_uses_allocation_effective_date(client_id, ar_ap_accounts):
+    customer = create_customer(client_id, "Effective Date Customer")
+    invoice = create_invoice(
+        client_id, customer.id,
+        [{"description": "January work", "quantity": 1,
+          "unit_price_cents": 1000,
+          "revenue_account_id": ar_ap_accounts["revenue"]}],
+        date(2026, 1, 15), date(2026, 2, 15),
+    )
+    invoice = post_invoice(invoice.id, ar_ap_accounts["ar"])
+    payment_id = record_customer_payment(
+        client_id, customer.id, date(2026, 1, 10), 1000,
+        ar_ap_accounts["cash"], [],
+    )
+    with pytest.raises(ValueError, match="cannot precede the payment or document"):
+        apply_customer_credit(payment_id, invoice.id, 1000, date(2026, 1, 14))
+    application_id = apply_customer_credit(
+        payment_id, invoice.id, 1000, date(2026, 1, 20)
+    )
+    assert _scalar(
+        "SELECT application_date FROM payment_allocations WHERE id = ?",
+        (application_id,),
+    ) == "2026-01-20"
+
+    before_application = get_ar_aging(client_id, date(2026, 1, 16))
+    assert {(row["kind"], row["amount_cents"]) for row in before_application} == {
+        ("invoice", 1000), ("credit", -1000),
+    }
+    assert get_ar_aging(client_id, date(2026, 1, 21)) == []
+
+    future_customer = create_customer(client_id, "Initial Allocation Customer")
+    future_invoice = create_invoice(
+        client_id, future_customer.id,
+        [{"description": "Future invoice", "quantity": 1,
+          "unit_price_cents": 500,
+          "revenue_account_id": ar_ap_accounts["revenue"]}],
+        date(2026, 3, 15), date(2026, 4, 15),
+    )
+    future_invoice = post_invoice(future_invoice.id, ar_ap_accounts["ar"])
+    future_payment = record_customer_payment(
+        client_id, future_customer.id, date(2026, 3, 10), 500,
+        ar_ap_accounts["cash"],
+        [{"invoice_id": future_invoice.id, "amount_cents": 500}],
+    )
+    assert _scalar(
+        "SELECT application_date FROM payment_allocations WHERE payment_id = ?",
+        (future_payment,),
+    ) == "2026-03-15"
+    assert get_ar_aging(client_id, date(2026, 3, 12))[-1]["amount_cents"] == -500
+    assert not [row for row in get_ar_aging(client_id, date(2026, 3, 16))
+                if row["party_id"] == future_customer.id]
+
+
 def test_fully_unallocated_payment_is_open_credit(client_id, ar_ap_accounts):
     customer = create_customer(client_id, "Unallocated Customer")
     invoice = _invoice(client_id, customer.id, ar_ap_accounts, 1000)
@@ -622,9 +725,11 @@ def test_void_payment_and_invoice_restore_and_reverse(client_id, ar_ap_accounts)
 
 def test_ar_aging_ties_to_control_account_with_partial_credit_and_void(client_id, ar_ap_accounts):
     customer = create_customer(client_id, "Aging Customer")
-    partial = _invoice(client_id, customer.id, ar_ap_accounts, 10000, date(2026, 7, 1))
+    partial = _invoice(client_id, customer.id, ar_ap_accounts, 10000,
+                       date(2026, 7, 1), invoice_date=date(2026, 6, 1))
     credit_doc = _invoice(client_id, customer.id, ar_ap_accounts, 1000, date(2026, 8, 15))
-    voided = _invoice(client_id, customer.id, ar_ap_accounts, 2000, date(2026, 5, 1))
+    voided = _invoice(client_id, customer.id, ar_ap_accounts, 2000,
+                      date(2026, 5, 1), invoice_date=date(2026, 4, 1))
     record_customer_payment(client_id, customer.id, date(2026, 8, 20), 7000,
                             ar_ap_accounts["cash"],
                             [{"invoice_id": partial.id, "amount_cents": 4000},
@@ -754,7 +859,7 @@ def test_taxed_invoice_void_reverses_tax_line_and_credit_memo_aging_ties_out(
     customer = create_customer(client_id, "Tax Void Customer")
     taxed = create_invoice(client_id, customer.id, [{"description": "Taxed", "quantity": 1,
         "unit_price_cents": 10000, "revenue_account_id": ar_ap_accounts["revenue"]}],
-        tax_rate="0.0650")
+        date(2026, 8, 1), date(2026, 8, 31), tax_rate="0.0650")
     taxed = post_invoice(taxed.id, ar_ap_accounts["ar"], ar_ap_accounts["tax"])
     reversal = void_invoice(taxed.id, date(2026, 8, 20))
     assert _entry_lines(reversal) == [(account, credit, debit)

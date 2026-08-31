@@ -153,6 +153,8 @@ def _create_document(client_id: int, party_id: int, lines: Iterable, document_da
     line_type, document_type = (InvoiceLine, Invoice) if is_invoice else (BillLine, Bill)
     document_date = _iso(document_date or date.today(), date_field)
     due_date = _iso(due_date or document_date, "due_date")
+    if due_date < document_date:
+        raise ValueError("Due date cannot precede the document date.")
     document_lines = _coerce_lines(lines, line_type, account_field)
     tax_rate, tax_amount_cents = _tax_values(document_lines, tax_rate)
     conn = get_connection()
@@ -468,6 +470,7 @@ def _record_payment(client_id: int, party_id: int, payment_date, amount_cents: i
     table = "invoices" if is_invoice else "bills"
     party_field = "customer_id" if is_invoice else "vendor_id"
     document_field = "invoice_id" if is_invoice else "bill_id"
+    date_field = "invoice_date" if is_invoice else "bill_date"
     payments_table = "payments" if is_invoice else "bill_payments_v2"
     allocations_table = "payment_allocations" if is_invoice else "bill_payment_allocations"
     money_field = "deposit_account_id" if is_invoice else "payment_account_id"
@@ -500,7 +503,8 @@ def _record_payment(client_id: int, party_id: int, payment_date, amount_cents: i
             if allocation_amount > balance:
                 raise ValueError(f"An allocation cannot exceed the {table[:-1]}'s open balance.")
             control_accounts.add(document.control_account_id)
-            documents.append((document, allocation_amount))
+            application_date = max(payment_date, getattr(document, date_field).isoformat())
+            documents.append((document, allocation_amount, application_date))
         if not documents:
             cursor.execute(
                 f"""SELECT DISTINCT control_account_id FROM {table}
@@ -537,21 +541,22 @@ def _record_payment(client_id: int, party_id: int, payment_date, amount_cents: i
              control_account_id, (memo or "").strip() or None, entry.id),
         )
         payment_id = cursor.lastrowid
-        for document, allocation_amount in documents:
+        for document, allocation_amount, application_date in documents:
             cursor.execute(
-                f"INSERT INTO {allocations_table} (payment_id, {document_field}, amount_cents) VALUES (?, ?, ?)",
-                (payment_id, document.id, allocation_amount),
+                f"INSERT INTO {allocations_table} (payment_id, {document_field}, amount_cents, application_date) VALUES (?, ?, ?, ?)",
+                (payment_id, document.id, allocation_amount, application_date),
             )
             allocation_id = cursor.lastrowid
             AuditLog.write(cursor, client_id, allocations_table, allocation_id, "INSERT",
                            new_values={"payment_id": payment_id, document_field: document.id,
-                                       "amount_cents": allocation_amount})
+                                       "amount_cents": allocation_amount,
+                                       "application_date": application_date})
         _after_allocation_insert()
         AuditLog.write(cursor, client_id, payments_table, payment_id, "INSERT",
                        new_values={party_field: party_id, "payment_date": payment_date,
                                    "amount_cents": amount_cents, money_field: money_account_id,
                                    "journal_entry_id": entry.id})
-        for document, _ in documents:
+        for document, _, _ in documents:
             _set_document_status(cursor, client_id, document.id, is_invoice, document.status)
         conn.commit()
         return payment_id
@@ -629,10 +634,12 @@ def _credit_balance(cursor, payment_id: int, is_invoice: bool) -> int:
     return int(row["balance"])
 
 
-def _apply_credit(payment_id: int, record_id: int, amount_cents: int, is_invoice: bool):
+def _apply_credit(payment_id: int, record_id: int, amount_cents: int, is_invoice: bool,
+                  application_date=None):
     table = "invoices" if is_invoice else "bills"
     party_field = "customer_id" if is_invoice else "vendor_id"
     document_field = "invoice_id" if is_invoice else "bill_id"
+    date_field = "invoice_date" if is_invoice else "bill_date"
     payments_table = "payments" if is_invoice else "bill_payments_v2"
     allocations_table = "payment_allocations" if is_invoice else "bill_payment_allocations"
     amount_cents = int(amount_cents)
@@ -658,14 +665,26 @@ def _apply_credit(payment_id: int, record_id: int, amount_cents: int, is_invoice
             raise ValueError("Credit application cannot exceed the remaining on-account credit.")
         if amount_cents > _open_balance(cursor, record_id, is_invoice):
             raise ValueError(f"Credit application cannot exceed the {table[:-1]}'s open balance.")
+        earliest_application_date = max(
+            payment["payment_date"], getattr(document, date_field).isoformat()
+        )
+        if application_date is None:
+            application_date = max(date.today().isoformat(), earliest_application_date)
+        else:
+            application_date = _iso(application_date, "application_date")
+            if application_date < earliest_application_date:
+                raise ValueError(
+                    "Application date cannot precede the payment or document date."
+                )
         cursor.execute(
-            f"INSERT INTO {allocations_table} (payment_id, {document_field}, amount_cents, applied_later) VALUES (?, ?, ?, 1)",
-            (payment_id, record_id, amount_cents),
+            f"INSERT INTO {allocations_table} (payment_id, {document_field}, amount_cents, applied_later, application_date) VALUES (?, ?, ?, 1, ?)",
+            (payment_id, record_id, amount_cents, application_date),
         )
         allocation_id = cursor.lastrowid
         AuditLog.write(cursor, document.client_id, allocations_table, allocation_id, "INSERT",
                        new_values={"payment_id": payment_id, document_field: record_id,
-                                   "amount_cents": amount_cents})
+                                   "amount_cents": amount_cents,
+                                   "application_date": application_date})
         _set_document_status(cursor, document.client_id, record_id, is_invoice, document.status)
         conn.commit()
         return allocation_id
@@ -676,12 +695,14 @@ def _apply_credit(payment_id: int, record_id: int, amount_cents: int, is_invoice
         conn.close()
 
 
-def apply_customer_credit(payment_id: int, invoice_id: int, amount_cents: int) -> int:
-    return _apply_credit(payment_id, invoice_id, amount_cents, True)
+def apply_customer_credit(payment_id: int, invoice_id: int, amount_cents: int,
+                          application_date=None) -> int:
+    return _apply_credit(payment_id, invoice_id, amount_cents, True, application_date)
 
 
-def apply_vendor_credit(payment_id: int, bill_id: int, amount_cents: int) -> int:
-    return _apply_credit(payment_id, bill_id, amount_cents, False)
+def apply_vendor_credit(payment_id: int, bill_id: int, amount_cents: int,
+                        application_date=None) -> int:
+    return _apply_credit(payment_id, bill_id, amount_cents, False, application_date)
 
 
 def _refund_credit(payment_id: int, amount_cents: int, money_account_id: int,
@@ -700,6 +721,8 @@ def _refund_credit(payment_id: int, amount_cents: int, money_account_id: int,
         payment = cursor.fetchone()
         if not payment or payment["status"] != "recorded":
             raise ValueError("Payment not found or already voided.")
+        if refund_date < payment["payment_date"]:
+            raise ValueError("Refund date cannot precede the payment date.")
         if amount_cents > _credit_balance(cursor, payment_id, is_invoice):
             raise ValueError("Refund cannot exceed the remaining on-account credit.")
         control_account_id = payment["control_account_id"]
@@ -749,6 +772,16 @@ def refund_vendor_credit(payment_id: int, amount_cents: int, from_account_id: in
 
 def _reversal_entry(cursor, client_id: int, original_entry_id: int, reversal_date,
                     description: str, source_reference: str):
+    reversal_date = _iso(reversal_date, "void_date")
+    cursor.execute(
+        "SELECT entry_date FROM journal_entries WHERE id = ? AND client_id = ?",
+        (original_entry_id, client_id),
+    )
+    original = cursor.fetchone()
+    if not original:
+        raise ValueError("The original journal entry was not found.")
+    if reversal_date < original["entry_date"]:
+        raise ValueError("Void date cannot precede the original transaction date.")
     cursor.execute(
         "SELECT account_id, debit, credit, memo FROM journal_entry_lines WHERE journal_entry_id = ? ORDER BY id",
         (original_entry_id,),
@@ -757,7 +790,7 @@ def _reversal_entry(cursor, client_id: int, original_entry_id: int, reversal_dat
     if not rows:
         raise ValueError("The original journal entry has no lines to reverse.")
     return JournalEntry(
-        client_id=client_id, entry_date=date.fromisoformat(_iso(reversal_date, "void_date")),
+        client_id=client_id, entry_date=date.fromisoformat(reversal_date),
         description=description, source_reference=source_reference,
         lines=[JournalEntryLine(account_id=row["account_id"], debit=to_dollars(row["credit"]),
                                 credit=to_dollars(row["debit"]), memo=row["memo"])
@@ -969,11 +1002,13 @@ def create_credit_memo(client_id: int, customer_id: int, lines: Iterable, memo_d
         if not cursor.fetchone():
             raise ValueError("The customer must belong to this client.")
         if original_invoice_id is not None:
-            cursor.execute("SELECT client_id, customer_id FROM invoices WHERE id = ?",
+            cursor.execute("SELECT client_id, customer_id, invoice_date FROM invoices WHERE id = ?",
                            (original_invoice_id,))
             original = cursor.fetchone()
             if not original or original["client_id"] != client_id or original["customer_id"] != customer_id:
                 raise ValueError("The original invoice must belong to the same client and customer.")
+            if memo_date < original["invoice_date"]:
+                raise ValueError("Credit memo date cannot precede the original invoice date.")
         for line in memo_lines:
             _assert_account(cursor, client_id, line.revenue_account_id, "Revenue")
         cursor.execute(
@@ -1086,7 +1121,8 @@ def _credit_memo_balance(cursor, memo_id: int) -> int:
     return int(row["balance"])
 
 
-def apply_credit_memo(memo_id: int, invoice_id: int, amount_cents: int) -> int:
+def apply_credit_memo(memo_id: int, invoice_id: int, amount_cents: int,
+                      application_date=None) -> int:
     amount_cents = int(amount_cents)
     if amount_cents <= 0:
         raise ValueError("Application amount must be greater than zero.")
@@ -1109,14 +1145,24 @@ def apply_credit_memo(memo_id: int, invoice_id: int, amount_cents: int) -> int:
             raise ValueError("The application cannot exceed the credit memo's remaining balance.")
         if amount_cents > invoice_balance:
             raise ValueError("The application cannot exceed the invoice's open balance.")
+        earliest_application_date = max(memo.memo_date, invoice.invoice_date).isoformat()
+        if application_date is None:
+            application_date = max(date.today().isoformat(), earliest_application_date)
+        else:
+            application_date = _iso(application_date, "application_date")
+            if application_date < earliest_application_date:
+                raise ValueError(
+                    "Application date cannot precede the credit memo or invoice date."
+                )
         cursor.execute(
-            "INSERT INTO credit_applications (credit_memo_id, invoice_id, amount_cents) VALUES (?, ?, ?)",
-            (memo_id, invoice_id, amount_cents),
+            "INSERT INTO credit_applications (credit_memo_id, invoice_id, amount_cents, application_date) VALUES (?, ?, ?, ?)",
+            (memo_id, invoice_id, amount_cents, application_date),
         )
         application_id = cursor.lastrowid
         AuditLog.write(cursor, memo.client_id, "credit_applications", application_id, "INSERT",
                        new_values={"credit_memo_id": memo_id, "invoice_id": invoice_id,
-                                   "amount_cents": amount_cents})
+                                   "amount_cents": amount_cents,
+                                   "application_date": application_date})
         _set_document_status(cursor, memo.client_id, invoice_id, True, invoice.status)
         if _credit_memo_balance(cursor, memo_id) == 0:
             cursor.execute("UPDATE credit_memos SET status = 'applied' WHERE id = ?", (memo_id,))
@@ -1349,11 +1395,11 @@ def get_income_by_customer(client_id: int, start, end):
                       COALESCE(SUM((SELECT SUM(a.amount_cents) FROM payment_allocations a
                                     JOIN payments p ON p.id = a.payment_id
                                     WHERE a.invoice_id = i.id AND p.status != 'voided'
-                                      AND p.payment_date BETWEEN ? AND ?)), 0)
+                                      AND a.application_date BETWEEN ? AND ?)), 0)
                       + COALESCE(SUM((SELECT SUM(ca.amount_cents) FROM credit_applications ca
                                      JOIN credit_memos cm ON cm.id = ca.credit_memo_id
                                      WHERE ca.invoice_id = i.id AND cm.status != 'voided'
-                                       AND cm.memo_date <= ?)), 0) total_paid_cents
+                                       AND ca.application_date <= ?)), 0) total_paid_cents
                FROM customers c JOIN invoices i ON i.customer_id = c.id
                WHERE c.client_id = ? AND i.invoice_date BETWEEN ? AND ?
                  AND i.status NOT IN ('draft', 'voided')
@@ -1369,11 +1415,11 @@ def get_income_by_customer(client_id: int, start, end):
                           - COALESCE((SELECT SUM(a.amount_cents) FROM payment_allocations a
                                       JOIN payments p ON p.id = a.payment_id
                                       WHERE a.invoice_id = i.id AND p.status != 'voided'
-                                        AND p.payment_date <= ?), 0)
+                                        AND a.application_date <= ?), 0)
                           - COALESCE((SELECT SUM(ca.amount_cents) FROM credit_applications ca
                                       JOIN credit_memos cm ON cm.id = ca.credit_memo_id
                                       WHERE ca.invoice_id = i.id AND cm.status != 'voided'
-                                        AND cm.memo_date <= ?), 0)), 0) balance
+                                        AND ca.application_date <= ?), 0)), 0) balance
                    FROM invoices i WHERE i.customer_id = ? AND i.client_id = ?
                      AND i.invoice_date <= ? AND i.status NOT IN ('draft', 'voided')""",
                 (end, end, row["customer_id"], client_id, end),
@@ -1602,10 +1648,8 @@ def send_invoice_email(invoice_id: int, to_address: str, subject=None, body=None
 
 def _open_credit_rows(client_id: int, as_of, is_invoice: bool):
     as_of = _iso(as_of, "as_of")
-    table = "invoices" if is_invoice else "bills"
     party_table = "customers" if is_invoice else "vendors"
     party_field = "customer_id" if is_invoice else "vendor_id"
-    date_field = "invoice_date" if is_invoice else "bill_date"
     allocations_table = "payment_allocations" if is_invoice else "bill_payment_allocations"
     payments_table = "payments" if is_invoice else "bill_payments_v2"
     refunds_table = "payment_refunds" if is_invoice else "bill_payment_refunds"
@@ -1615,8 +1659,7 @@ def _open_credit_rows(client_id: int, as_of, is_invoice: bool):
             f"""SELECT p.id payment_id, p.{party_field}, party.name party_name, p.payment_date,
                        p.amount_cents - COALESCE((SELECT SUM(a.amount_cents)
                            FROM {allocations_table} a
-                           JOIN {table} ad ON ad.id = a.{table[:-1]}_id
-                           WHERE a.payment_id = p.id AND ad.{date_field} <= ?), 0) -
+                           WHERE a.payment_id = p.id AND a.application_date <= ?), 0) -
                        COALESCE((SELECT SUM(r.amount_cents) FROM {refunds_table} r
                            WHERE r.payment_id = p.id AND r.refund_date <= ?), 0) open_credit_cents
                 FROM {payments_table} p JOIN {party_table} party ON party.id = p.{party_field}
@@ -1644,7 +1687,7 @@ def _open_credit_rows(client_id: int, as_of, is_invoice: bool):
                                FROM credit_memo_lines WHERE credit_memo_id = cm.id), 0) +
                            cm.tax_amount_cents - COALESCE((SELECT SUM(ca.amount_cents)
                                FROM credit_applications ca JOIN invoices i ON i.id = ca.invoice_id
-                               WHERE ca.credit_memo_id = cm.id AND cm.memo_date <= ?), 0) remaining
+                               WHERE ca.credit_memo_id = cm.id AND ca.application_date <= ?), 0) remaining
                      FROM credit_memos cm JOIN customers c ON c.id = cm.customer_id
                     WHERE cm.client_id = ? AND cm.memo_date <= ? AND cm.status != 'draft'
                       AND NOT (cm.status = 'voided' AND EXISTS (
@@ -1682,12 +1725,12 @@ def _aging(client_id: int, as_of, is_invoice: bool):
                                  WHERE {table[:-1]}_id = d.id), 0) + d.tax_amount_cents -
                        COALESCE((SELECT SUM(a.amount_cents) FROM {allocations_table} a
                                  JOIN {payments_table} p ON p.id = a.payment_id
-                                 WHERE a.{table[:-1]}_id = d.id AND p.payment_date <= ?
+                                 WHERE a.{table[:-1]}_id = d.id AND a.application_date <= ?
                                    AND NOT (p.status = 'voided' AND EXISTS (
                                        SELECT 1 FROM journal_entries pv
                                        WHERE pv.id = p.voided_journal_entry_id
                                    AND pv.entry_date <= ?))), 0) -
-                       {"COALESCE((SELECT SUM(ca.amount_cents) FROM credit_applications ca JOIN credit_memos cm ON cm.id = ca.credit_memo_id WHERE ca.invoice_id = d.id AND cm.memo_date <= ? AND cm.status != 'voided'), 0)" if is_invoice else "0"} open_balance_cents
+                       {"COALESCE((SELECT SUM(ca.amount_cents) FROM credit_applications ca JOIN credit_memos cm ON cm.id = ca.credit_memo_id WHERE ca.invoice_id = d.id AND ca.application_date <= ? AND cm.status != 'voided'), 0)" if is_invoice else "0"} open_balance_cents
                 FROM {table} d JOIN {party_table} party ON party.id = d.{party_field}
                 WHERE d.client_id = ? AND d.status != 'draft' AND d.{date_field} <= ?
                   AND NOT (d.status = 'voided' AND EXISTS (

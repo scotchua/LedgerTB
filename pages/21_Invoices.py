@@ -13,12 +13,12 @@ from database import init_database
 from database.connection import get_cursor
 from models.account import Account
 from money import to_cents, to_dollars
-from services.ar_ap import (apply_credit_memo, build_invoice_pdf, create_credit_memo, create_customer,
+from services.ar_ap import (apply_credit_memo, apply_customer_credit,
+                            build_invoice_pdf, create_credit_memo, create_customer,
                             create_invoice, list_credit_memos, list_customer_credits,
                             list_invoices, post_credit_memo, post_invoice,
                             record_customer_payment, send_invoice_email,
-                            void_credit_memo, void_invoice,
-                            void_payment)
+                            void_credit_memo, void_invoice, void_payment)
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 
@@ -176,7 +176,46 @@ if credits:
     st.dataframe(pd.DataFrame([{"Payment": row["payment_id"], "Customer": row["party_name"],
         "Credit": f"${to_dollars(row['open_credit_cents']):,.2f}"} for row in credits]),
         hide_index=True, width="stretch")
-    credit_payment = st.selectbox("Payment to void", [row["payment_id"] for row in credits])
+    credit_payment = st.selectbox("Customer credit", [row["payment_id"] for row in credits])
+    selected_credit = next(row for row in credits if row["payment_id"] == credit_payment)
+    credit_invoices = [row for row in rows
+                       if row["customer_id"] == selected_credit["customer_id"]
+                       and row["status"] in ("posted", "partially_paid")
+                       and row["open_balance_cents"] > 0]
+    if credit_invoices:
+        credit_invoice = st.selectbox(
+            "Apply customer credit to invoice",
+            [row["id"] for row in credit_invoices],
+        )
+        selected_credit_invoice = next(
+            row for row in credit_invoices if row["id"] == credit_invoice
+        )
+        maximum_credit = min(
+            selected_credit["open_credit_cents"],
+            selected_credit_invoice["open_balance_cents"],
+        )
+        credit_amount = st.number_input(
+            "Customer credit amount", min_value=0.01,
+            max_value=float(to_dollars(maximum_credit)), step=0.01,
+        )
+        earliest_credit_date = max(
+            date.fromisoformat(selected_credit["payment_date"]),
+            date.fromisoformat(selected_credit_invoice["invoice_date"]),
+        )
+        credit_application_date = st.date_input(
+            "Customer credit application date", max(date.today(), earliest_credit_date),
+            min_value=earliest_credit_date,
+        )
+        if st.button("Apply customer credit"):
+            try:
+                apply_customer_credit(
+                    credit_payment, credit_invoice, to_cents(credit_amount),
+                    credit_application_date,
+                )
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                st.rerun()
     if st.button("Void customer payment"):
         try:
             void_payment(credit_payment, date.today())
@@ -228,9 +267,20 @@ if credit_memos and assets:
     if eligible:
         apply_invoice_id = st.selectbox("Apply credit to invoice", [row["id"] for row in eligible])
         apply_amount = st.number_input("Credit amount to apply", min_value=0.01, step=0.01)
+        selected_apply_invoice = next(row for row in eligible if row["id"] == apply_invoice_id)
+        earliest_memo_application = max(
+            date.fromisoformat(memo["memo_date"]),
+            date.fromisoformat(selected_apply_invoice["invoice_date"]),
+        )
+        memo_application_date = st.date_input(
+            "Credit memo application date",
+            max(date.today(), earliest_memo_application),
+            min_value=earliest_memo_application,
+        )
         if st.button("Apply credit memo"):
             try:
-                apply_credit_memo(memo_id, apply_invoice_id, to_cents(apply_amount))
+                apply_credit_memo(memo_id, apply_invoice_id, to_cents(apply_amount),
+                                  memo_application_date)
             except Exception as exc:
                 st.error(str(exc))
             else:

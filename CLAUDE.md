@@ -33,7 +33,7 @@ custody of anyone's data. Built and maintained with Claude Code.
   `dbconn.ASSISTANT_ACCESS_LEVEL` ("read" / "propose" / "post") scopes an
   authorizer on every connection. read: SELECT + audit_log INSERT.
   propose: + INSERT on the inboxes (`draft_entries`,
-  `imported_transactions`) and setup tables (`clients`, `accounts` —
+  `depreciation_draft_links`, `imported_transactions`) and setup tables (`clients`, `accounts` —
   scaffold, never alter). **No UPDATE is granted at any level** — an
   earlier version of this line claimed propose could UPDATE
   `draft_entries`; it never could, and nothing should "restore" that.

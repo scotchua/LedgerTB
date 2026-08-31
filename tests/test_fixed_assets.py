@@ -144,6 +144,20 @@ def test_disposing_already_disposed_asset_is_refused(client_id, fixed_accounts):
                       fixed_accounts["cash"], fixed_accounts["gain_loss"])
 
 
+def test_disposal_cannot_be_backdated_before_existing_depreciation(
+    client_id, fixed_accounts,
+):
+    asset = _make_asset(client_id, _make_type(client_id, fixed_accounts))
+    run_depreciation(asset.id, date(2026, 1, 31))
+
+    with pytest.raises(ValueError, match="cannot precede an existing depreciation run"):
+        dispose_asset(asset.id, date(2026, 1, 20), 0,
+                      fixed_accounts["cash"], fixed_accounts["gain_loss"])
+
+    assert JournalEntry.count(client_id) == 1
+    assert FixedAsset.get_by_id(asset.id).status == "registered"
+
+
 def test_propose_depreciation_creates_draft_only(client_id, fixed_accounts):
     asset = _make_asset(client_id, _make_type(client_id, fixed_accounts))
     result = mcp_tools.propose_depreciation_run(
@@ -153,6 +167,30 @@ def test_propose_depreciation_creates_draft_only(client_id, fixed_accounts):
     assert result["amount_cents"] == 3000
     assert JournalEntry.count(client_id) == 0
     assert _run_amounts(asset.id) == []
+
+
+def test_depreciation_proposal_respects_engine_access_level(
+    client_id, fixed_accounts, monkeypatch,
+):
+    asset = _make_asset(client_id, _make_type(client_id, fixed_accounts))
+    monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", "read")
+    with pytest.raises(Exception):
+        mcp_tools.propose_depreciation_run(
+            client_id, asset.id, "2026-01-31", "Monthly close"
+        )
+
+    monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", "propose")
+    result = mcp_tools.propose_depreciation_run(
+        client_id, asset.id, "2026-01-31", "Monthly close"
+    )
+    assert result["status"] == "pending"
+    with get_cursor() as cursor:
+        cursor.execute(
+            "SELECT fixed_asset_id, period_end FROM depreciation_draft_links "
+            "WHERE draft_entry_id = ?", (result["draft_id"],),
+        )
+        link = cursor.fetchone()
+    assert (link["fixed_asset_id"], link["period_end"]) == (asset.id, "2026-01-31")
 
 
 def test_approved_depreciation_draft_prevents_second_post(client_id, fixed_accounts):
@@ -206,6 +244,42 @@ def test_period_posted_between_proposal_and_approval_rolls_back(
 
     assert JournalEntry.count(client_id) == 1
     assert _run_amounts(asset.id) == [3000]
+    assert DraftEntry.get_by_id(draft.id, client_id).status == "pending"
+
+
+def test_disposal_between_proposal_and_approval_rejects_stale_depreciation(
+    client_id, fixed_accounts,
+):
+    asset = _make_asset(client_id, _make_type(client_id, fixed_accounts))
+    result = propose_depreciation_run(asset.id, date(2026, 1, 31))
+    dispose_asset(asset.id, date(2026, 1, 20), 0,
+                  fixed_accounts["cash"], fixed_accounts["gain_loss"])
+
+    draft = DraftEntry.get_by_id(result["draft_id"], client_id)
+    with pytest.raises(ValueError, match="stale.*Disposed assets cannot be depreciated"):
+        draft.approve()
+
+    assert JournalEntry.count(client_id) == 1
+    assert _run_amounts(asset.id) == []
+    assert DraftEntry.get_by_id(draft.id, client_id).status == "pending"
+
+
+def test_declining_balance_draft_recomputes_after_earlier_period_posts(
+    client_id, fixed_accounts,
+):
+    asset_type = _make_type(client_id, fixed_accounts,
+                            method="declining_balance", life=None, rate=0.24)
+    asset = _make_asset(client_id, asset_type, cost=100000, salvage=0)
+    result = propose_depreciation_run(asset.id, date(2026, 2, 28))
+    assert result["amount_cents"] == 2000
+    run_depreciation(asset.id, date(2026, 1, 31))
+
+    draft = DraftEntry.get_by_id(result["draft_id"], client_id)
+    with pytest.raises(ValueError, match="current amount changed"):
+        draft.approve()
+
+    assert JournalEntry.count(client_id) == 1
+    assert _run_amounts(asset.id) == [2000]
     assert DraftEntry.get_by_id(draft.id, client_id).status == "pending"
 
 

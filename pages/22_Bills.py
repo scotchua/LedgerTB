@@ -13,7 +13,7 @@ from database import init_database
 from database.connection import get_cursor
 from models.account import Account
 from money import to_cents, to_dollars
-from services.ar_ap import (create_bill, create_vendor, list_bills,
+from services.ar_ap import (apply_vendor_credit, create_bill, create_vendor, list_bills,
                             list_vendor_credits, post_bill, record_vendor_payment,
                             record_sales_tax_remittance, void_bill,
                             void_vendor_payment)
@@ -125,7 +125,42 @@ if credits:
     st.dataframe(pd.DataFrame([{"Payment": row["payment_id"], "Vendor": row["party_name"],
         "Credit": f"${to_dollars(row['open_credit_cents']):,.2f}"} for row in credits]),
         hide_index=True, width="stretch")
-    credit_payment = st.selectbox("Vendor payment to void", [row["payment_id"] for row in credits])
+    credit_payment = st.selectbox("Vendor credit", [row["payment_id"] for row in credits])
+    selected_credit = next(row for row in credits if row["payment_id"] == credit_payment)
+    credit_bills = [row for row in rows
+                    if row["vendor_id"] == selected_credit["vendor_id"]
+                    and row["status"] in ("posted", "partially_paid")
+                    and row["open_balance_cents"] > 0]
+    if credit_bills:
+        credit_bill = st.selectbox(
+            "Apply vendor credit to bill", [row["id"] for row in credit_bills]
+        )
+        selected_credit_bill = next(row for row in credit_bills if row["id"] == credit_bill)
+        maximum_credit = min(
+            selected_credit["open_credit_cents"], selected_credit_bill["open_balance_cents"]
+        )
+        credit_amount = st.number_input(
+            "Vendor credit amount", min_value=0.01,
+            max_value=float(to_dollars(maximum_credit)), step=0.01,
+        )
+        earliest_credit_date = max(
+            date.fromisoformat(selected_credit["payment_date"]),
+            date.fromisoformat(selected_credit_bill["bill_date"]),
+        )
+        credit_application_date = st.date_input(
+            "Vendor credit application date", max(date.today(), earliest_credit_date),
+            min_value=earliest_credit_date,
+        )
+        if st.button("Apply vendor credit"):
+            try:
+                apply_vendor_credit(
+                    credit_payment, credit_bill, to_cents(credit_amount),
+                    credit_application_date,
+                )
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                st.rerun()
     if st.button("Void vendor payment"):
         try:
             void_vendor_payment(credit_payment, date.today())
