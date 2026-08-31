@@ -334,6 +334,29 @@ def _post_document(record_id: int, control_account_id: int, is_invoice: bool,
                         JournalEntryLine(account_id=item["inventory_account_id"],
                                          credit=to_dollars(amount_cents), memo=line.description),
                     ])
+                    # A frozen per-unit cost cannot always extend to the exact
+                    # cost acquired. When this sale empties the shelf, whatever
+                    # the extension could not reach is real cost that belongs in
+                    # COGS, so clear it and leave the inventory account at zero.
+                    residual_cents = (
+                        int(result["value_cents"]) if not result["quantity"] else 0
+                    )
+                    if residual_cents:
+                        residual = to_dollars(abs(residual_cents))
+                        over_recognized = residual_cents < 0
+                        memo = f"{line.description}: rounding residual"
+                        cogs_lines.extend([
+                            JournalEntryLine(
+                                account_id=item["cogs_account_id"],
+                                debit=0 if over_recognized else residual,
+                                credit=residual if over_recognized else 0,
+                                memo=memo),
+                            JournalEntryLine(
+                                account_id=item["inventory_account_id"],
+                                debit=residual if over_recognized else 0,
+                                credit=0 if over_recognized else residual,
+                                memo=memo),
+                        ])
                     movement_ids.append(result["movement_id"])
                 cogs_entry = JournalEntry(
                     client_id=document.client_id, entry_date=document.invoice_date,
@@ -870,7 +893,7 @@ def _void_document(record_id: int, void_date, is_invoice: bool):
                 if line.inventory_item_id is None:
                     continue
                 cursor.execute(
-                    "SELECT id, unit_cost_cents FROM inventory_movements "
+                    "SELECT id, unit_cost_cents, journal_entry_id FROM inventory_movements "
                     "WHERE source_type = 'invoice' AND source_id = ? AND source_line_id = ?",
                     (document.id, line.id),
                 )
@@ -881,7 +904,6 @@ def _void_document(record_id: int, void_date, is_invoice: bool):
                     )
                 inventory_lines.append((line, original))
             if inventory_lines:
-                cogs_lines = []
                 movement_ids = []
                 reversal_date = date.fromisoformat(_iso(void_date, "void_date"))
                 for line, original in inventory_lines:
@@ -891,25 +913,24 @@ def _void_document(record_id: int, void_date, is_invoice: bool):
                         source_type="invoice_void", source_id=document.id,
                         source_line_id=line.id, automatic_journal_entry=False,
                     )
-                    cursor.execute(
-                        "SELECT inventory_account_id, cogs_account_id FROM inventory_items WHERE id = ?",
-                        (line.inventory_item_id,),
-                    )
-                    item = cursor.fetchone()
-                    amount_cents = line.quantity * original["unit_cost_cents"]
-                    cogs_lines.extend([
-                        JournalEntryLine(account_id=item["inventory_account_id"],
-                                         debit=to_dollars(amount_cents), memo=line.description),
-                        JournalEntryLine(account_id=item["cogs_account_id"],
-                                         credit=to_dollars(amount_cents), memo=line.description),
-                    ])
                     movement_ids.append(result["movement_id"])
-                cogs_reversal = JournalEntry(
-                    client_id=document.client_id, entry_date=reversal_date,
-                    description=f"Void inventory sale: invoice #{record_id}",
-                    source_reference=f"Void invoice {record_id}", entry_type="Adjusting",
-                    lines=cogs_lines,
+                # Reverse the original cost entry line by line instead of
+                # recomputing quantity times frozen cost. A sale that emptied
+                # the shelf also posted a rounding residual, and only a true
+                # reversal returns both COGS and inventory to where they were.
+                original_entries = {original["journal_entry_id"]
+                                    for _, original in inventory_lines}
+                if len(original_entries) != 1 or None in original_entries:
+                    raise ValueError(
+                        "This invoice's inventory movements are not linked to one "
+                        "cost-of-goods entry, so the void cannot reverse them safely."
+                    )
+                cogs_reversal = _reversal_entry(
+                    cursor, document.client_id, original_entries.pop(), reversal_date,
+                    f"Void inventory sale: invoice #{record_id}",
+                    f"Void invoice {record_id}",
                 )
+                cogs_reversal.entry_type = "Adjusting"
                 cogs_reversal.save(conn=conn)
                 placeholders = ",".join("?" for _ in movement_ids)
                 cursor.execute(

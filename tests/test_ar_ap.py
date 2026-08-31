@@ -273,9 +273,13 @@ def test_invoice_inventory_post_and_void_use_frozen_cost(client_id, ar_ap_accoun
     assert [(row["quantity"], row["unit_cost_cents"]) for row in reversals] == [
         (2, 1001), (3, 1001),
     ]
+    # Same accounts and same frozen-cost amounts as before; the pairs now read
+    # cost-account-first because the void mirrors the original entry line by
+    # line instead of rebuilding it, which is what also reverses a depleting
+    # sale's rounding residual.
     assert _entry_lines(reversal_entry_id) == [
-        (inventory_id, 2002, 0), (cogs_id, 0, 2002),
-        (inventory_id, 3003, 0), (cogs_id, 0, 3003),
+        (cogs_id, 0, 2002), (inventory_id, 2002, 0),
+        (cogs_id, 0, 3003), (inventory_id, 3003, 0),
     ]
     assert inventory_position(item_id)["quantity"] == 20
 

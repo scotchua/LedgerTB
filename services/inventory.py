@@ -114,7 +114,7 @@ def inventory_position(item_id, through_date=None, conn=None):
             date_filter = " AND movement_date <= ?"
             params.append(_movement_date(through_date).isoformat())
         cursor.execute(
-            "SELECT quantity, unit_cost_cents FROM inventory_movements "
+            "SELECT quantity, unit_cost_cents, movement_type FROM inventory_movements "
             "WHERE inventory_item_id = ?" + date_filter +
             " ORDER BY movement_date, id",
             params,
@@ -124,6 +124,12 @@ def inventory_position(item_id, through_date=None, conn=None):
         average_cents = Decimal("0")
         for row in cursor.fetchall():
             movement_quantity = Decimal(str(row["quantity"]))
+            # A purchase arriving on an empty shelf opens a new cost pool. The
+            # residual the last depletion left behind was already cleared to
+            # COGS when that sale posted, so carrying it into the new pool
+            # would bias its average by a cent.
+            if not quantity and row["movement_type"] == "purchase":
+                value_cents = Decimal("0")
             # Older rows may not have a stored cost; preserve their historical
             # running-average valuation without migrating existing data.
             unit_cost = (
@@ -134,9 +140,10 @@ def inventory_position(item_id, through_date=None, conn=None):
             quantity += movement_quantity
             if quantity < 0:
                 raise ValueError("Inventory movement history cannot produce negative quantity.")
+            # An emptied shelf keeps its signed residual here: it is exactly
+            # what the frozen per-unit costs could not extend to, and it is
+            # what the depleting sale clears to COGS.
             average_cents = value_cents / quantity if quantity else Decimal("0")
-            if not quantity:
-                value_cents = Decimal("0")
         return {
             "quantity": float(quantity),
             "weighted_average_unit_cost_cents": _round_cents(average_cents),
