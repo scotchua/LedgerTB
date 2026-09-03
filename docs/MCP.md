@@ -100,6 +100,24 @@ from an already-running MCP process.
   changes no report until a person accepts it. Logo upload and removal exist
   only in the app. Close packages then use the client identity as the primary
   brand and the firm identity as the preparer.
+- **Payroll is recorded, never calculated.** At propose level the assistant
+  may stage a draft pay run (`propose_pay_run`) from figures a payroll
+  provider already produced: gross pay, each withholding, and net pay per
+  employee. LedgerTB computes none of them and refuses any stub whose gross
+  minus withholdings does not equal its net, naming the stub rather than
+  silently adjusting it. The run lands in **Payroll Recording** as a draft
+  that has touched no account. A person posts it there, and that is also
+  where the wage and liability accounts are chosen — an accounting judgment
+  the assistant is not given. `list_employees` and `list_pay_runs` are read
+  tools for referencing employees and checking status. The assistant cannot
+  add an employee: `employees` is deliberately outside its insert surface,
+  because putting a person on a client's book is a human decision.
+
+  **Employer-side payroll taxes are not part of a pay run.** A pay run posts
+  gross wages, the withholding liabilities, and net cash — there is no place
+  in the model for employer FICA, FUTA, or SUTA expense and its matching
+  liability. Record those as a separate entry (`propose_entry`).
+
 - **Shared/custom book files are read-only.** The separate MCP process does
   not yet participate in firm mode's one-writer sidecar lock, so books outside
   LedgerTB's local managed-data folder are capped at read access even if the

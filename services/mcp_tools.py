@@ -1327,3 +1327,187 @@ def import_accounts(client_id: int, rows: list) -> dict:
                  "dropped. Fix error rows and re-send just those; review any "
                  "semantic warnings on rows that were created."),
     }
+
+
+# --- payroll recording ------------------------------------------------------
+# LedgerTB does not calculate payroll, file forms, or compute tax. These tools
+# accept figures a payroll provider already computed and record them. Nothing
+# here derives a withholding, a tax, or a net.
+
+
+def list_employees(client_id: int) -> list:
+    """Employees on the book, for referencing in propose_pay_run."""
+    from models.payroll import Employee
+    from database.connection import get_cursor
+
+    _require_client(client_id)
+    with get_cursor() as cursor:
+        cursor.execute(
+            "SELECT id, name FROM departments WHERE client_id = ?", (client_id,)
+        )
+        departments = {row["id"]: row["name"] for row in cursor.fetchall()}
+    return [
+        {
+            "employee_id": e.id,
+            "name": e.name,
+            "status": e.status,
+            "department": departments.get(e.department_id),
+        }
+        for e in Employee.get_all(client_id)
+    ]
+
+
+def list_pay_runs(client_id: int, status: str = "draft") -> list:
+    """Pay runs and whether each is still a draft. Pass 'all' for every one.
+
+    A draft pay run has touched no account: it becomes a journal entry only
+    when a person posts it in LedgerTB, choosing the wage and liability
+    accounts there.
+    """
+    import json as _json
+    from database.connection import get_cursor
+
+    _require_client(client_id)
+    query = "SELECT * FROM pay_runs WHERE client_id = ?"
+    params = [client_id]
+    if status != "all":
+        query += " AND status = ?"
+        params.append(status)
+    with get_cursor() as cursor:
+        cursor.execute(query + " ORDER BY id", params)
+        runs = [dict(row) for row in cursor.fetchall()]
+        out = []
+        for run in runs:
+            cursor.execute(
+                "SELECT ps.gross_pay_cents, ps.net_pay_cents, ps.deductions, "
+                "e.name AS employee_name "
+                "FROM pay_stubs ps JOIN employees e ON e.id = ps.employee_id "
+                "WHERE ps.pay_run_id = ? ORDER BY ps.id",
+                (run["id"],),
+            )
+            stubs = [dict(row) for row in cursor.fetchall()]
+            out.append({
+                "pay_run_id": run["id"],
+                "status": run["status"],
+                "pay_period_start": run["pay_period_start"],
+                "pay_period_end": run["pay_period_end"],
+                "pay_date": run["pay_date"],
+                "journal_entry_id": run["journal_entry_id"],
+                "total_gross": round(
+                    sum(s["gross_pay_cents"] for s in stubs) / 100, 2),
+                "total_net": round(
+                    sum(s["net_pay_cents"] for s in stubs) / 100, 2),
+                "stubs": [
+                    {
+                        "employee_name": s["employee_name"],
+                        "gross_pay": round(s["gross_pay_cents"] / 100, 2),
+                        "net_pay": round(s["net_pay_cents"] / 100, 2),
+                        "withholdings": [
+                            {"label": d["label"],
+                             "amount": round(d["amount_cents"] / 100, 2)}
+                            for d in _json.loads(s["deductions"])
+                        ],
+                    }
+                    for s in stubs
+                ],
+            })
+    return out
+
+
+@mutating
+def propose_pay_run(client_id: int, period_start: str, period_end: str,
+                    pay_date: str, stubs: list, rationale: str = "") -> dict:
+    """Stage a DRAFT pay run from figures a payroll provider already computed.
+
+    Never posts. A person reviews the run in LedgerTB's Payroll Recording page
+    and posts it there, which is also where the wage and liability accounts are
+    chosen: that mapping is an accounting judgment, so this tool does not make
+    it and cannot reach the ledger.
+    """
+    from models.audit_log import AuditLog
+    from models.payroll import Employee
+    from services.payroll_recording import add_pay_stub, create_pay_run
+    from database.connection import get_connection
+    from money import to_cents
+
+    _require_client(client_id)
+    start = _parse_date(period_start, "period_start")
+    end = _parse_date(period_end, "period_end")
+    paid = _parse_date(pay_date, "pay_date")
+    if not isinstance(stubs, list) or not stubs:
+        raise ValueError("stubs must be a non-empty list of pay stubs.")
+
+    known = {e.id: e for e in Employee.get_all(client_id)}
+    prepared = []
+    for index, stub in enumerate(stubs, start=1):
+        if not isinstance(stub, dict):
+            raise ValueError(f"Stub {index} must be an object.")
+        employee_id = stub.get("employee_id")
+        if employee_id not in known:
+            raise ValueError(
+                f"Stub {index}: no employee {employee_id!r} on this client. "
+                "Call list_employees; a person adds employees in LedgerTB."
+            )
+        try:
+            gross = to_cents(stub["gross_pay"])
+            net = to_cents(stub["net_pay"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Stub {index}: gross_pay and net_pay are required amounts."
+            ) from exc
+        withholdings = stub.get("withholdings") or []
+        if not isinstance(withholdings, list):
+            raise ValueError(f"Stub {index}: withholdings must be a list.")
+        deductions = []
+        for item in withholdings:
+            if not isinstance(item, dict) or not str(item.get("label", "")).strip():
+                raise ValueError(
+                    f"Stub {index}: each withholding needs a label and amount."
+                )
+            deductions.append({
+                "label": str(item["label"]).strip(),
+                "amount_cents": to_cents(item.get("amount")),
+            })
+        # Arithmetic is the caller's to get right; say which stub is wrong
+        # rather than letting the service report an anonymous mismatch.
+        if gross - sum(d["amount_cents"] for d in deductions) != net:
+            raise ValueError(
+                f"Stub {index}: gross pay minus withholdings must equal net pay "
+                f"(gross {gross / 100:.2f}, withholdings "
+                f"{sum(d['amount_cents'] for d in deductions) / 100:.2f}, "
+                f"net {net / 100:.2f})."
+            )
+        prepared.append((employee_id, gross, deductions, net))
+
+    # One transaction: a partially built pay run is worse than none, because a
+    # reviewer would see a run whose stubs do not represent the whole payroll.
+    conn = get_connection()
+    try:
+        pay_run = create_pay_run(client_id, start, end, paid, _conn=conn)
+        for employee_id, gross, deductions, net in prepared:
+            add_pay_stub(pay_run.id, employee_id, gross, deductions, net,
+                         _conn=conn)
+        if rationale.strip():
+            AuditLog.write(
+                conn.cursor(), client_id, "pay_runs", pay_run.id, "INSERT",
+                new_values={"assistant_rationale": rationale.strip()},
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "pay_run_id": pay_run.id,
+        "status": "draft",
+        "stubs": len(prepared),
+        "total_gross": round(sum(g for _, g, _, _ in prepared) / 100, 2),
+        "total_net": round(sum(n for _, _, _, n in prepared) / 100, 2),
+        "posted": False,
+        "note": ("Draft only — no account was touched. A person reviews this "
+                 "run in LedgerTB → Payroll Recording and chooses the wage and "
+                 "liability accounts when posting it. Employer payroll taxes "
+                 "are not part of a pay run: record those with propose_entry."),
+    }

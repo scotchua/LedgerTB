@@ -461,6 +461,47 @@ def propose_depreciation_run(client_id: int, fixed_asset_id: int,
 
 @server.tool()
 @_serialized
+def list_employees(client_id: int) -> list:
+    """Employees on this book with their department, for propose_pay_run.
+    LedgerTB does not calculate payroll; adding an employee is done in the
+    app by a person."""
+    _require_level("read")
+    return mcp_tools.list_employees(client_id)
+
+
+@server.tool()
+@_serialized
+def list_pay_runs(client_id: int, status: str = "draft") -> list:
+    """Pay runs and whether each is still a draft ("draft", "posted", or
+    "all"). A draft has touched no account; posting happens in the app."""
+    _require_level("read")
+    return mcp_tools.list_pay_runs(client_id, status)
+
+
+@server.tool()
+@_serialized
+@_mutating
+def propose_pay_run(client_id: int, period_start: str, period_end: str,
+                    pay_date: str, stubs: list, rationale: str = "") -> dict:
+    """Stage a DRAFT pay run for human review. It does NOT touch the ledger.
+
+    LedgerTB never calculates payroll: pass figures your payroll provider
+    already computed. stubs: [{"employee_id": 3, "gross_pay": 5000.00,
+    "net_pay": 3712.50, "withholdings": [{"label": "Federal income tax",
+    "amount": 750.00}, {"label": "FICA", "amount": 537.50}]}] (dollars).
+    Gross minus withholdings must equal net for each stub. Call
+    list_employees for the ids. Explain WHY in rationale.
+
+    Employer-side payroll taxes are NOT part of a pay run — the model has no
+    place to post them. Record employer tax expense and its liability with
+    propose_entry. Needs access level "propose"."""
+    _require_level("propose")
+    return mcp_tools.propose_pay_run(client_id, period_start, period_end,
+                                     pay_date, stubs, rationale)
+
+
+@server.tool()
+@_serialized
 def list_drafts(client_id: int, status: str = "pending") -> list:
     """Draft entries this server has filed and their review status
     ("pending", "approved", "rejected", or "all"). Each result includes the
