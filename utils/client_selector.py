@@ -198,6 +198,8 @@ def render_client_selector() -> Optional[int]:
         st.sidebar.page_link("pages/2_Journal_Entries.py", label=je_label, icon=icons.JOURNAL_ENTRIES)
         st.sidebar.page_link("pages/3_Chart_of_Accounts.py", label="Chart of Accounts", icon=icons.CHART_OF_ACCOUNTS)
         st.sidebar.page_link("pages/19_Fixed_Assets.py", label="Fixed Assets", icon=icons.FIXED_ASSETS)
+        st.sidebar.page_link("pages/17_Inventory.py", label="Inventory", icon=icons.INVENTORY)
+        st.sidebar.page_link("pages/20_Payroll_Recording.py", label="Payroll Recording", icon=icons.PAYROLL)
 
         # Import with pending badge
         import_label = "Import Transactions"
@@ -207,6 +209,8 @@ def render_client_selector() -> Optional[int]:
 
         st.sidebar.page_link("pages/5_Reports.py", label="Reports", icon=icons.REPORTS)
         st.sidebar.page_link("pages/6_Transactions.py", label="Transactions", icon=icons.TRANSACTIONS)
+        st.sidebar.page_link("pages/21_Invoices.py", label="Invoices", icon=icons.INVOICES)
+        st.sidebar.page_link("pages/22_Bills.py", label="Bills", icon=icons.BILLS)
         st.sidebar.page_link("pages/10_Bank_Reconciliation.py", label="Bank Reconciliation", icon=icons.RECONCILIATION)
         st.sidebar.page_link("pages/14_Close_Map.py", label="Close Map", icon=icons.CLOSE_MAP)
         st.sidebar.page_link("pages/11_Book_Review.py", label="Book Review", icon=icons.REVIEW)
