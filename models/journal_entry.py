@@ -575,12 +575,18 @@ class JournalEntry:
                 (entry_id,),
             )
             source_lines = cursor.fetchall()
+            # The reversal keeps the source entry's accounting type. Statements
+            # bucket Beginning Balance and Closing entries specially
+            # (docs/EARNINGS-ATTRIBUTION.md), so a Regular-typed reversal would
+            # land on the wrong side and double-count income instead of
+            # netting the pair to zero; an Adjusting reversal likewise belongs
+            # in the worksheet's AJE columns with the entry it reverses.
             reversal = JournalEntry(
                 client_id=client_id,
                 entry_date=effective_date,
                 description=f"Reversal: {row['description'] or f'Journal Entry #{entry_id}'}"[:200],
                 source_reference=reference,
-                entry_type="Regular",
+                entry_type=row["entry_type"] or "Regular",
                 reverses_journal_entry_id=entry_id,
                 lines=[
                     JournalEntryLine(
@@ -622,7 +628,12 @@ class JournalEntry:
                 conn.close()
 
     @staticmethod
-    def get_next_aje_reference(client_id: int, period_start: date, period_end: date) -> str:
+    def get_next_aje_reference(
+        client_id: int,
+        period_start: date,
+        period_end: date,
+        conn=None,
+    ) -> str:
         """
         Generate the next AJE reference number for a client/period.
         Format: AJE-001, AJE-002, etc.
@@ -636,7 +647,11 @@ class JournalEntry:
             Next available AJE reference (e.g., "AJE-001")
         """
         require_valid_range(period_start, period_end, "AJE period")
-        with get_cursor() as cursor:
+        owns_conn = conn is None
+        if owns_conn:
+            conn = get_connection()
+        try:
+            cursor = conn.cursor()
             cursor.execute("""
                 SELECT aje_reference FROM journal_entries
                 WHERE client_id = ?
@@ -647,6 +662,9 @@ class JournalEntry:
                 LIMIT 1
             """, (client_id, period_start.isoformat(), period_end.isoformat()))
             row = cursor.fetchone()
+        finally:
+            if owns_conn:
+                conn.close()
 
         if row and row['aje_reference']:
             # Extract number from AJE-XXX format

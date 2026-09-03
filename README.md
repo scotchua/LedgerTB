@@ -7,7 +7,7 @@ A **Ledger Labs LLC** product — the software studio of [Charlie Barmore, CPA](
 ## What it does
 
 - **Clients**: separate books per client, with chart-of-accounts templates by entity type (S corp, partnership, nonprofit, and more) and industry — and a chart importer that speaks **QuickBooks type names** directly (Bank, Credit Card, A/R, COGS, …), so a QB export comes in whole, with unmappable rows reported rather than silently dropped. Charts with **no account numbers** (QBO's default) get numbers assigned by type range, shown before anything imports; any existing numbering scheme is kept as-is.
-- **Journal entries**: classic double-entry with validation. If it doesn't balance, it doesn't post.
+- **Journal entries**: classic double-entry with validation. If it doesn't balance, it doesn't post. Reusable templates can prefill the normal entry form, and monthly, quarterly, or annual schedules generate one idempotent draft per fiscal period for human approval, including optional period-end reversal drafts.
 - **Bank imports**: bring in transactions from CSV with saved per-bank formats, duplicate detection, and an import verification step (including row-continuity checks — a balanced trial balance is *not* proof an import was complete). New accounts can be created right in the category dropdown. **Or skip the format question entirely**: hand any statement — CSV, PDF, a pasted table — to your assistant, which normalizes and stages it into the same review flow (see Assistant access below).
 - **AI categorization**: Claude suggests the account for each imported transaction and learns your patterns over time. Suggestions only: you review, you post. The audit trail records what happened either way.
 - **Book Review**: a deterministic integrity sweep (unbalanced entries, unposted imports, broken links, date problems, quiet accounts) plus an AI category-consistency review governed by your own per-client policy notes, and an analytical memo.
@@ -102,7 +102,7 @@ The app runs fully without any API key. To turn on AI categorization, either set
 ## Desktop builds
 
 - **macOS**: download the signed and notarized Apple Silicon `LedgerTB.app` from the latest release. To build it yourself, create a clean Python 3.12 environment, install `requirements-macos-arm64.lock`, and run `./scripts/build_release.sh`. The build verifies the lock before packaging. Signing is configured via a local `scripts/signing.env`.
-- **Windows**: an Inno Setup installer built by CI (`.github/workflows/release.yml`, tag-triggered) from `scripts/ledgertb.iss`. The release pipeline refuses to ship a build whose encryption is unavailable, installs the pinned set in `requirements-windows.lock`, and will not publish a build that cannot serve a page (`scripts/smoke_serve.ps1`).
+- **Windows**: an Inno Setup installer built by CI (`.github/workflows/release.yml`, tag-triggered) from `scripts/ledgertb.iss`. The release pipeline refuses to ship a build whose encryption is unavailable, installs the pinned set in `requirements-windows.lock`, and will not publish a build that cannot serve a page (`scripts/smoke_serve.ps1`) or fully exit after its native window closes (`scripts/smoke_close.ps1`).
 
 ## The posture
 
@@ -125,6 +125,7 @@ python -m pytest -q -m "not performance"
 - `DESKTOP.md` — desktop builds, packaging, notarization
 - `docs/MCP.md` — assistant access setup and security model
 - `docs/CLOSE-MAP.md` — account support, review, signoff, and stale-change rules
+- `docs/RECURRING-JOURNAL-ENTRIES.md` — the v1.7.0 template and recurrence contract
 - `docs/LEDGERPDF-PAIRING.md` — books-to-binder workflow with LedgerPDF
 - `docs/FIRM-MODE.md` — shared-drive book files and the in-use lock
 - `docs/WINDOWS-TESTING.md` — the Windows smoke-test checklist

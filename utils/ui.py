@@ -92,6 +92,22 @@ def view_switcher(options, key, label="View"):
 _PARKING_HINTS = ("ask my accountant", "uncategorized", "suspense")
 
 
+def external_link_button(label, url, *, key=None, **button_kwargs):
+    """A button that opens an external site in the system default browser.
+
+    In the desktop shell, a rendered link (st.link_button, target='_blank')
+    would route through the embedded webview, which never hands navigations
+    to the system browser — the app's own URLs carry the launch token, so
+    that door stays closed (see desktop.py). LedgerTB's server runs on the
+    user's own machine, so opening the browser server-side reaches the same
+    screen without the URL ever entering the webview's navigation path.
+    """
+    if st.button(label, key=key, **button_kwargs):
+        import webbrowser
+
+        webbrowser.open(url)
+
+
 def is_parking_account(label):
     """Whether an account label is a park-it-for-review bucket rather than a
     real category — "Ask My Accountant", "Uncategorized", "Suspense". A row
@@ -108,6 +124,7 @@ table.pb-statement {
     border-collapse: collapse;
     font-variant-numeric: tabular-nums;
     margin: 0.25rem 0 0.75rem 0;
+    user-select: text;
 }
 table.pb-statement.wide { max-width: 64rem; }
 table.pb-statement td {
@@ -119,6 +136,14 @@ table.pb-statement td.amt { text-align: right; white-space: nowrap; width: 8.5re
 table.pb-statement td.num {
     width: 4.2rem; white-space: nowrap; color: #6b7280; font-size: 0.9em;
 }
+table.pb-statement td.amt { cursor: text; }
+table.pb-statement a.pb-drill {
+    color: inherit;
+    text-decoration: underline;
+    text-decoration-color: #94a3b8;
+    text-underline-offset: 0.16rem;
+}
+table.pb-statement a.pb-drill:hover { color: #1f3a5f; }
 table.pb-statement td.note-cell { color: #6b7280; font-size: 0.85em; }
 table.pb-statement span.muted { color: #6b7280; font-size: 0.85em; margin-left: 0.5rem; }
 table.pb-statement tr.head td {
@@ -161,8 +186,19 @@ def statement_html(rows, headers=None, formats=None, show_numbers=False):
         kind, label = row[0], row[1]
         amounts = row[2] if len(row) > 2 and row[2] is not None else []
         note = row[3] if len(row) > 3 else None
-        number = row[4] if len(row) > 4 else None
+        href = row[4] if len(row) > 4 else None
+        number = row[5] if len(row) > 5 else None
         label_html = _html.escape(str(label))
+        if href:
+            safe_href = _html.escape(str(href), quote=True)
+            safe_label = label_html
+            # Same-tab link only. A target='_blank' variant is not safe here:
+            # the desktop shell hands new-window navigations to the system
+            # browser, which would put the launch token in that browser's
+            # history and give it an authorized session to the open book.
+            label_html = (
+                f"<a class='pb-drill' href='{safe_href}'>{safe_label}</a>"
+            )
         if note:
             label_html += f"<span class='muted'>{_html.escape(str(note))}</span>"
         if kind == "note":
@@ -193,8 +229,8 @@ def statement_html(rows, headers=None, formats=None, show_numbers=False):
 def financial_statement(rows, headers=None, formats=None, show_numbers=False):
     """Render rows as an actual financial statement, not a widget pile.
 
-    rows: iterables of (kind, label, amounts, note, number) — note and
-      number optional.
+    rows: iterables of (kind, label, amounts, note, href, number) — note,
+      href, and number all optional.
       kind: 'section' (major heading), 'group' (subgroup heading),
             'item' (indented line),
             'subtotal' (bold, ruled amounts), 'total' (bold, double-ruled
@@ -203,9 +239,12 @@ def financial_statement(rows, headers=None, formats=None, show_numbers=False):
                two for debit/credit layouts). Dollar signs appear on
                subtotal/total rows, accounting-style; negatives in parens,
                an exact zero as a dash.
+      href: turns the line label into a drill-down link (same tab only).
       number: the account number, when ``show_numbers`` is on. It is a column
               of its own, never glued onto the label: a caption that sometimes
               begins with a number and sometimes does not cannot line up.
+              It sits after href because upstream owns position 4; keeping
+              that order lets upstream's drill-down call sites merge untouched.
     headers: optional list of amount-column headings.
     formats: optional per-column formats ("money" or "percent").
     show_numbers: draw the account-number column. Independent of grouping;
@@ -222,6 +261,7 @@ table.pb-ledger {
     font-variant-numeric: tabular-nums;
     font-size: 0.92em;
     margin: 0.25rem 0 0.75rem 0;
+    user-select: text;
 }
 table.pb-ledger td, table.pb-ledger th {
     border: none;
@@ -235,6 +275,7 @@ table.pb-ledger th {
     border-bottom: 1px solid #b9bec7;
 }
 table.pb-ledger td.r, table.pb-ledger th.r { text-align: right; white-space: nowrap; }
+table.pb-ledger td.r { cursor: text; }
 table.pb-ledger tr:nth-child(even) td { background: rgba(151, 166, 195, 0.08); }
 table.pb-ledger tr.total td {
     font-weight: 700; border-top: 1px solid #565d68; background: none;

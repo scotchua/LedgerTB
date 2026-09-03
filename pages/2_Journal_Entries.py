@@ -10,20 +10,33 @@ from models.account import Account
 from models.client import Client
 from models.draft_entry import DraftEntry
 from models.journal_entry import JournalEntry, JournalEntryLine
+from models.recurring_entry import JournalEntryTemplate, TemplateLine
 from models.transaction import ImportedTransaction
 from services.import_corrections import correct_imported_category
+from services.preferences import get_date_format
+from services.recurring_entries import recurring_draft_contexts
 from database import init_database
 from database import connection as dbconn
-from utils.client_context import pop_client_intent, scope_page_to_client
+from utils.client_context import (
+    pop_client_intent,
+    scope_page_to_client,
+    set_client_intent,
+)
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 from utils import icons
 from constants import EntryType
 from utils.fiscal_dates import fiscal_year_bounds
+from utils.dates import display_date
 from utils.ui import view_switcher
+from utils.recurring_ui import render_recurring_view
+from money import to_cents, to_dollars
 
 
-_FORM_WIDGET_PREFIXES = ("account_", "debit_", "credit_", "memo_", "je_hdr_")
+_FORM_WIDGET_PREFIXES = (
+    "account_", "debit_", "credit_", "memo_", "je_hdr_",
+    "je_new_template_name_",
+)
 
 
 def _empty_je_lines():
@@ -64,6 +77,7 @@ st.set_page_config(page_title="Journal Entries", page_icon=icons.JOURNAL_ENTRIES
 # Gate on the database passphrase before any DB access, then ensure schema.
 require_unlock()
 init_database()
+date_format = get_date_format()
 
 client_id = render_client_selector()
 
@@ -87,6 +101,7 @@ if journal_scope.changed:
     start_new_form_generation()
     st.session_state.je_lines = _empty_je_lines()
     st.session_state.correction_source_entry_id = None
+    st.session_state.editing_entry_id = None
     st.session_state.journal_active_tab = "New Entry"
     st.session_state.pop("_journal_active_tab_rendered", None)
     for key in (
@@ -111,36 +126,81 @@ if journal_scope.changed:
         "journal_page",
         "reversal_entry_id",
         "reversal_date",
-        "confirm_reversal",
+        "reversal_result",
         "draft_result",
+        "je_template_loaded_message",
+        "je_template_name_gen",
+        "je_use_template",
+        "recurring_through_date",
+        "recurring_result",
+        "recurring_errors",
+        "recurring_editor_id",
+        "recurring_editor_name",
+        "recurring_editor_description",
+        "recurring_editor_reference",
+        "recurring_editor_type",
+        "recurring_editor_rows",
+        "recurring_confirm_archive",
+        "journal_return_report",
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
-        if key.startswith((
+        if key != "recurring_widget_gen" and key.startswith((
             "correction_target_",
             "correction_date_",
             "correction_reason_",
             "post_correction_",
             "cancel_correction_",
+            "recurring_",
         )):
             del st.session_state[key]
+    # Rotate after pruning so the browser sees new widget identities. Keep the
+    # marker itself above; generations must continue increasing across more
+    # than one client/book switch instead of cycling back to g1.
+    st.session_state.recurring_widget_gen = (
+        st.session_state.get("recurring_widget_gen", 0) + 1
+    )
+    # A new key generation is the only checkbox reset the frontend honors;
+    # popping the keyed value would let the browser re-impose it.
+    st.session_state["reversal_confirm_gen"] = (
+        st.session_state.get("reversal_confirm_gen", 0) + 1
+    )
 
 journal_intent = pop_client_intent(
     st.session_state, "journal", client_id, dbconn.DATABASE_PATH
 )
 if isinstance(journal_intent, dict):
     requested_view = journal_intent.get("view")
-    if requested_view in {"New Entry", "View Entries", "Reverse Entry", "Drafts"}:
+    if requested_view in {
+        "New Entry", "View Entries", "Reverse Entry", "Drafts",
+        "Templates & recurring",
+    }:
         st.session_state.journal_active_tab = requested_view
         st.session_state.pop("_journal_active_tab_rendered", None)
     requested_entry_id = journal_intent.get("entry_id")
     if isinstance(requested_entry_id, int) and requested_entry_id > 0:
         st.session_state.edit_entry_id = requested_entry_id
+    return_report = journal_intent.get("return_report")
+    if isinstance(return_report, dict):
+        st.session_state.journal_return_report = return_report
 
 # Get client info
 client = Client.get_by_id(client_id)
 st.caption(f"Viewing: **{client.name}**")
 current_fy_start, _ = fiscal_year_bounds(date.today(), client.fiscal_year_end_month)
+
+return_report = st.session_state.get("journal_return_report")
+if isinstance(return_report, dict) and return_report.get("report") == "General Ledger":
+    if st.button("← Back to General Ledger", key="journal_back_to_report"):
+        set_client_intent(
+            st.session_state,
+            "report",
+            return_report,
+            client_id,
+            dbconn.DATABASE_PATH,
+        )
+        st.session_state.pop("journal_return_report", None)
+        st.switch_page("pages/5_Reports.py")
 
 # Initialize session state
 if 'je_lines' not in st.session_state:
@@ -148,6 +208,9 @@ if 'je_lines' not in st.session_state:
 
 if "je_form_gen" not in st.session_state:
     st.session_state.je_form_gen = 0
+
+if "recurring_widget_gen" not in st.session_state:
+    st.session_state.recurring_widget_gen = 0
 
 if st.session_state.pop("_prune_je_form_widgets", False):
     # Only stale-generation keys exist this early in the run; the current
@@ -180,6 +243,13 @@ def load_entry_as_correction(entry: JournalEntry):
         start_new_form_generation()
 
 
+# Upstream's "editing an existing entry" flag. It stays None here: posted
+# entries are immutable (migration 041), so a drill-down loads a correction
+# copy rather than editing the original in place. The template-reuse gating
+# and the form heading both read it, so it has to exist.
+if 'editing_entry_id' not in st.session_state:
+    st.session_state.editing_entry_id = None
+
 # Check if we're coming from General Ledger drill-down
 if 'edit_entry_id' in st.session_state:
     # A context change already rotated the form before the valid, tagged
@@ -206,6 +276,7 @@ if 'edit_entry_id' in st.session_state:
 
 def reset_entry_form():
     start_new_form_generation()
+    st.session_state.editing_entry_id = None
     st.session_state.je_lines = _empty_je_lines()
     st.session_state.correction_source_entry_id = None
     st.session_state.pop("reverse_and_correct_entry_id", None)
@@ -220,6 +291,30 @@ def reset_entry_form():
         del st.session_state.je_description
     if 'je_aje_reference' in st.session_state:
         del st.session_state.je_aje_reference
+
+
+def load_template_into_form(template: JournalEntryTemplate):
+    """Copy a template into a fresh, editable journal-entry form."""
+    st.session_state.editing_entry_id = None
+    st.session_state.je_lines = [
+        {
+            "account_id": line.account_id,
+            "debit": to_dollars(line.debit_cents),
+            "credit": to_dollars(line.credit_cents),
+            "memo": line.memo or "",
+        }
+        for line in template.lines
+    ]
+    st.session_state.je_entry_date = date.today()
+    st.session_state.je_entry_type = template.entry_type
+    st.session_state.je_source_reference = template.source_reference or ""
+    st.session_state.je_description = template.description
+    st.session_state.je_aje_reference = None
+    st.session_state.je_template_loaded_message = (
+        f"Loaded template {template.name}. Review the date and amounts before saving."
+    )
+    st.session_state.journal_active_tab = "New Entry"
+    start_new_form_generation()
 
 
 def render_entry_controls(entry: JournalEntry, import_link: dict | None):
@@ -326,6 +421,7 @@ if correction_entry_id:
                 # current month.
                 value=correction_link.get("transaction_date") or date.today(),
                 key=f"correction_date_{correction_entry_id}",
+                format=date_format,
                 help="Use an open accounting period. The imported transaction date is not changed.",
             )
             reason = st.text_input(
@@ -374,7 +470,7 @@ if "journal_active_tab" not in st.session_state:
     st.session_state.journal_active_tab = "New Entry"
 
 active_view = view_switcher(
-    ["New Entry", "View Entries", "Reverse Entry", "Drafts"],
+    ["New Entry", "View Entries", "Reverse Entry", "Drafts", "Templates & recurring"],
     key="journal_active_tab"
 )
 if (
@@ -389,8 +485,7 @@ if _pending_drafts and active_view != "Drafts":
     _bc1, _bc2 = st.columns([4, 1])
     with _bc1:
         noun = "draft entry" if _pending_drafts == 1 else "draft entries"
-        st.info(f"{_pending_drafts} {noun} proposed by your assistant "
-                "await review.", icon="📥")
+        st.info(f"{_pending_drafts} {noun} await review.", icon="📥")
     with _bc2:
         if st.button("Review drafts", key="goto_drafts", width="stretch"):
             st.session_state.journal_active_tab = "Drafts"
@@ -409,6 +504,36 @@ if active_view == "New Entry":
     saved_message = st.session_state.pop("je_saved_message", None)
     if saved_message:
         st.success(saved_message)
+    template_message = st.session_state.pop("je_template_loaded_message", None)
+    if template_message:
+        st.info(template_message)
+
+    reusable_templates = JournalEntryTemplate.get_all(client_id)
+    if reusable_templates and not st.session_state.editing_entry_id:
+        template_options = {template.id: template.name for template in reusable_templates}
+        template_col, use_col = st.columns([3, 1])
+        with template_col:
+            selected_template_id = st.selectbox(
+                "Use template",
+                options=list(template_options),
+                format_func=lambda template_id: template_options[template_id],
+                index=None,
+                placeholder="Choose a saved template",
+                key=journal_scope.key("je_use_template"),
+            )
+        with use_col:
+            st.write("")
+            st.write("")
+            if st.button(
+                "Load template", disabled=not selected_template_id,
+                key=journal_scope.key("je_load_template"),
+            ):
+                selected_template = JournalEntryTemplate.get_by_id(
+                    selected_template_id, client_id
+                )
+                if selected_template:
+                    load_template_into_form(selected_template)
+                    st.rerun()
 
     # Get all active accounts for dropdown
     accounts = Account.get_all(client_id, active_only=True)
@@ -440,7 +565,10 @@ if active_view == "New Entry":
     # Generation-keyed (hdr_key) so saving or loading an entry actually resets
     # them — unkeyed widgets keep their browser-side state across a reset.
     with col1:
-        entry_date = st.date_input("Date", value=default_date, key=hdr_key("date"))
+        entry_date = st.date_input(
+            "Date", value=default_date, key=hdr_key("date"),
+            format=date_format,
+        )
 
     with col2:
         type_index = entry_type_options.index(default_type) if default_type in entry_type_options else 0
@@ -631,6 +759,53 @@ if active_view == "New Entry":
             reset_entry_form()
             st.rerun()
 
+    if not st.session_state.editing_entry_id:
+        with st.expander("Save this entry as a template"):
+            st.caption(
+                "The date and AJE reference are not saved. Scheduled use is set up "
+                "after the template is created."
+            )
+            template_name_gen = st.session_state.get("je_template_name_gen", 0)
+            template_name = st.text_input(
+                "Template name",
+                key=journal_scope.key(
+                    f"je_new_template_name_g{template_name_gen}"
+                ),
+                placeholder="e.g., Monthly prepaid amortization",
+            )
+            if st.button(
+                "Save template", key=journal_scope.key("je_save_template"),
+                disabled=dbconn.READ_ONLY or not template_name.strip(),
+            ):
+                try:
+                    template_lines = [
+                        TemplateLine(
+                            account_id=int(line["account_id"]),
+                            debit_cents=to_cents(line["debit"]),
+                            credit_cents=to_cents(line["credit"]),
+                            memo=line["memo"] or "",
+                        )
+                        for line in st.session_state.je_lines
+                        if line["account_id"]
+                        and (line["debit"] > 0 or line["credit"] > 0)
+                    ]
+                    template = JournalEntryTemplate(
+                        client_id=client_id, name=template_name,
+                        description=description, entry_type=entry_type,
+                        source_reference=source_reference or "",
+                        lines=template_lines,
+                    )
+                    template.save()
+                except Exception as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state.je_saved_message = (
+                        f"Template {template.name} created. Add a recurring "
+                        "schedule from Templates & recurring when needed."
+                    )
+                    st.session_state.je_template_name_gen = template_name_gen + 1
+                    st.rerun()
+
 elif active_view == "View Entries":
     st.subheader("Journal Entry List")
 
@@ -661,10 +836,16 @@ elif active_view == "View Entries":
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        filter_start = st.date_input("From Date", value=current_fy_start, key="filter_start")
+        filter_start = st.date_input(
+            "From Date", value=current_fy_start, key="filter_start",
+            format=date_format,
+        )
 
     with col2:
-        filter_end = st.date_input("To Date", value=date.today(), key="filter_end")
+        filter_end = st.date_input(
+            "To Date", value=date.today(), key="filter_end",
+            format=date_format,
+        )
 
     with col3:
         filter_type = st.selectbox("Entry Type", options=['All'] + EntryType.ALL, key="filter_type")
@@ -766,7 +947,11 @@ elif active_view == "View Entries":
                 header += f" ({entry.aje_reference or 'AJE'})"
             elif entry.entry_type != 'Regular':
                 header += f" ({entry.entry_type})"
-            header += f" | {entry.entry_date} | {entry.description or 'No description'} | ${entry.total_debits():,.2f}"
+            header += (
+                f" | {display_date(entry.entry_date, date_format)} | "
+                f"{entry.description or 'No description'} | "
+                f"${entry.total_debits():,.2f}"
+            )
 
             if entry.reverses_journal_entry_id:
                 st.caption(
@@ -859,6 +1044,10 @@ elif active_view == "Reverse Entry":
         "so the accounting history and audit trail are preserved."
     )
 
+    _reversal_msg = st.session_state.pop("reversal_result", None)
+    if _reversal_msg:
+        st.success(_reversal_msg)
+
     reversal_entry_id = st.number_input(
         "Original journal entry #", min_value=1, value=1, step=1,
         key="reversal_entry_id",
@@ -868,7 +1057,8 @@ elif active_view == "Reverse Entry":
         st.info("Enter an existing journal entry number for this client.")
     else:
         st.markdown(
-            f"**JE #{original.id}** · {original.entry_date} · "
+            f"**JE #{original.id}** · "
+            f"{display_date(original.entry_date, date_format)} · "
             f"{original.description or 'No description'} · ${original.total_debits():,.2f}"
         )
         for line in original.lines:
@@ -894,10 +1084,15 @@ elif active_view == "Reverse Entry":
 
         reversal_date = st.date_input(
             "Reversal date", value=date.today(), key="reversal_date",
+            format=date_format,
         )
+        # The confirm checkbox key carries a generation nonce: a fresh key is
+        # the only reset the frontend honors, and writing the widget's own key
+        # after instantiation raises mid-render.
+        confirm_gen = st.session_state.get("reversal_confirm_gen", 0)
         confirmed = st.checkbox(
             "I understand this posts a new entry and does not delete the original.",
-            key="confirm_reversal",
+            key=f"confirm_reversal_{confirm_gen}",
         )
         if st.button(
             "Post reversal", type="primary",
@@ -906,6 +1101,7 @@ elif active_view == "Reverse Entry":
         ):
             try:
                 reversal = JournalEntry.reverse(original.id, client_id, reversal_date)
+                st.session_state["reversal_confirm_gen"] = confirm_gen + 1
                 if st.session_state.get("reverse_and_correct_entry_id") == original.id:
                     load_entry_as_correction(original)
                     st.session_state.je_entry_date = reversal.entry_date
@@ -915,17 +1111,23 @@ elif active_view == "Reverse Entry":
                         f"Reversal posted as JE #{reversal.id}. Post the corrected copy below."
                     )
                     st.rerun()
-                st.success(f"Reversal posted as JE #{reversal.id}.")
-                st.session_state.confirm_reversal = False
+                st.session_state["reversal_result"] = (
+                    f"Reversal posted as JE #{reversal.id}."
+                )
+                st.rerun()
             except ValueError as exc:
                 st.error(str(exc))
+
+
+elif active_view == "Templates & recurring":
+    render_recurring_view(client, date_format, load_template_into_form)
 
 
 if active_view == "Drafts":
     st.subheader("Draft entries")
     st.caption(
-        "Proposals filed by your assistant (MCP). Nothing here is in the "
-        "books: approving posts a real journal entry under your name, "
+        "Proposals filed by your assistant or generated from a recurring "
+        "schedule. Nothing here is in the books: approving posts a real journal entry under your name, "
         "rejecting marks the proposal rejected, and the audit trail records both."
     )
     _draft_msg = st.session_state.pop("draft_result", None)
@@ -938,12 +1140,34 @@ if active_view == "Drafts":
     else:
         _names = {a.account_number: a.name
                   for a in Account.get_all(client_id, active_only=False)}
+        _recurring_contexts = recurring_draft_contexts(
+            client_id, [draft.id for draft in _pending]
+        )
         for d in _pending:
             with st.container(border=True):
-                st.markdown(f"**{d.entry_date} · {d.description}**")
+                st.markdown(
+                    f"**{display_date(d.entry_date, date_format)} · "
+                    f"{d.description}**"
+                )
                 st.caption(f"Draft #{d.id} · {d.entry_type} · proposed by "
                            f"{d.proposed_by}"
                            + (f" · {d.proposed_at}" if d.proposed_at else ""))
+                recurring_context = _recurring_contexts.get(d.id)
+                if recurring_context:
+                    role = recurring_context["role"].lower()
+                    st.info(
+                        f"Recurring {role} · {recurring_context['template_name']} · "
+                        f"{recurring_context['period_name']} · generation "
+                        f"{recurring_context['generation_number']}"
+                    )
+                    if (
+                        recurring_context["role"] == "Primary"
+                        and recurring_context["reversal_rule"] == "NextDay"
+                    ):
+                        st.caption(
+                            "Approval will also create a separate reversal draft "
+                            "dated the day after period end."
+                        )
                 if d.rationale:
                     # Plain body text, not italics — an assistant's rationale
                     # runs to a paragraph, and italics at that length is the
@@ -971,7 +1195,7 @@ if active_view == "Drafts":
                         st.markdown(f"**Original · JE #{d.original_entry_id}**")
                         if original:
                             st.caption(
-                                f"{original.entry_date} · "
+                                f"{display_date(original.entry_date, date_format)} · "
                                 f"{original.description or 'No description'}"
                             )
                             st.table([
@@ -986,7 +1210,10 @@ if active_view == "Drafts":
                             st.error("The linked original entry is unavailable.")
                     with proposed_col:
                         st.markdown(f"**Proposed correction · Draft #{d.id}**")
-                        st.caption(f"{d.entry_date} · {d.description}")
+                        st.caption(
+                            f"{display_date(d.entry_date, date_format)} · "
+                            f"{d.description}"
+                        )
                         st.table(proposed_rows)
                 else:
                     st.table(proposed_rows)
@@ -1000,9 +1227,16 @@ if active_view == "Drafts":
                         except Exception as exc:
                             st.error(f"Could not post the draft: {exc}")
                         else:
-                            st.session_state.draft_result = (
-                                f"Draft #{d.id} posted as journal entry "
-                                f"#{_entry_id}.")
+                            result = (
+                                f"Draft #{d.id} posted as journal entry #{_entry_id}."
+                            )
+                            if (
+                                recurring_context
+                                and recurring_context["role"] == "Primary"
+                                and recurring_context["reversal_rule"] == "NextDay"
+                            ):
+                                result += " Its reversal draft now awaits review."
+                            st.session_state.draft_result = result
                             st.rerun()
                 with _a2:
                     if st.button("Reject", key=f"draft_reject_{d.id}",
@@ -1013,6 +1247,9 @@ if active_view == "Drafts":
 
     _reviewed_drafts = DraftEntry.get_resolved(client_id)
     if _reviewed_drafts:
+        _reviewed_contexts = recurring_draft_contexts(
+            client_id, [draft.id for draft in _reviewed_drafts]
+        )
         with st.expander(f"Recently reviewed drafts ({len(_reviewed_drafts)})"):
             st.dataframe([
                 {
@@ -1021,6 +1258,11 @@ if active_view == "Drafts":
                     "Description": d.description,
                     "Corrects": (f"JE #{d.original_entry_id}"
                                  if d.original_entry_id else "—"),
+                    "Source": (
+                        f"Recurring {_reviewed_contexts[d.id]['role'].lower()} · "
+                        f"{_reviewed_contexts[d.id]['template_name']}"
+                        if d.id in _reviewed_contexts else d.proposed_by
+                    ),
                     "Result": d.status.title(),
                     "Reviewed by": d.resolved_by or "—",
                     "Reviewed at": d.resolved_at or "—",

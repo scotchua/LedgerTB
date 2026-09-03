@@ -40,7 +40,11 @@ from database import connection as dbconn
 from constants import AccountSubtype
 from database.connection import get_connection, get_cursor
 from models.audit_log import AuditLog
-from models.reports import ReportGenerator, TrialBalanceWorksheetRow
+from models.reports import (
+    CASH_FLOW_STATEMENT_SECTIONS,
+    ReportGenerator,
+    TrialBalanceWorksheetRow,
+)
 from money import to_dollars
 from services.branding import (
     ClientBranding,
@@ -49,11 +53,14 @@ from services.branding import (
     get_client_branding,
 )
 from utils.dates import long_date, long_datetime
+from utils.fiscal_dates import fiscal_year_bounds
 from utils.statement_format import statement_amount
 from utils.export import set_excel_literal
 
 _HEADER_FONT = Font(bold=True)
 _MONEY_FMT = "#,##0.00"
+_STATEMENT_MONEY_FMT = '#,##0.00;(#,##0.00);"-"'
+_STATEMENT_PERCENT_FMT = '0.0"%";(0.0"%");"-"'
 _TOTAL_BORDER = Border(top=Side(style="thin", color="000000"))
 
 
@@ -450,6 +457,39 @@ def load_close_package_snapshot(
     )
 
 
+def _earnings_tie_out(
+    client_id: int, period_start: date, period_end: date,
+    income_statement: Dict, balance_sheet: Dict,
+) -> str:
+    """Income-statement net income must equal the balance sheet's Current
+    Year Earnings line for any fiscal-year-to-date package — the period
+    starts at the fiscal year and ends inside it (docs/EARNINGS-ATTRIBUTION.md).
+    A failing tie means the two statements disagree about the period's
+    earnings — never export that silently."""
+    with get_cursor() as cursor:
+        row = cursor.execute(
+            "SELECT fiscal_year_end_month FROM clients WHERE id = ?",
+            (client_id,),
+        ).fetchone()
+    fye_month = (row["fiscal_year_end_month"]
+                 if row and row["fiscal_year_end_month"] else 12)
+    fy_start, fy_end = fiscal_year_bounds(period_end, fye_month)
+    if period_start != fy_start or period_end > fy_end:
+        return "Not a fiscal year-to-date period - not compared"
+    current_year_earnings = sum(
+        item["balance"] for item in balance_sheet["equity"]
+        if item["name"] == "Current Year Earnings"
+        and not item["account_number"]
+    )
+    if abs(income_statement["net_income"] - current_year_earnings) < 0.01:
+        return "YES"
+    return (
+        "OUT OF BALANCE - net income "
+        f"{income_statement['net_income']:,.2f} vs current year earnings "
+        f"{current_year_earnings:,.2f}"
+    )
+
+
 def _append_literal_row(ws, values):
     """Append a row while ensuring every string is stored as literal text."""
     ws.append(values)
@@ -533,12 +573,12 @@ def _append_statement_section(ws, title: str, items: List[dict],
         cells = _append_literal_row(
             ws, [_statement_label(item), item["balance"]]
         )
-        cells[1].number_format = _MONEY_FMT
+        cells[1].number_format = _STATEMENT_MONEY_FMT
     total_cells = _append_literal_row(ws, [total_label, total_value])
     for cell in total_cells:
         cell.font = _HEADER_FONT
         cell.border = _TOTAL_BORDER
-    total_cells[1].number_format = _MONEY_FMT
+    total_cells[1].number_format = _STATEMENT_MONEY_FMT
 
 
 def _append_statement_total(ws, label: str, value: float):
@@ -546,7 +586,7 @@ def _append_statement_total(ws, label: str, value: float):
     for cell in cells:
         cell.font = _HEADER_FONT
         cell.border = _TOTAL_BORDER
-    cells[1].number_format = _MONEY_FMT
+    cells[1].number_format = _STATEMENT_MONEY_FMT
 
 
 def _comparison_values(item: Dict) -> list:
@@ -577,8 +617,8 @@ def _append_comparative_statement_section(
             ws, [_statement_label(item)] + _comparison_values(item)
         )
         for cell in cells[1:4]:
-            cell.number_format = _MONEY_FMT
-        cells[4].number_format = '0.0"%"'
+            cell.number_format = _STATEMENT_MONEY_FMT
+        cells[4].number_format = _STATEMENT_PERCENT_FMT
     _append_comparative_statement_total(ws, total_label, total)
 
 
@@ -604,8 +644,8 @@ def _append_comparative_statement_groups(
                 ws, [f"    {_statement_label(item)}"] + _comparison_values(item)
             )
             for cell in cells[1:4]:
-                cell.number_format = _MONEY_FMT
-            cells[4].number_format = '0.0"%"'
+                cell.number_format = _STATEMENT_MONEY_FMT
+            cells[4].number_format = _STATEMENT_PERCENT_FMT
         subtotal_cells = _append_literal_row(
             ws,
             [f"  Total {group['group']}"] + _comparison_values(group['subtotal']),
@@ -614,8 +654,8 @@ def _append_comparative_statement_groups(
             cell.font = _HEADER_FONT
             cell.border = _TOTAL_BORDER
         for cell in subtotal_cells[1:4]:
-            cell.number_format = _MONEY_FMT
-        subtotal_cells[4].number_format = '0.0"%"'
+            cell.number_format = _STATEMENT_MONEY_FMT
+        subtotal_cells[4].number_format = _STATEMENT_PERCENT_FMT
 
     _append_comparative_statement_total(ws, total_label, total)
 
@@ -646,8 +686,8 @@ def _append_comparative_income_statement(ws, report: Dict) -> None:
                 cell.border = _TOTAL_BORDER
         if values is not None:
             for cell in cells[1:4]:
-                cell.number_format = _MONEY_FMT
-            cells[4].number_format = '0.0"%"'
+                cell.number_format = _STATEMENT_MONEY_FMT
+            cells[4].number_format = _STATEMENT_PERCENT_FMT
 
 
 def _append_comparative_statement_total(ws, label: str, total: Dict):
@@ -656,8 +696,8 @@ def _append_comparative_statement_total(ws, label: str, total: Dict):
         cell.font = _HEADER_FONT
         cell.border = _TOTAL_BORDER
     for cell in cells[1:4]:
-        cell.number_format = _MONEY_FMT
-    cells[4].number_format = '0.0"%"'
+        cell.number_format = _STATEMENT_MONEY_FMT
+    cells[4].number_format = _STATEMENT_PERCENT_FMT
 
 
 def build_close_package(
@@ -725,6 +765,9 @@ def build_close_package(
          "YES" if abs(balance_sheet["total_assets"] -
                       balance_sheet["total_liabilities_equity"]) < 0.01
          else "OUT OF BALANCE"),
+        ("Net income ties to balance sheet earnings",
+         _earnings_tie_out(client_id, period_start, period_end,
+                           income_statement, balance_sheet)),
         ("Cash flow status",
          "READY" if cash_flow["ready"] else "REVIEW WARNINGS"),
         ("Cash flow - net change in cash", cash_flow["computed_cash_change"]),
@@ -974,16 +1017,12 @@ def build_close_package(
     )
     if not comparative_cash_flow['prior_available']:
         _append_literal_row(ws, ["No prior-year data", "", "", "", ""])
-    for title, key, total_label in [
-        ("Operating Activities", "operating",
-         "Net Cash Provided by Operating Activities"),
-        ("Investing Activities", "investing",
-         "Net Cash Provided by Investing Activities"),
-        ("Financing Activities", "financing",
-         "Net Cash Provided by Financing Activities"),
-        ("Unclassified Cash Activity", "unclassified",
-         "Net Unclassified Cash Activity"),
-    ]:
+    cash_flow_sections = CASH_FLOW_STATEMENT_SECTIONS + ((
+        "Unclassified Cash Activity",
+        "unclassified",
+        "Net Unclassified Cash Activity",
+    ),)
+    for title, key, total_label in cash_flow_sections:
         section = comparative_cash_flow[key]
         if (
             key == "unclassified"
@@ -1044,7 +1083,7 @@ def build_close_package(
                 "", "", "", "",
             ])
             cells[amount_column - 1].value = entry["amount"]
-            cells[amount_column - 1].number_format = _MONEY_FMT
+            cells[amount_column - 1].number_format = _STATEMENT_MONEY_FMT
 
     for period_name, entries, amount_column in [
         ("CURRENT NONCASH INVESTING AND FINANCING ACTIVITY",
@@ -1067,7 +1106,7 @@ def build_close_package(
                 "", "", "", "",
             ])
             cells[amount_column - 1].value = entry["amount"]
-            cells[amount_column - 1].number_format = _MONEY_FMT
+            cells[amount_column - 1].number_format = _STATEMENT_MONEY_FMT
 
     for sheet in wb.worksheets:
         sheet.oddFooter.left.text = display_name
@@ -1095,16 +1134,23 @@ _PDF_META = ParagraphStyle("meta", fontName="Helvetica", fontSize=10, leading=14
 
 
 def _money(value: float) -> str:
-    return f"{value:,.2f}" if value else ""
+    if not value:
+        return ""
+    body = f"{abs(value):,.2f}"
+    return f"({body})" if value < 0 else body
 
 
 def _money_total(value: float) -> str:
     """Display statement totals explicitly, including a meaningful zero."""
-    return f"{value:,.2f}"
+    body = f"{abs(value):,.2f}"
+    return f"({body})" if value < 0 else body
 
 
 def _percent(value: Optional[float]) -> str:
-    return "" if value is None else f"{value:,.1f}%"
+    if value is None:
+        return ""
+    body = f"{abs(value):,.1f}%"
+    return f"({body})" if value < 0 else body
 
 
 def _pdf_comparison_values(item: Dict, totals: bool = False) -> list:
@@ -1377,6 +1423,9 @@ def build_close_package_pdf(
                 ["Final trial balance - total debits", _money(total_dr)],
                 ["Final trial balance - total credits", _money(total_cr)],
                 ["In balance", "Yes" if balanced else "OUT OF BALANCE"],
+                ["Net income ties to balance sheet earnings",
+                 _earnings_tie_out(client_id, period_start, period_end,
+                                   income_statement, balance_sheet)],
                 ["Journal lines in period", str(len(transactions))],
                 ["Adjusting entry lines", str(len(ajes))],
                 ["Close Map",
@@ -1505,16 +1554,12 @@ def build_close_package_pdf(
         ),
         Spacer(1, 10),
     ]
-    for title, key, total_label in [
-        ("Operating Activities", "operating",
-         "Net Cash Provided by Operating Activities"),
-        ("Investing Activities", "investing",
-         "Net Cash Provided by Investing Activities"),
-        ("Financing Activities", "financing",
-         "Net Cash Provided by Financing Activities"),
-        ("Unclassified Cash Activity", "unclassified",
-         "Net Unclassified Cash Activity"),
-    ]:
+    cash_flow_sections = CASH_FLOW_STATEMENT_SECTIONS + ((
+        "Unclassified Cash Activity",
+        "unclassified",
+        "Net Unclassified Cash Activity",
+    ),)
+    for title, key, total_label in cash_flow_sections:
         section = comparative_cash_flow[key]
         if (
             key == "unclassified"

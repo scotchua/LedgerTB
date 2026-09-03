@@ -10,6 +10,12 @@ from models.audit_log import AuditLog
 from models.client import Client
 from models.draft_entry import DraftEntry
 from models.journal_entry import JournalEntry
+from models.recurring_entry import (
+    JournalEntryTemplate,
+    RecurringSchedule,
+    TemplateLine,
+)
+from models.fiscal_period import FiscalPeriod
 from models.transaction import ImportedTransaction
 from services.posting import post_transaction
 from services import mcp_tools
@@ -207,6 +213,36 @@ def test_changing_account_type_clears_incompatible_subtype(
     saved = Account.get_by_id(expense.id, client_id=client_id)
     assert saved.type == "Asset"
     assert saved.subtype is None
+
+
+def test_edit_account_scrolls_the_editor_into_view(
+    client_id, accounts, monkeypatch
+):
+    _select_client(monkeypatch, client_id)
+    rendered_html = []
+    monkeypatch.setattr(
+        st,
+        "html",
+        lambda body, **kwargs: rendered_html.append((body, kwargs)),
+    )
+
+    page = AppTest.from_file(
+        page_path("pages/3_Chart_of_Accounts.py"), default_timeout=30
+    ).run()
+    account_id = accounts["cash"]
+    page.button(
+        key=f"edit_{account_id}__chart_of_accounts_g0"
+    ).click().run()
+
+    assert not page.exception
+    assert page.session_state["editing_account"] == account_id
+    assert "_coa_scroll_to_editor" not in page.session_state
+    assert any("Edit Account:" in item.value for item in page.subheader)
+    assert len(rendered_html) == 1
+    body, options = rendered_html[0]
+    assert "account-edit-form" in body
+    assert "scrollIntoView" in body
+    assert options["unsafe_allow_javascript"] is True
 
 
 def test_add_account_subtypes_follow_type_without_form_submission(
@@ -410,8 +446,48 @@ def test_report_statements_render_with_balance_checks(client_id, accounts, monke
         assert not page.exception, view
         if expected:
             assert any(expected in str(s.value) for s in page.success), view
-        # the GL drill-down selectbox replaced the per-account buttons
-        assert any("gl_pick" in (box.key or "") for box in page.selectbox), view
+        # Account labels themselves are now the drill-down surface; the old
+        # detached account picker must not return.
+        assert any(
+            "Click an account" in str(item.value) for item in page.caption
+        ), view
+        assert not any(
+            box.label == "Drill into general ledger" for box in page.selectbox
+        ), view
+
+
+def test_report_drilldown_preserves_authorized_desktop_token(
+    client_id, accounts, monkeypatch
+):
+    """A report link opens a fresh Streamlit session, so it must carry the
+    desktop launch token that authorized the current session."""
+    from utils import unlock
+
+    _select_client(monkeypatch, client_id)
+    monkeypatch.setenv(unlock.UI_TOKEN_ENV, "launch-secret")
+    post_entry(
+        client_id, date(2026, 1, 15),
+        [(accounts["cash"], 500, 0), (accounts["revenue"], 0, 500)],
+    )
+
+    page = AppTest.from_file(
+        page_path("pages/5_Reports.py"), default_timeout=30
+    )
+    page.query_params["t"] = "launch-secret"
+    page.session_state["active_report"] = "Trial Balance"
+    page.run()
+
+    assert not page.exception
+    rendered = "\n".join(
+        str(item.body) for item in page.get("html") if hasattr(item, "body")
+    )
+    assert "report=General+Ledger" in rendered
+    assert "t=launch-secret" in rendered
+    # No new-tab variant: the desktop shell hands target='_blank' navigations
+    # to the system browser, which would write the launch token into that
+    # browser's history and hand it an authorized session to the open book.
+    assert "target='_blank'" not in rendered
+    assert "pb-new-tab" not in rendered
 
 
 def test_cash_flow_report_renders_quality_check_and_export(
@@ -435,6 +511,10 @@ def test_cash_flow_report_renders_quality_check_and_export(
         button.label == "Download Excel"
         for button in page.get("download_button")
     )
+    html = "\n".join(
+        str(item.body) for item in page.get("html") if hasattr(item, "body")
+    )
+    assert "Net Cash Provided by (Used in) Operating Activities" in html
 
 
 def test_legacy_income_statement_defaults_to_classic_layout(
@@ -728,6 +808,51 @@ def test_general_ledger_defaults_to_all_accounts(client_id, accounts, monkeypatc
     filter_box = next(b for b in drilled.selectbox if b.label == "Account filter")
     assert filter_box.value == accounts["cash"]
 
+    # Changing the period must not reconstruct the account picker as All.
+    drilled.selectbox(key="gl_date_preset__reports_g0").select("Custom").run()
+    drilled.date_input(key="gl_start__reports_g0").set_value(
+        date(2026, 2, 1)
+    ).run()
+    filter_box = next(b for b in drilled.selectbox if b.label == "Account filter")
+    assert filter_box.value == accounts["cash"]
+
+
+def test_report_url_drilldown_and_browser_back_restore_source(
+    client_id, accounts, monkeypatch
+):
+    _select_client(monkeypatch, client_id)
+    post_entry(
+        client_id, date(2026, 2, 15),
+        [(accounts["cash"], 100, 0), (accounts["revenue"], 0, 100)],
+    )
+    page = AppTest.from_file(
+        page_path("pages/5_Reports.py"), default_timeout=30
+    )
+    page.query_params.update({
+        "report": "General Ledger",
+        "client_id": str(client_id),
+        "account_id": str(accounts["cash"]),
+        "start": "2026-02-01",
+        "end": "2026-02-28",
+        "return_report": "Income Statement",
+        "return_start": "2026-01-01",
+        "return_end": "2026-02-28",
+    })
+    page.run()
+
+    assert not page.exception
+    assert page.session_state["active_report"] == "General Ledger"
+    assert page.selectbox(key="gl_account_filter__reports_g0").value == accounts["cash"]
+    assert page.date_input(key="gl_start__reports_g0").value == date(2026, 2, 1)
+    assert page.date_input(key="gl_end__reports_g0").value == date(2026, 2, 28)
+
+    page.query_params.clear()
+    page.run()
+    assert not page.exception
+    assert page.session_state["active_report"] == "Income Statement"
+    assert page.date_input(key="is_start__reports_g0").value == date(2026, 1, 1)
+    assert page.date_input(key="is_end__reports_g0").value == date(2026, 2, 28)
+
 
 def test_year_close_checklist_page_renders(client_id, accounts, monkeypatch):
     _select_client(monkeypatch, client_id)
@@ -806,13 +931,20 @@ def test_journal_discards_unsaved_state_for_same_client_id_in_another_book(
         type="Revenue",
     ).save()
 
-    # The reverse-and-correct workflow is client-owned state and must never
-    # survive the book boundary, even though both clients have numeric id 1.
+    # Client-owned workflow state that must never survive the book boundary,
+    # even though both selected clients have numeric id 1. Both the
+    # reverse-and-correct flow and the recurring/filter state are covered.
     journal.session_state["reverse_and_correct_entry_id"] = 123
     journal.session_state["reversal_entry_id"] = 123
-    journal.session_state["journal_active_tab"] = "Reverse Entry"
     journal.session_state["reversal_date"] = date(2026, 8, 1)
-    journal.session_state["confirm_reversal"] = True
+    journal.session_state["editing_entry_id"] = 123
+    journal.session_state["correct_import_entry_id"] = 123
+    journal.session_state["journal_active_tab"] = "View Entries"
+    journal.session_state["filter_search"] = "FIRST BOOK"
+    journal.session_state["journal_page"] = 4
+    journal.session_state["recurring_through_date"] = date(2026, 12, 31)
+    journal.session_state["recurring_editor_id"] = 999
+    journal.session_state["recurring_select_999_2026-01-01_rg0"] = True
     journal.run()
 
     assert not journal.exception
@@ -821,7 +953,14 @@ def test_journal_discards_unsaved_state_for_same_client_id_in_another_book(
     assert "reverse_and_correct_entry_id" not in journal.session_state
     assert "reversal_entry_id" not in journal.session_state
     assert "reversal_date" not in journal.session_state
-    assert "confirm_reversal" not in journal.session_state
+    assert journal.session_state["reversal_confirm_gen"] == 1
+    assert journal.session_state["editing_entry_id"] is None
+    assert "correct_import_entry_id" not in journal.session_state
+    assert "filter_search" not in journal.session_state
+    assert "recurring_through_date" not in journal.session_state
+    assert "recurring_editor_id" not in journal.session_state
+    assert "recurring_select_999_2026-01-01_rg0" not in journal.session_state
+    assert journal.session_state["recurring_widget_gen"] == 1
     assert journal.selectbox(key="account_0_g1").value is None
     assert journal.number_input(key="debit_0_g1").value == 0.0
     assert journal.text_input(key="je_hdr_desc_g1").value == ""
@@ -868,7 +1007,16 @@ def test_current_client_journal_intent_survives_destination_context_reset(
     set_client_intent(
         journal.session_state,
         "journal",
-        {"entry_id": target.id, "view": "View Entries"},
+        {
+            "entry_id": target.id,
+            "view": "New Entry",
+            "return_report": {
+                "report": "General Ledger",
+                "account_id": second_cash.id,
+                "start_date": date(2026, 7, 1),
+                "end_date": date(2026, 7, 31),
+            },
+        },
         second_client_id,
         dbconn.DATABASE_PATH,
     )
@@ -879,6 +1027,9 @@ def test_current_client_journal_intent_survives_destination_context_reset(
     assert journal.session_state["reverse_and_correct_entry_id"] == target.id
     assert journal.session_state["je_form_gen"] == 1
     assert journal.selectbox(key="account_0_g1").value == second_cash.id
+    assert any(
+        button.label == "← Back to General Ledger" for button in journal.button
+    )
 
 
 def test_journal_totals_reflect_committed_values_immediately(
@@ -1078,7 +1229,7 @@ def test_journal_reverse_posts_linked_entry(client_id, accounts, monkeypatch):
     journal.run()
 
     journal.button(key=f"reverse_entry_{entry.id}").click().run()
-    journal.checkbox(key="confirm_reversal").check().run()
+    journal.checkbox(key="confirm_reversal_0").check().run()
     journal.button(key="post_reversal").click().run()
     original = JournalEntry.get_by_id(entry.id)
     assert original.reversed_by_journal_entry_id is not None
@@ -1376,3 +1527,249 @@ def test_transactions_filters_reset_for_same_client_id_in_another_book(
     switched_text = " ".join(str(item.value) for item in page.text)
     assert "SECOND BOOK ROW" in switched_text
     assert "FIRST BOOK ROW" not in switched_text
+
+
+def test_report_client_route_applies_once_then_selector_wins(
+    client_id, accounts, monkeypatch
+):
+    """A drill-down URL selects its client once. After that the user's own
+    sidebar choice must stick — the route used to reapply itself on every
+    rerun, silently snapping the selection back for the rest of the session."""
+    from streamlit.delta_generator import DeltaGenerator
+
+    monkeypatch.setattr(DeltaGenerator, "page_link", lambda self, *a, **k: None)
+    second = Client(name="Second Co").save(seed_accounts=False)
+    Account(client_id=second, account_number="1010", name="Second Cash",
+            type="Asset").save()
+    post_entry(client_id, date(2026, 1, 15),
+               [(accounts["cash"], 500, 0), (accounts["revenue"], 0, 500)])
+
+    page = AppTest.from_file(page_path("pages/5_Reports.py"), default_timeout=60)
+    page.query_params["report"] = "Trial Balance"
+    page.query_params["client_id"] = str(client_id)
+    page.run()
+    assert not page.exception
+
+    selector = next(
+        s for s in page.sidebar.selectbox if s.label == "Select Client"
+    )
+    assert selector.value == client_id  # the URL still applies on first load
+
+    selector.set_value(second).run()
+    assert not page.exception
+    assert page.session_state["selected_client_id"] == second
+    captions = " ".join(str(item.value) for item in page.caption)
+    assert "Second Co" in captions
+
+    # Deliberately switching clients drops the stale route from the URL, so a
+    # refresh cannot resurrect the first client or aim its account filters at
+    # the second client's books.
+    assert "client_id" not in page.query_params
+
+    # Browser Back restores the drill URL: that must read as a new route and
+    # reapply its client, not be treated as already applied.
+    page.query_params["report"] = "Trial Balance"
+    page.query_params["client_id"] = str(client_id)
+    page.run()
+    assert not page.exception
+    assert page.session_state["selected_client_id"] == client_id
+    captions = " ".join(str(item.value) for item in page.caption)
+    assert "Test Co" in captions
+
+
+def test_reversal_posts_cleanly_and_resets_confirmation(
+    client_id, accounts, monkeypatch
+):
+    """Posting a reversal must not raise after succeeding (it used to write the
+    confirm checkbox's own key mid-render) and must reset the confirmation."""
+    _select_client(monkeypatch, client_id)
+    entry = post_entry(
+        client_id, date(2026, 2, 1),
+        [(accounts["cash"], 250, 0), (accounts["revenue"], 0, 250)],
+    )
+
+    page = AppTest.from_file(
+        page_path("pages/2_Journal_Entries.py"), default_timeout=30
+    )
+    page.session_state["journal_active_tab"] = "Reverse Entry"
+    page.run()
+    page.number_input(key="reversal_entry_id").set_value(entry.id).run()
+    page.checkbox(key="confirm_reversal_0").check().run()
+    page.button(key="post_reversal").click().run()
+
+    assert not page.exception, page.exception
+    success = " ".join(str(item.value) for item in page.success)
+    assert "Reversal posted as JE #" in success
+    assert page.checkbox(key="confirm_reversal_1").value is False
+
+    reversed_entries = JournalEntry.get_all(client_id)
+    assert any(
+        e.source_reference == f"Reversal of JE #{entry.id}"
+        for e in reversed_entries
+    )
+
+
+def test_recurring_view_generates_draft_and_template_loads_form(
+    client_id, accounts, monkeypatch
+):
+    _select_client(monkeypatch, client_id)
+    FiscalPeriod.ensure_periods_exist(client_id, 2026, 12)
+    template = JournalEntryTemplate(
+        client_id=client_id,
+        name="Monthly test schedule",
+        description="Monthly recurring test",
+        entry_type="Adjusting",
+        source_reference="Test schedule",
+        lines=[
+            TemplateLine(accounts["expense"], debit_cents=12_500),
+            TemplateLine(accounts["cash"], credit_cents=12_500),
+        ],
+    )
+    template.save()
+    schedule = RecurringSchedule(
+        template_id=template.id,
+        starts_on=date(2026, 1, 1),
+    )
+    schedule.save()
+
+    page = AppTest.from_file(
+        page_path("pages/2_Journal_Entries.py"), default_timeout=30
+    )
+    page.session_state["journal_active_tab"] = "Templates & recurring"
+    page.run()
+    assert not page.exception
+    page.date_input(key="recurring_through_date_rg0").set_value(date(2026, 1, 31)).run()
+    selection_key = f"recurring_select_{schedule.id}_2026-01-01_rg0"
+    page.checkbox(key=selection_key).check().run()
+    page.button(key="recurring_generate_selected_rg0").click().run()
+    assert not page.exception
+    drafts = DraftEntry.get_pending(client_id)
+    assert len(drafts) == 1
+    assert drafts[0].description == "Monthly recurring test"
+
+    page.session_state["journal_active_tab"] = "Drafts"
+    page.run()
+    recurring_notice = " ".join(str(item.value) for item in page.info)
+    assert "Recurring primary" in recurring_notice
+    assert "Monthly test schedule" in recurring_notice
+
+    load_page = AppTest.from_file(
+        page_path("pages/2_Journal_Entries.py"), default_timeout=30
+    ).run()
+    load_page.selectbox(key="je_use_template__journal_entries_g0").select(template.id).run()
+    load_page.button(key="je_load_template__journal_entries_g0").click().run()
+    assert not load_page.exception
+    assert load_page.session_state["je_description"] == "Monthly recurring test"
+    assert load_page.session_state["je_lines"][0]["debit"] == 125.0
+
+
+def test_recurring_view_surfaces_rejected_reversal_regeneration(
+    client_id, accounts, monkeypatch
+):
+    from services.recurring_entries import generate_occurrence, preview_due
+
+    _select_client(monkeypatch, client_id)
+    FiscalPeriod.ensure_periods_exist(client_id, 2026, 12)
+    template = JournalEntryTemplate(
+        client_id=client_id,
+        name="Reversal recovery",
+        description="Accrual with reversal",
+        entry_type="Adjusting",
+        lines=[
+            TemplateLine(accounts["expense"], debit_cents=25_000),
+            TemplateLine(accounts["cash"], credit_cents=25_000),
+        ],
+    )
+    template.save()
+    schedule = RecurringSchedule(
+        template_id=template.id,
+        starts_on=date(2026, 1, 1),
+        reversal_rule="NextDay",
+    )
+    schedule.save()
+    january = preview_due(client_id, through_date=date(2026, 1, 31))[0]
+    generated = generate_occurrence(
+        client_id, schedule.id, january.period_start, january.period_end
+    )
+    DraftEntry.get_by_id(generated["draft_id"], client_id).approve()
+    rejected = DraftEntry.get_pending(client_id)[0]
+    rejected.reject()
+
+    page = AppTest.from_file(
+        page_path("pages/2_Journal_Entries.py"), default_timeout=30
+    )
+    page.session_state["journal_active_tab"] = "Templates & recurring"
+    page.run()
+    key = f"recurring_regenerate_reversal_{generated['occurrence_id']}_rg0"
+    button = page.button(key=key)
+    assert button.label == "Regenerate reversal"
+    button.click().run()
+
+    assert not page.exception
+    pending = DraftEntry.get_pending(client_id)
+    assert len(pending) == 1
+    assert pending[0].id != rejected.id
+    assert pending[0].entry_date == rejected.entry_date
+
+
+def test_new_entry_can_be_saved_as_template(client_id, accounts, monkeypatch):
+    _select_client(monkeypatch, client_id)
+    page = AppTest.from_file(
+        page_path("pages/2_Journal_Entries.py"), default_timeout=30
+    ).run()
+    page.text_input(key="je_hdr_desc_g0").set_value("Monthly rent").run()
+    page.selectbox(key="account_0_g0").set_value(accounts["expense"]).run()
+    page.number_input(key="debit_0_g0").set_value(1500.0).run()
+    page.selectbox(key="account_1_g0").set_value(accounts["cash"]).run()
+    page.number_input(key="credit_1_g0").set_value(1500.0).run()
+    page.text_input(
+        key="je_new_template_name_g0__journal_entries_g0"
+    ).set_value("Rent template").run()
+    page.button(key="je_save_template__journal_entries_g0").click().run()
+
+    assert not page.exception
+    stored = JournalEntryTemplate.get_all(client_id)
+    assert len(stored) == 1
+    assert stored[0].name == "Rent template"
+    assert stored[0].lines[0].debit_cents == 150_000
+    assert JournalEntry.count(client_id) == 0
+
+
+def test_firm_settings_date_format_widget_is_book_scoped(db, monkeypatch):
+    """The date-format widget key must belong to the open book: a bare key
+    survives a book switch and would save book A's format into book B."""
+    from database import connection as dbconn
+    from streamlit.delta_generator import DeltaGenerator
+    from utils.client_context import book_scoped_key
+
+    monkeypatch.setattr(DeltaGenerator, "page_link", lambda self, *a, **k: None)
+    key = book_scoped_key("firm_date_format", dbconn.DATABASE_PATH)
+    assert key != "firm_date_format"
+    assert key != book_scoped_key("firm_date_format", "/elsewhere/other.probooks")
+
+    firm = AppTest.from_file(
+        page_path("pages/12_Firm_Settings.py"), default_timeout=30
+    ).run()
+    assert not firm.exception
+    assert firm.selectbox(key=key).value
+
+
+def test_chart_of_accounts_warns_about_unresolved_subtypes(
+    client_id, accounts, monkeypatch
+):
+    """A legacy subtype that no longer resolves (e.g. bare Equity "Capital"
+    after the 1.6.0 vocabulary change) must be announced with a visible
+    warning, not only inside the collapsed review expander."""
+    _select_client(monkeypatch, client_id)
+    legacy = Account(client_id=client_id, account_number="3100",
+                     name="Owner's Capital", type="Equity", subtype="Capital")
+    legacy.save()
+
+    page = AppTest.from_file(
+        page_path("pages/3_Chart_of_Accounts.py"), default_timeout=30
+    ).run()
+    assert not page.exception
+    warnings = " ".join(str(item.value) for item in page.warning)
+    assert "need a statement grouping" in warnings or \
+        "needs a statement grouping" in warnings
+    assert "3100 Owner's Capital" in warnings

@@ -25,8 +25,8 @@ from utils.ui import statement_html
 
 ROWS = [
     ("section", "Assets", []),
-    ("item", "Operating Checking", [48210.55], None, "1000"),
-    ("item", "Accounts receivable, net", [96500.25], None, ""),
+    ("item", "Operating Checking", [48210.55], None, None, "1000"),
+    ("item", "Accounts receivable, net", [96500.25], None, None, ""),
     ("subtotal", "Total Assets", [144710.80]),
     ("total", "Total Liabilities & Equity", [144710.80]),
 ]
@@ -65,7 +65,7 @@ def test_group_headings_span_the_number_column_and_keep_their_style():
     html = statement_html([
         ("section", "Assets", []),
         ("group", "Current Assets", []),
-        ("item", "Cash", [1.0], None, "1000"),
+        ("item", "Cash", [1.0], None, None, "1000"),
     ], show_numbers=True)
     group = _rows_of(html, "group")[0]
     assert "<td class='lbl' colspan='2'>Current Assets</td>" in group
@@ -140,14 +140,15 @@ def test_note_row_spans_every_column():
     plain = statement_html([("note", "No revenue recorded", [])])
     assert "colspan='2'" in plain
     numbered = statement_html(
-        [("item", "x", [1.0], None, "1"), ("note", "No revenue recorded", [])],
+        [("item", "x", [1.0], None, None, "1"),
+         ("note", "No revenue recorded", [])],
         show_numbers=True)
     assert "colspan='3'" in numbered
 
 
 def test_comparative_layout_widens_and_dates_its_headings():
     html = statement_html(
-        [("item", "Cash", [1.0, 2.0, -1.0, -50.0], None, "1000")],
+        [("item", "Cash", [1.0, 2.0, -1.0, -50.0], None, None, "1000")],
         headers=["As of Aug 31, 2026", "As of Aug 31, 2025", "$ Change", "% Change"],
         formats=["money", "money", "money", "percent"], show_numbers=True)
     assert "pb-statement wide numbered" in html
@@ -165,7 +166,7 @@ def test_consecutive_totals_each_keep_their_rule():
 
 
 def test_a_caption_with_markup_in_it_is_escaped():
-    html = statement_html([("item", "R&D <script>", [1.0], None, "6000")],
+    html = statement_html([("item", "R&D <script>", [1.0], None, None, "6000")],
                           show_numbers=True)
     assert "R&amp;D &lt;script&gt;" in html
     assert "<script>" not in html

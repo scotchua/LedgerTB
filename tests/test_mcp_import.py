@@ -10,6 +10,7 @@ from datetime import date
 import pytest
 
 from database import connection as dbconn
+from database.connection import get_cursor
 from models.account import Account
 from models.audit_log import AuditLog
 from models.client import Client
@@ -38,6 +39,8 @@ def test_propose_import_stages_with_identity_and_is_idempotent(
 
     result = mcp_tools.propose_import(client_id, cash_no, ROWS, "July stmt")
     assert result["staged"] == 3 and result["skipped_already_known"] == 0
+    assert result["staged_clean"] == 3
+    assert result["flagged_as_possible_duplicates"] == 0
 
     staged = ImportedTransaction.get_by_status(client_id, "Pending")
     assert len(staged) == 3
@@ -47,6 +50,8 @@ def test_propose_import_stages_with_identity_and_is_idempotent(
     # Re-proposing the same statement stages nothing new.
     again = mcp_tools.propose_import(client_id, cash_no, ROWS, "July stmt")
     assert again["staged"] == 0 and again["skipped_already_known"] == 3
+    assert again["staged_clean"] == 0
+    assert again["flagged_as_possible_duplicates"] == 0
     assert len(ImportedTransaction.get_by_status(client_id, "Pending")) == 3
 
     # The assistant cannot touch its own staged rows after filing them.
@@ -57,6 +62,99 @@ def test_propose_import_stages_with_identity_and_is_idempotent(
                 (client_id,))
 
     assert len(mcp_tools.list_staged_imports(client_id)) == 3
+
+
+def test_changed_batch_stages_same_facts_but_reports_them_as_flagged(
+    client_id, accounts
+):
+    cash_no = _cash_number(client_id, accounts)
+    mcp_tools.propose_import(client_id, cash_no, ROWS, "July stmt")
+
+    changed_batch = [ROWS[0], {**ROWS[1], "description": "NEW ROW"}]
+    result = mcp_tools.propose_import(
+        client_id, cash_no, changed_batch, "Changed extraction"
+    )
+
+    assert result["staged"] == 2
+    assert result["skipped_already_known"] == 0
+    assert result["flagged_as_possible_duplicates"] == 1
+    assert result["staged_clean"] == 1
+
+
+def test_legacy_import_identity_is_computed_without_assistant_update(
+    client_id, accounts, monkeypatch
+):
+    cash_no = _cash_number(client_id, accounts)
+    with get_cursor(commit=True) as cursor:
+        cursor.execute(
+            """INSERT INTO imported_transactions
+               (client_id, import_batch, transaction_date, description, amount,
+                bank_account_id, status)
+               VALUES (?, 'legacy', '2026-06-01', 'LEGACY ROW', -1000, ?,
+                       'Posted')""",
+            (client_id, accounts["cash"]),
+        )
+        legacy_id = cursor.lastrowid
+
+    monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", "propose")
+    result = mcp_tools.propose_import(
+        client_id, cash_no,
+        [{"date": "2026-07-01", "description": "NEW ROW", "amount": -5}],
+    )
+
+    assert result["staged"] == 1
+    with get_cursor() as cursor:
+        cursor.execute(
+            "SELECT row_fingerprint, idempotency_key "
+            "FROM imported_transactions WHERE id = ?", (legacy_id,),
+        )
+        legacy = cursor.fetchone()
+    assert legacy["row_fingerprint"] is None
+    assert legacy["idempotency_key"] is None
+
+
+def test_propose_import_normalizes_credit_card_statement_signs(
+    client_id, accounts
+):
+    card = Account.get_by_id(
+        accounts["credit_card"], client_id=client_id
+    )
+    rows = [
+        {"date": "2026-07-03", "description": "CANVA", "amount": 15.00},
+        {
+            "date": "2026-07-07",
+            "description": "CARD PAYMENT",
+            "amount": -100.00,
+        },
+    ]
+
+    mcp_tools.propose_import(client_id, card.account_number, rows, "Card stmt")
+
+    staged = ImportedTransaction.get_by_status(client_id, "Pending")
+    amounts = {row.description: row.amount for row in staged}
+    assert amounts == {"CANVA": -15.00, "CARD PAYMENT": 100.00}
+
+
+def test_propose_import_allows_explicit_sign_override(client_id, accounts):
+    card = Account.get_by_id(
+        accounts["credit_card"], client_id=client_id
+    )
+    rows = [
+        {"date": "2026-07-03", "description": "OFX CANVA", "amount": -15.00}
+    ]
+
+    mcp_tools.propose_import(
+        client_id,
+        card.account_number,
+        rows,
+        "Normalized OFX",
+        sign_convention="bank",
+    )
+
+    staged = ImportedTransaction.get_by_status(client_id, "Pending")
+    assert [(row.description, row.amount) for row in staged] == [
+        ("OFX CANVA", -15.00)
+    ]
 
 
 def test_propose_import_validation(client_id, accounts):
@@ -72,6 +170,10 @@ def test_propose_import_validation(client_id, accounts):
         mcp_tools.propose_import(client_id, cash_no,
                                  [{"date": "2026-07-03", "description": "x",
                                    "amount": 0}])
+    with pytest.raises(ValueError, match="sign_convention"):
+        mcp_tools.propose_import(
+            client_id, cash_no, ROWS, sign_convention="statement-ish"
+        )
 
 
 def test_hydration_does_not_self_match_and_posting_adopts_the_row(

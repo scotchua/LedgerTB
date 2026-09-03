@@ -21,10 +21,12 @@ import functools
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mcp.server import MCPServer
+from pydantic import BaseModel, ConfigDict, Field
 
 from database import connection as dbconn
 from services import mcp_tools
@@ -38,6 +40,45 @@ from utils import secure_store
 # path, key, read-only mode, and access level are process globals.
 _tool_lock = threading.Lock()
 _tool_state = threading.local()
+
+
+class AccountImportRow(BaseModel):
+    """One chart-of-accounts row accepted by import_accounts."""
+
+    # This model exists to DOCUMENT the row shape, not to replace the service's
+    # per-row validation with whole-call validation. QuickBooks exports and LLM
+    # clients may supply numbers as integers or include extra metadata; those
+    # rows must still reach import_accounts so every one is accounted for.
+    model_config = ConfigDict(extra="allow")
+
+    number: Any = Field(
+        default="",
+        description="Account number. Optional; LedgerTB assigns one if blank.",
+    )
+    name: Any = Field(default="", description="Account name; required per row.")
+    type: Any = Field(
+        default="",
+        description=(
+            "Canonical LedgerTB type or a QuickBooks type such as Bank, "
+            "Credit Card, Accounts Receivable (A/R), or Fixed Asset."
+        )
+    )
+    subtype: Any = Field(
+        default="",
+        description=(
+            "Optional reporting subtype; overrides the subtype implied by a "
+            "QuickBooks type. Examples: Cash, Accounts Receivable, Fixed "
+            "Asset, Accumulated Depreciation (alias: Contra Asset), Credit "
+            "Card, Retained Earnings, Operating Revenue, Operating Expense."
+        ),
+    )
+    detail_type: Any = Field(
+        default="",
+        description="Optional QuickBooks alias for subtype/detail type.",
+    )
+    description: Any = Field(
+        default="", description="Optional account description or notes."
+    )
 
 
 def _access_level(names) -> str:
@@ -175,7 +216,8 @@ server = MCPServer(
         "find the client_id; amounts are US dollars. What you may do is set "
         "by the user's chosen access level (Data Safety): read only; "
         "propose (file draft entries, stage imports, and suggest client "
-        "branding text/colors for human review); "
+        "branding text/colors for human review; scaffold clients, accounts, "
+        "and open fiscal calendars directly); "
         "or post (additionally post balanced entries, APPEND-ONLY — nothing "
         "can ever be edited or deleted from here). Tools tell you if the "
         "level is insufficient."
@@ -208,10 +250,11 @@ def list_clients() -> list:
 
 @server.tool()
 @_serialized
-def list_accounts(client_id: int) -> list:
-    """The client's chart of accounts: number, name, type, subtype, active."""
+def list_accounts(client_id: int, account_number: str = "") -> list:
+    """The client's chart of accounts: number, name, type, subtype, active.
+    Pass account_number for one exact account; no match returns an empty list."""
     _require_level("read")
-    return mcp_tools.list_accounts(client_id)
+    return mcp_tools.list_accounts(client_id, account_number or None)
 
 
 @server.tool()
@@ -259,7 +302,10 @@ def trial_balance(client_id: int, as_of: str = "",
 def income_statement(client_id: int, start: str, end: str,
                      compare_to_prior_year: bool = False) -> dict:
     """Income statement for a period (ISO dates): revenues, expenses, and net
-    income. Set compare_to_prior_year for line-by-line PY amounts and changes."""
+    income. multistep_ready says whether every Revenue and Expense account is
+    classified well enough to show Gross Profit and Operating Income; review
+    statement_warnings when false. Set compare_to_prior_year for line-by-line
+    PY amounts, changes, and combined current/prior classification diagnostics."""
     _require_level("read")
     return mcp_tools.income_statement(
         client_id, start, end, compare_to_prior_year
@@ -306,10 +352,11 @@ def general_ledger(client_id: int, account_number: str,
 @_serialized
 def find_entries(client_id: int, search: str = "", start: str = "",
                  end: str = "", account_number: str = "",
-                 entry_type: str = "", limit: int = 50) -> list:
+                 entry_type: str = "", limit: int = 50) -> dict:
     """Search journal entries. search matches description/reference/amount;
     entry_type is Regular, Adjusting, Closing, or Beginning Balance; all
-    filters optional and combinable."""
+    filters optional and combinable. Returns {entries: [], count: 0} when no
+    entries match."""
     _require_level("read")
     return mcp_tools.find_entries(
         client_id, search or None, start or None, end or None,
@@ -416,7 +463,8 @@ def propose_depreciation_run(client_id: int, fixed_asset_id: int,
 @_serialized
 def list_drafts(client_id: int, status: str = "pending") -> list:
     """Draft entries this server has filed and their review status
-    ("pending", "approved", "rejected", or "all")."""
+    ("pending", "approved", "rejected", or "all"). Each result includes the
+    stored entry_type; clients must not guess a missing accounting type."""
     _require_level("read")
     return mcp_tools.list_drafts(client_id, status)
 
@@ -425,17 +473,23 @@ def list_drafts(client_id: int, status: str = "pending") -> list:
 @_serialized
 @_mutating
 def propose_import(client_id: int, bank_account_number: str, rows: list,
-                   source_label: str = "Assistant import") -> dict:
+                   source_label: str = "Assistant import",
+                   sign_convention: str = "auto") -> dict:
     """Stage bank/card transactions for human review in LedgerTB's import
-    flow — use this after normalizing ANY statement format (CSV, PDF, OFX,
-    a pasted table). rows: [{"date": "2026-07-03", "description": "...",
-    "amount": -12.50}] — positive = money in, negative = money out, from the
-    bank account's perspective. Duplicate-checked; nothing posts until a
-    person categorizes and posts it in the app. Needs access level "propose"
-    or higher."""
+    flow — use this after parsing ANY statement format (CSV, PDF, OFX, or a
+    pasted table). Send amounts as printed in the source register: bank
+    deposits are positive and withdrawals negative; card charges are positive
+    and payments negative. LedgerTB normalizes card signs so negative always
+    means money out. sign_convention defaults to "auto" from the account type;
+    pass "bank", "credit_card", or "flip" only when the source differs.
+    Exact retries of the same batch are skipped. Matching accounting facts
+    submitted in a changed batch are staged but counted as possible duplicates
+    for human review; staged_clean and flagged_as_possible_duplicates partition
+    the staged count. Nothing posts until a person categorizes and posts it in
+    the app. Needs access level "propose" or higher."""
     _require_level("propose")
     return mcp_tools.propose_import(client_id, bank_account_number, rows,
-                                    source_label)
+                                    source_label, sign_convention)
 
 
 @server.tool()
@@ -476,13 +530,14 @@ def post_entry(client_id: int, entry_date: str, description: str,
 @server.tool()
 @_serialized
 def export_close_package(client_id: int, period_start: str, period_end: str,
-                         out_dir: str) -> dict:
+                         out_dir: str = "") -> dict:
     """Write the period's close package — a branded PDF and an Excel workbook
     (Summary, Trial Balance, Transactions, Adjusting Entries, Receipts &
     Disbursements) — into out_dir, so a workpaper tool such as LedgerPDF can
-    ingest it. Works at every access level, but ONLY into folders the user
-    listed in LEDGERTB_MCP_EXPORT_ROOTS; anywhere else is refused. The export
-    is audit-logged."""
+    ingest it. Works at every access level, but only inside the per-book export
+    folder approved in LedgerTB -> Data Safety -> Assistant access (or the
+    environment fallback). Omit out_dir to use that approved folder. The
+    export is audit-logged."""
     _require_level("read")
     return mcp_tools.export_close_package(client_id, period_start, period_end,
                                           out_dir)
@@ -493,26 +548,41 @@ def export_close_package(client_id: int, period_start: str, period_end: str,
 @_mutating
 def create_client(name: str, entity_type: str = "",
                   fiscal_year_end_month: int = 12,
-                  seed_default_chart: bool = True) -> dict:
+                  seed_default_chart: bool = True,
+                  initial_fiscal_year: int = 0) -> dict:
     """Create a new client (a new set of books), optionally seeded with the
-    default chart of accounts. Setup only — the assistant can never modify or
-    delete a client afterwards. Needs access level "propose" or higher."""
+    default chart of accounts and an initial period calendar. A zero
+    initial_fiscal_year means the fiscal year containing today. Setup only — the
+    assistant can never modify or delete a client afterwards. Needs access
+    level "propose" or higher."""
     _require_level("propose")
     return mcp_tools.create_client(name, entity_type, fiscal_year_end_month,
-                                   seed_default_chart)
+                                   seed_default_chart, initial_fiscal_year)
 
 
 @server.tool()
 @_serialized
 @_mutating
-def import_accounts(client_id: int, rows: list) -> dict:
-    """Add accounts to a client's chart of accounts. rows:
-    [{"number": "1000", "name": "Operating Checking", "type": "Bank"}] —
-    canonical or QuickBooks type names both work (QB names imply subtypes,
-    e.g. Bank -> Asset/Cash). Existing numbers are skipped and reported;
-    nothing is silently dropped. Needs access level "propose" or higher."""
+def ensure_fiscal_year(client_id: int, fiscal_year: int) -> dict:
+    """Idempotently add a client's Year, Quarter, and Month periods so Close
+    Map and period workflows can use that fiscal year. Needs assistant access
+    level "propose" or higher."""
     _require_level("propose")
-    return mcp_tools.import_accounts(client_id, rows)
+    return mcp_tools.ensure_fiscal_year(client_id, fiscal_year)
+
+
+@server.tool()
+@_mutating
+def import_accounts(client_id: int, rows: list[AccountImportRow]) -> dict:
+    """Add typed rows to a client's chart. QuickBooks types imply subtypes
+    (Bank -> Asset/Cash); an explicit subtype overrides that implication.
+    Existing numbers, assigned numbers, errors, and semantic warnings are all
+    reported; nothing is silently dropped. Needs access level "propose" or
+    higher."""
+    _require_level("propose")
+    return mcp_tools.import_accounts(
+        client_id, [row.model_dump() for row in rows]
+    )
 
 
 @server.tool()

@@ -80,6 +80,7 @@ coa_scope = scope_page_to_client(
 )
 if coa_scope.changed:
     st.session_state.pop("editing_account", None)
+    st.session_state.pop("_coa_scroll_to_editor", None)
 
 coa_key = coa_scope.key
 
@@ -107,6 +108,22 @@ with tab1:
         if not AccountSubtype.is_canonical(account.type, account.subtype)
     ]
     if review_accounts:
+        preview_names = ", ".join(
+            f"{account.account_number} {account.name}"
+            for account in review_accounts[:4]
+        )
+        if len(review_accounts) > 4:
+            preview_names += f", and {len(review_accounts) - 4} more"
+        st.warning(
+            f"{len(review_accounts)} account"
+            f"{'s' if len(review_accounts) != 1 else ''} need"
+            f"{'' if len(review_accounts) != 1 else 's'} a statement "
+            f"grouping: {preview_names}. Until one is assigned, these "
+            "accounts appear under an \"Unclassified\" heading on financial "
+            "statements and their cash activity shows a review warning on "
+            "the cash flow statement. Assign groupings in \"Review "
+            "statement subtypes\" just below."
+        )
         with st.expander(
             f"Review statement subtypes ({len(review_accounts)})",
             expanded=False,
@@ -221,15 +238,48 @@ with tab1:
                             # Edit button
                             if st.button("Edit", key=coa_key(f"edit_{account.id}")):
                                 st.session_state['editing_account'] = account.id
+                                st.session_state['_coa_scroll_to_editor'] = True
+                                st.rerun()
 
-        # Edit account modal
+        # Edit account panel
         if 'editing_account' in st.session_state:
             account = Account.get_by_id(st.session_state['editing_account'], client_id=client_id)
             if account is None:
                 # Unknown or stale id (e.g. left over from before a client switch) -
                 # drop it rather than risk editing/deleting another client's account.
                 st.session_state.pop('editing_account', None)
+                st.session_state.pop('_coa_scroll_to_editor', None)
             if account:
+                scroll_to_editor = st.session_state.pop(
+                    '_coa_scroll_to_editor', False
+                )
+                scroll_script = ""
+                if scroll_to_editor:
+                    # The editor follows the complete account list, so opening it
+                    # can otherwise look like an unresponsive button. The script
+                    # is static and runs once after Streamlit mounts the anchor.
+                    scroll_script = """
+                        <script>
+                        (() => {
+                            const anchor = document.getElementById(
+                                "account-edit-form"
+                            );
+                            if (!anchor) return;
+                            window.requestAnimationFrame(() => {
+                                anchor.scrollIntoView({
+                                    behavior: "smooth",
+                                    block: "start"
+                                });
+                            });
+                        })();
+                        </script>
+                    """
+                st.html(
+                    '<div id="account-edit-form" '
+                    'style="scroll-margin-top: 1rem;"></div>'
+                    + scroll_script,
+                    unsafe_allow_javascript=scroll_to_editor,
+                )
                 st.divider()
                 st.subheader(f"Edit Account: {account.display_name()}")
 
@@ -465,6 +515,8 @@ with tab3:
                 f"(listed above). Importing now creates a partial chart — fix "
                 f"the file to bring in everything.", icon="⚠️",
             )
+        for warning in [a.get("warning") for a in parsed if a.get("warning")]:
+            st.warning(warning, icon="⚠️")
 
         if parsed:
             existing_accounts = Account.get_all(client_id, active_only=False)

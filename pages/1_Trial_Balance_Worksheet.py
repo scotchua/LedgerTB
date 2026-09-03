@@ -26,6 +26,7 @@ from utils.ui import apply_default_on_change
 from utils.unlock import require_unlock
 from utils import icons
 from utils.export import set_excel_literal
+from utils.fiscal_dates import fiscal_year_ending_year
 from models.client import Client
 from models.fiscal_period import FiscalPeriod
 from models.reports import ReportGenerator
@@ -38,6 +39,7 @@ from services.close_package import (
     consistent_export_window,
     load_close_package_snapshot,
 )
+from services.preferences import get_date_format
 
 
 st.set_page_config(
@@ -50,6 +52,7 @@ st.set_page_config(
 # Gate on the database passphrase before any DB access, then ensure schema.
 require_unlock()
 init_database()
+date_format = get_date_format()
 
 client_id = render_client_selector()
 
@@ -90,8 +93,8 @@ col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 
 with col1:
     # Get current year and ensure periods exist
-    current_year = date.today().year
     fiscal_year_end = client.fiscal_year_end_month
+    current_year = fiscal_year_ending_year(date.today(), fiscal_year_end)
 
     # Check available years from existing periods
     periods = FiscalPeriod.get_all(client_id)
@@ -196,13 +199,15 @@ apply_default_on_change(period_end_key, depends_on=selected_period_id,
 with col3:
     period_start = st.date_input(
         "From",
-        key=period_start_key
+        key=period_start_key,
+        format=date_format,
     )
 
 with col4:
     period_end = st.date_input(
         "To",
-        key=period_end_key
+        key=period_end_key,
+        format=date_format,
     )
 
 if period_start > period_end:
@@ -712,7 +717,8 @@ if st.session_state.get('show_aje_form', False):
                 key=worksheet_key("aje_reference"),
             )
             aje_date = st.date_input(
-                "Date", value=period_end, key=worksheet_key("aje_date")
+                "Date", value=period_end, key=worksheet_key("aje_date"),
+                format=date_format,
             )
 
         with form_cols[1]:

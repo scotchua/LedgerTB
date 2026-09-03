@@ -281,6 +281,9 @@ def test_close_package_renders_curated_statement_groups(client_id, accounts):
     wb = openpyxl.load_workbook(BytesIO(package.read()))
 
     income = wb["Income Statement"]
+    income_labels = [
+        income.cell(row, 1).value for row in range(1, income.max_row + 1)
+    ]
     income_rows = {
         income.cell(row, 1).value: income.cell(row, 2).value
         for row in range(1, income.max_row + 1)
@@ -290,6 +293,8 @@ def test_close_package_renders_curated_statement_groups(client_id, accounts):
     assert income_rows["  Cost of Goods Sold"] is None
     assert income_rows["Gross Profit"] == pytest.approx(200)
     assert income_rows["Operating Income"] == pytest.approx(150)
+    assert income_labels.count("Operating Expenses") == 1
+    assert "  Operating Expenses" not in income_labels
 
     balance = wb["Balance Sheet"]
     balance_rows = {
@@ -319,6 +324,52 @@ def test_close_package_renders_curated_statement_groups(client_id, accounts):
             assert label in text
     finally:
         doc.close()
+
+
+def test_close_package_uses_sign_neutral_cash_labels_and_parentheses(
+    client_id, accounts
+):
+    operating_expense = Account(
+        client_id=client_id,
+        account_number="6100",
+        name="Rent Expense",
+        type="Expense",
+        subtype=AccountSubtype.OPERATING_EXPENSE,
+    )
+    operating_expense.save()
+    post_entry(client_id, date(2026, 2, 1), [
+        (operating_expense.id, 125, 0), (accounts["cash"], 0, 125),
+    ])
+    tb_rows, _ = ReportGenerator.trial_balance_worksheet(client_id, *Q1)
+    snapshot = load_close_package_snapshot(client_id, *Q1)
+
+    workbook = openpyxl.load_workbook(BytesIO(build_close_package(
+        client_id, "Test Co", *Q1, tb_rows, snapshot=snapshot
+    ).read()))
+    cash_flow = workbook["Cash Flow"]
+    total_label = "Net Cash Provided by (Used in) Operating Activities"
+    total_row = next(
+        row for row in range(1, cash_flow.max_row + 1)
+        if cash_flow.cell(row, 1).value == total_label
+    )
+    assert cash_flow.cell(total_row, 2).value == pytest.approx(-125)
+    assert cash_flow.cell(total_row, 2).number_format == (
+        '#,##0.00;(#,##0.00);"-"'
+    )
+
+    document = pdfium.PdfDocument(build_close_package_pdf(
+        client_id, "Test Co", *Q1, tb_rows, snapshot=snapshot
+    ).read())
+    try:
+        text = "\n".join(
+            document[index].get_textpage().get_text_range()
+            for index in range(len(document))
+        )
+        assert total_label in text
+        assert "(125.00)" in text
+        assert "-125.00" not in text
+    finally:
+        document.close()
 
 
 def test_close_package_discloses_offsetting_unclassified_cash_entries(
@@ -660,6 +711,7 @@ def test_pdf_package_contains_every_section(booked_period, accounts):
         assert "240.00" in text          # total revenue
         assert "190.00" in text          # net income
         assert "Balance sheet is in balance." in text
+        assert "Net income ties to balance sheet earnings" in text
         assert "CASH AT BEGINNING OF PERIOD" in text
         assert "TOTALS" in text
         assert len(doc) >= 6
@@ -764,3 +816,45 @@ def test_pdf_and_excel_can_share_one_captured_snapshot(
     )
     assert xlsx.read().startswith(b"PK")
     assert pdf.read().startswith(b"%PDF")
+
+
+def test_summary_ties_net_income_to_balance_sheet_earnings(booked_period, accounts):
+    """Full-fiscal-year packages assert income-statement net income equals the
+    balance sheet's Current Year Earnings (docs/EARNINGS-ATTRIBUTION.md) --
+    including with a mid-year conversion Beginning Balance in the book."""
+    client_id = booked_period
+    post_entry(client_id, date(2026, 6, 30), [
+        (accounts["cash"], 5000, 0), (accounts["revenue"], 0, 5000),
+    ], entry_type="Beginning Balance")
+    full_year = (date(2026, 1, 1), date(2026, 12, 31))
+
+    tb_rows, _ = ReportGenerator.trial_balance_worksheet(client_id, *full_year)
+    package = build_close_package(client_id, "Test Co", *full_year, tb_rows)
+    wb = openpyxl.load_workbook(BytesIO(package.read()))
+    summary = wb["Summary"]
+    cells = {summary.cell(row=i, column=1).value: summary.cell(row=i, column=2).value
+             for i in range(1, summary.max_row + 1)}
+    assert cells["Net income ties to balance sheet earnings"] == "YES"
+
+    # Any fiscal-year-to-date period ties: Q1 starts at the fiscal year.
+    tb_rows_q1, _ = ReportGenerator.trial_balance_worksheet(client_id, *Q1)
+    q1_package = build_close_package(client_id, "Test Co", *Q1, tb_rows_q1)
+    q1_summary = openpyxl.load_workbook(BytesIO(q1_package.read()))["Summary"]
+    q1_cells = {
+        q1_summary.cell(row=i, column=1).value: q1_summary.cell(row=i, column=2).value
+        for i in range(1, q1_summary.max_row + 1)
+    }
+    assert q1_cells["Net income ties to balance sheet earnings"] == "YES"
+
+    # A period that does not start at the fiscal year reports the comparison
+    # as not applicable rather than failing a tie that cannot hold for it.
+    feb_mar = (date(2026, 2, 1), date(2026, 3, 31))
+    tb_rows_fm, _ = ReportGenerator.trial_balance_worksheet(client_id, *feb_mar)
+    fm_package = build_close_package(client_id, "Test Co", *feb_mar, tb_rows_fm)
+    fm_summary = openpyxl.load_workbook(BytesIO(fm_package.read()))["Summary"]
+    fm_cells = {
+        fm_summary.cell(row=i, column=1).value: fm_summary.cell(row=i, column=2).value
+        for i in range(1, fm_summary.max_row + 1)
+    }
+    assert fm_cells["Net income ties to balance sheet earnings"] == \
+        "Not a fiscal year-to-date period - not compared"

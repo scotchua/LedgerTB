@@ -76,18 +76,20 @@ _ASSISTANT_INSERT_TABLES = {
     # Export audit rows at every level: even a read-level assistant's file
     # exports get recorded, and both tables are append-only anyway.
     "read": frozenset({"audit_log", "document_audits"}),
-    # clients/accounts at propose+: an assistant may scaffold a new client
-    # and its chart (setup, not ledger); it still cannot alter either later
-    # (no UPDATE/DELETE at any level).
+    # clients/accounts/fiscal_periods at propose+: an assistant may scaffold a
+    # new client, its chart, and its period calendar (setup, not ledger); it
+    # still cannot alter any of them later (no UPDATE/DELETE at any level).
     "propose": frozenset({"draft_entries", "imported_transactions", "audit_log",
                           "document_audits",
-                          "clients", "accounts", "close_review_proposals",
+                          "clients", "accounts", "fiscal_periods",
+                          "close_review_proposals",
                           "client_branding_proposals", "bank_connections",
                           "bank_connection_accounts", "bank_connection_syncs",
                           "depreciation_draft_links"}),
     "post": frozenset({"draft_entries", "imported_transactions", "audit_log",
                        "document_audits",
-                       "clients", "accounts", "close_review_proposals",
+                       "clients", "accounts", "fiscal_periods",
+                       "close_review_proposals",
                        "client_branding_proposals", "bank_connections",
                        "bank_connection_accounts", "bank_connection_syncs",
                        "depreciation_draft_links",

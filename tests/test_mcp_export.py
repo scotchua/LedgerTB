@@ -79,9 +79,10 @@ def test_export_refused_outside_roots(client_id, accounts, tmp_path, monkeypatch
     approved.mkdir()
     elsewhere = tmp_path / "elsewhere"
     monkeypatch.setenv("LEDGERTB_MCP_EXPORT_ROOTS", str(approved))
-    with pytest.raises(ValueError, match="outside"):
+    with pytest.raises(ValueError, match="outside") as exc_info:
         mcp_tools.export_close_package(client_id, "2026-01-01", "2026-03-31",
                                        str(elsewhere))
+    assert str(approved) in str(exc_info.value)
     with pytest.raises(ValueError, match="outside"):
         mcp_tools.export_close_package(client_id, "2026-01-01", "2026-03-31",
                                        str(approved / ".." / "elsewhere"))
@@ -241,6 +242,32 @@ def test_second_rename_failure_removes_first_final_file(
     assert audit is not None
     assert completion is None
     assert final_files == []
+
+
+def test_export_defaults_to_the_approved_folder(client_id, accounts, tmp_path,
+                                                monkeypatch):
+    _seed(client_id, accounts)
+    monkeypatch.setenv("LEDGERTB_MCP_EXPORT_ROOTS", str(tmp_path))
+
+    result = mcp_tools.export_close_package(
+        client_id, "2026-01-01", "2026-03-31", ""
+    )
+
+    assert Path(result["pdf"]).parent == tmp_path
+    assert Path(result["xlsx"]).parent == tmp_path
+
+
+def test_relative_export_directory_is_resolved_inside_approved_root(
+    client_id, accounts, tmp_path, monkeypatch
+):
+    _seed(client_id, accounts)
+    monkeypatch.setenv("LEDGERTB_MCP_EXPORT_ROOTS", str(tmp_path))
+
+    result = mcp_tools.export_close_package(
+        client_id, "2026-01-01", "2026-03-31", "  Q1 close  "
+    )
+
+    assert Path(result["pdf"]).parent == tmp_path / "Q1 close"
 
 
 def test_the_folder_chosen_in_the_app_beats_the_environment(client_id, accounts,

@@ -1,8 +1,9 @@
 import streamlit as st
 import sys
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date
 from io import BytesIO
+from urllib.parse import urlencode
 
 import pandas as pd
 
@@ -12,19 +13,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.account import Account
 from models.client import Client
 from models.audit_log import AuditLog
-from models.reports import ReportGenerator
+from models.reports import CASH_FLOW_STATEMENT_SECTIONS, ReportGenerator
 from money import to_dollars
 from services.ar_ap import get_1099_summary, get_income_by_customer, get_sales_tax_report
 from database import init_database
 from database import connection as dbconn
 from utils.client_context import (
+    book_scoped_key,
     pop_client_intent,
     scope_page_to_client,
     set_client_intent,
 )
 from utils.client_selector import render_client_selector
-from utils.unlock import require_unlock
-from utils.dates import long_date, short_date
+from utils.unlock import authorized_ui_token, require_unlock
+from utils.dates import display_date, long_date, short_date
+from services.preferences import get_date_format
 from utils.ui import (
     apply_default_on_change,
     financial_statement,
@@ -36,6 +39,12 @@ from utils.ui import (
 from utils import icons
 from utils.export import sanitize_df
 from utils.fiscal_dates import fiscal_year_bounds
+from utils.report_dates import (
+    AS_OF_PRESETS,
+    PERIOD_PRESETS,
+    as_of_for_preset,
+    period_for_preset,
+)
 
 
 def _comparative_headers(current, prior):
@@ -58,6 +67,42 @@ st.set_page_config(page_title="Reports", page_icon=icons.REPORTS, layout="wide")
 require_unlock()
 init_database()
 
+def _query_value(name):
+    value = st.query_params.get(name)
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+# Every URL parameter a report link can carry. One signature over all of them
+# is the "have I applied this URL yet" marker for the client below and for the
+# report route further down, so Back/Forward always count as a new URL.
+_ROUTE_FIELDS = (
+    "report", "client_id", "account_id", "start", "end", "as_of", "return_report",
+    "return_start", "return_end", "return_as_of",
+)
+
+# A new browser tab starts a new Streamlit session. Carry the selected client
+# in report links and validate it against the open book before the sidebar
+# selector renders, so a drill-down cannot silently land on the first client.
+route_client_value = _query_value("client_id")
+try:
+    route_client_id = int(route_client_value) if route_client_value else None
+except (TypeError, ValueError):
+    route_client_id = None
+route_client = Client.get_by_id(route_client_id) if route_client_id else None
+# Apply the URL's client once per URL, mirroring the report-route guard below.
+# Reapplying on every rerun would override the user's own sidebar selection
+# for the rest of the session after a drill-down. The marker key is
+# book-scoped: the same URL against a different book is a different route.
+_route_marker_key = book_scoped_key("_reports_client_route", dbconn.DATABASE_PATH)
+_route_signature = tuple((name, _query_value(name)) for name in _ROUTE_FIELDS)
+if st.session_state.get(_route_marker_key) != _route_signature:
+    st.session_state[_route_marker_key] = _route_signature
+    if route_client and route_client.is_active:
+        st.session_state.selected_client_id = route_client_id
+        st.session_state.client_selector = route_client_id
+
 client_id = render_client_selector()
 
 st.title("Reports")
@@ -66,6 +111,19 @@ if not client_id:
     st.warning("Please create a client first in the Clients page.")
     st.page_link("pages/0_Clients.py", label="Go to Clients →")
     st.stop()
+
+# The user picked a different client than the URL's route: drop the stale
+# route parameters (never the launch token) so a refresh cannot resurrect
+# the old client or aim its account filters at the new client's books.
+if route_client_id and client_id != route_client_id:
+    for _name in _ROUTE_FIELDS:
+        if _name in st.query_params:
+            del st.query_params[_name]
+    # Re-mark against the now-cleared URL, so browser Back to the old drill
+    # URL reads as a new route and reapplies its client.
+    st.session_state[_route_marker_key] = tuple(
+        (name, _query_value(name)) for name in _ROUTE_FIELDS
+    )
 
 report_scope = scope_page_to_client(
     st.session_state, "reports", client_id, dbconn.DATABASE_PATH
@@ -81,32 +139,121 @@ report_key = report_scope.key
 # Get client info
 client = Client.get_by_id(client_id)
 st.caption(f"Viewing: **{client.name}**")
-current_fy_start, _ = fiscal_year_bounds(date.today(), client.fiscal_year_end_month)
+today = date.today()
+current_fy_start, _ = fiscal_year_bounds(today, client.fiscal_year_end_month)
+date_format = get_date_format()
 
 
-def gl_drill_down(options, key, start_date, end_date):
-    """One selectbox + button instead of a button per account row."""
-    if not options:
-        return
-    dd1, dd2 = st.columns([3, 1])
-    with dd1:
-        picked = st.selectbox(
-            "Drill into general ledger",
-            options=list(options.keys()),
-            format_func=lambda account_id: options[account_id],
-            key=report_key(f"{key}_gl_pick"),
+def _query_date(name):
+    raw = _query_value(name)
+    try:
+        return date.fromisoformat(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _report_href(report, **values):
+    params = {"report": report, "client_id": client_id}
+    params.update({
+        key: value.isoformat() if isinstance(value, date) else value
+        for key, value in values.items()
+        if value is not None
+    })
+    ui_token = authorized_ui_token()
+    if ui_token:
+        params["t"] = ui_token
+    return "?" + urlencode(params)
+
+
+def _drill_href(
+    account_id, start_date, end_date, return_report,
+    *, return_start=None, return_end=None, return_as_of=None,
+):
+    return _report_href(
+        "General Ledger",
+        account_id=account_id,
+        start=start_date,
+        end=end_date,
+        return_report=return_report,
+        return_start=return_start,
+        return_end=return_end,
+        return_as_of=return_as_of,
+    )
+
+
+def _as_of_selector(prefix, label="As of Date"):
+    preset_col, date_col, _ = st.columns([1.2, 1, 2])
+    with preset_col:
+        preset = st.selectbox(
+            "Date preset",
+            AS_OF_PRESETS,
+            key=report_key(f"{prefix}_date_preset"),
         )
-    with dd2:
-        st.write("")
-        if st.button(
-            "Open GL →", width="stretch",
-            key=report_key(f"{key}_gl_open"),
-        ):
-            st.session_state.gl_account_id = picked
-            st.session_state.gl_start_date = start_date
-            st.session_state.gl_end_date = end_date
-            st.session_state.active_report = "General Ledger"
-            st.rerun()
+    selected = as_of_for_preset(
+        preset, today, client.fiscal_year_end_month
+    )
+    date_key = report_key(f"{prefix}_date")
+    if selected is not None:
+        apply_default_on_change(
+            date_key, (client_id, preset, today), selected
+        )
+    date_value = {} if date_key in st.session_state else {
+        "value": selected or today
+    }
+    with date_col:
+        return st.date_input(
+            label,
+            key=date_key,
+            format=date_format,
+            disabled=selected is not None,
+            **date_value,
+        )
+
+
+def _period_selector(prefix, default_preset="This Fiscal Year"):
+    preset_col, start_col, end_col, _ = st.columns([1.2, 1, 1, 1])
+    with preset_col:
+        preset = st.selectbox(
+            "Date range",
+            PERIOD_PRESETS,
+            index=PERIOD_PRESETS.index(default_preset),
+            key=report_key(f"{prefix}_date_preset"),
+        )
+    selected = period_for_preset(
+        preset, today, client.fiscal_year_end_month
+    )
+    start_key = report_key(f"{prefix}_start")
+    end_key = report_key(f"{prefix}_end")
+    if selected is not None:
+        apply_default_on_change(
+            start_key, (client_id, preset, today), selected[0]
+        )
+        apply_default_on_change(
+            end_key, (client_id, preset, today), selected[1]
+        )
+    start_value_arg = {} if start_key in st.session_state else {
+        "value": selected[0] if selected else current_fy_start
+    }
+    end_value_arg = {} if end_key in st.session_state else {
+        "value": selected[1] if selected else today
+    }
+    with start_col:
+        start_value = st.date_input(
+            "Start Date",
+            key=start_key,
+            format=date_format,
+            disabled=selected is not None,
+            **start_value_arg,
+        )
+    with end_col:
+        end_value = st.date_input(
+            "End Date",
+            key=end_key,
+            format=date_format,
+            disabled=selected is not None,
+            **end_value_arg,
+        )
+    return start_value, end_value
 
 # Track active report in session state for sidebar navigation
 if 'active_report' not in st.session_state:
@@ -131,8 +278,76 @@ if isinstance(report_intent, dict):
                 "start_date", current_fy_start
             )
             st.session_state.gl_end_date = report_intent.get(
-                "end_date", date.today()
+                "end_date", today
             )
+            nested_return = report_intent.get("return_route")
+            if isinstance(nested_return, dict):
+                st.session_state[report_key("return_route")] = nested_return
+
+# Account lines are ordinary links so they support browser Back, right-click,
+# and Command/Ctrl-click into a new tab. Apply a URL route only once per URL;
+# otherwise its original account and dates would overwrite deliberate changes
+# to the General Ledger filters on every Streamlit rerun.
+route_signature = tuple((name, _query_value(name)) for name in _ROUTE_FIELDS)
+route_key = report_key("query_route")
+if st.session_state.get(route_key) != route_signature:
+    st.session_state[route_key] = route_signature
+    route_report = _query_value("report")
+    if route_report in report_options:
+        st.session_state.active_report = route_report
+        st.session_state.pop("_active_report_rendered", None)
+        route_start = _query_date("start")
+        route_end = _query_date("end")
+        route_as_of = _query_date("as_of")
+
+        if route_report == "General Ledger":
+            raw_account = _query_value("account_id")
+            try:
+                st.session_state.gl_account_id = int(raw_account)
+            except (TypeError, ValueError):
+                st.session_state.gl_account_id = None
+            st.session_state.gl_start_date = route_start or current_fy_start
+            st.session_state.gl_end_date = route_end or today
+            return_report = _query_value("return_report")
+            if return_report in report_options and return_report != "General Ledger":
+                st.session_state[report_key("return_route")] = {
+                    "report": return_report,
+                    "start": _query_date("return_start"),
+                    "end": _query_date("return_end"),
+                    "as_of": _query_date("return_as_of"),
+                }
+        elif route_report in {"Income Statement", "Cash Flow"}:
+            prefix = "is" if route_report == "Income Statement" else "cf"
+            st.session_state[report_key(f"{prefix}_date_preset")] = "Custom"
+            if route_start:
+                st.session_state[report_key(f"{prefix}_start")] = route_start
+            if route_end:
+                st.session_state[report_key(f"{prefix}_end")] = route_end
+        elif route_report in {"Trial Balance", "Balance Sheet"}:
+            prefix = "tb" if route_report == "Trial Balance" else "bs"
+            st.session_state[report_key(f"{prefix}_date_preset")] = "Custom"
+            if route_as_of:
+                st.session_state[report_key(f"{prefix}_date")] = route_as_of
+    elif not route_report:
+        # Browser Back removes the drill-down query string. Restore the report
+        # that created the link, matching the explicit Back control below.
+        prior_route = st.session_state.get(report_key("return_route"))
+        if isinstance(prior_route, dict) and prior_route.get("report") in report_options:
+            prior_report = prior_route["report"]
+            st.session_state.active_report = prior_report
+            st.session_state.pop("_active_report_rendered", None)
+            if prior_report in {"Income Statement", "Cash Flow"}:
+                prefix = "is" if prior_report == "Income Statement" else "cf"
+                st.session_state[report_key(f"{prefix}_date_preset")] = "Custom"
+                if prior_route.get("start"):
+                    st.session_state[report_key(f"{prefix}_start")] = prior_route["start"]
+                if prior_route.get("end"):
+                    st.session_state[report_key(f"{prefix}_end")] = prior_route["end"]
+            elif prior_report in {"Trial Balance", "Balance Sheet"}:
+                prefix = "tb" if prior_report == "Trial Balance" else "bs"
+                st.session_state[report_key(f"{prefix}_date_preset")] = "Custom"
+                if prior_route.get("as_of"):
+                    st.session_state[report_key(f"{prefix}_date")] = prior_route["as_of"]
 
 # Report selector (segmented tabs; programmatically controllable via
 # st.session_state.active_report from the sidebar quick links and GL drills).
@@ -175,11 +390,7 @@ elif selected_report == "1099 Summary":
 elif selected_report == "Trial Balance":
     st.subheader("Trial Balance")
 
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        as_of_date = st.date_input(
-            "As of Date", value=date.today(), key=report_key("tb_date")
-        )
+    as_of_date = _as_of_selector("tb")
 
     rows = ReportGenerator.trial_balance(client_id, as_of_date)
     comparison = ReportGenerator.comparative_trial_balance(client_id, as_of_date)
@@ -207,14 +418,25 @@ elif selected_report == "Trial Balance":
     else:
         total_debits = sum(r.debit for r in rows)
         total_credits = sum(r.credit for r in rows)
+        gl_start = fiscal_year_bounds(
+            as_of_date, client.fiscal_year_end_month
+        )[0]
 
         st.markdown(f"**As of {long_date(as_of_date)}**")
+        st.caption(
+            "Click an account to open its ledger. Use your browser's Back "
+            "button to return to this report."
+        )
         if compare_py:
             statement_rows = [
                 ("item", f"{row['account_number']} - {row['name']}",
                  [row['current_debit'] or None, row['current_credit'] or None,
                   row['prior_debit'] or None, row['prior_credit'] or None],
-                 row['type'])
+                 row['type'],
+                 _drill_href(
+                     account_id_lookup[row['account_number']], gl_start,
+                     as_of_date, "Trial Balance", return_as_of=as_of_date,
+                 ) if row['account_number'] in account_id_lookup else None)
                 for row in comparison['accounts']
             ]
             statement_rows.append((
@@ -235,7 +457,11 @@ elif selected_report == "Trial Balance":
                  f"{row.account_number} - {row.account_name}",
                  [row.debit if row.debit > 0 else None,
                   row.credit if row.credit > 0 else None],
-                 row.account_type)
+                 row.account_type,
+                 _drill_href(
+                     account_id_lookup[row.account_number], gl_start,
+                     as_of_date, "Trial Balance", return_as_of=as_of_date,
+                 ) if row.account_number in account_id_lookup else None)
                 for row in rows
             ]
             statement_rows.append(("total", "Totals", [total_debits, total_credits]))
@@ -245,15 +471,6 @@ elif selected_report == "Trial Balance":
             st.success("Trial balance is in balance.")
         else:
             st.error(f"Trial balance is OUT OF BALANCE by ${abs(total_debits - total_credits):,.2f}")
-
-        gl_drill_down(
-            {account_id_lookup[r.account_number]:
-                 f"{r.account_number} - {r.account_name}"
-             for r in rows if r.account_number in account_id_lookup},
-            key="tb",
-            start_date=fiscal_year_bounds(as_of_date, client.fiscal_year_end_month)[0],
-            end_date=as_of_date,
-        )
 
         # Export
         st.divider()
@@ -281,15 +498,7 @@ elif selected_report == "Trial Balance":
 elif selected_report == "Income Statement":
     st.subheader("Income Statement")
 
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        is_start = st.date_input(
-            "Start Date", value=current_fy_start, key=report_key("is_start")
-        )
-    with col2:
-        is_end = st.date_input(
-            "End Date", value=date.today(), key=report_key("is_end")
-        )
+    is_start, is_end = _period_selector("is")
 
     if is_start > is_end:
         st.error("Income statement start date cannot be after the end date.")
@@ -345,6 +554,10 @@ elif selected_report == "Income Statement":
     st.markdown(
         f"**{long_date(is_start)} to {long_date(is_end)}**"
     )
+    st.caption(
+        "Click an account to open its ledger. Use your browser's Back "
+        "button to return to this report."
+    )
 
     def _amounts(item):
         if not compare_py:
@@ -386,6 +599,14 @@ elif selected_report == "Income Statement":
         # The warning is already shown with warning styling above the table.
         'statement_warnings': [],
     }
+    line_href_lookup = {
+        item['account_number']: _drill_href(
+            account_id_lookup[item['account_number']], is_start, is_end,
+            "Income Statement", return_start=is_start, return_end=is_end,
+        )
+        for item in revenue_lines + expense_lines
+        if item['account_number'] in account_id_lookup
+    }
     statement_rows = []
     for kind, label, value in ReportGenerator.income_statement_rows(
         layout_report, grouped=group_is
@@ -396,6 +617,7 @@ elif selected_report == "Income Statement":
             label,
             [] if value is None else _amounts(value),
             None,
+            line_href_lookup.get(number) if kind == "item" else None,
             number,
         ))
 
@@ -415,14 +637,6 @@ elif selected_report == "Income Statement":
             f"Prior period: {long_date(report['prior_period']['start'])} to "
             f"{long_date(report['prior_period']['end'])}"
         )
-
-    gl_drill_down(
-        {account_id_lookup[r['account_number']]:
-             f"{r['account_number']} - {r['name']}"
-         for r in revenue_lines + expense_lines
-         if r['account_number'] in account_id_lookup},
-        key="is", start_date=is_start, end_date=is_end,
-    )
 
     # Export
     st.divider()
@@ -457,11 +671,7 @@ elif selected_report == "Income Statement":
 elif selected_report == "Balance Sheet":
     st.subheader("Balance Sheet")
 
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        bs_date = st.date_input(
-            "As of Date", value=date.today(), key=report_key("bs_date")
-        )
+    bs_date = _as_of_selector("bs")
 
     group_accounts_bs = st.toggle(
         "Group accounts", key=report_key("bs_group_accounts"),
@@ -514,6 +724,13 @@ elif selected_report == "Balance Sheet":
     account_id_lookup = {a.account_number: a.id for a in accounts}
 
     st.markdown(f"**As of {long_date(bs_date)}**")
+    st.caption(
+        "Click an account to open its ledger. Use your browser's Back "
+        "button to return to this report."
+    )
+    bs_gl_start = fiscal_year_bounds(
+        bs_date, client.fiscal_year_end_month
+    )[0]
 
     def _bs_amounts(item):
         if not compare_py:
@@ -541,28 +758,33 @@ elif selected_report == "Balance Sheet":
                 visible.append({**group, 'accounts': accounts})
         return visible
 
+    def _bs_item_row(item):
+        account_number = item['account_number']
+        href = None
+        if account_number and account_number in account_id_lookup:
+            href = _drill_href(
+                account_id_lookup[account_number], bs_gl_start, bs_date,
+                "Balance Sheet", return_as_of=bs_date,
+            )
+        # Bare caption: the number has its own column, so gluing it onto the
+        # label would put the words on two different left edges.
+        return ("item", item['name'], _bs_amounts(item), None, href,
+                account_number)
+
     def _section(title, groups, flat_items, subtotal_label, subtotal_value):
         rows = [("section", title, [])]
         if group_bs:
             visible_groups = _visible_bs_groups(groups)
             for group in visible_groups:
                 rows.append(("group", group['group'], []))
-                rows.extend(
-                    ("item", item['name'], _bs_amounts(item), None,
-                     item['account_number'])
-                    for item in group['accounts']
-                )
+                rows.extend(_bs_item_row(item) for item in group['accounts'])
                 rows.append((
                     "subtotal", f"Total {group['group']}",
                     _bs_amounts(group['subtotal']),
                 ))
             has_lines = bool(visible_groups)
         else:
-            rows.extend(
-                ("item", item['name'], _bs_amounts(item), None,
-                 item['account_number'])
-                for item in flat_items
-            )
+            rows.extend(_bs_item_row(item) for item in flat_items)
             has_lines = bool(flat_items)
         if not has_lines:
             rows.append(("note", f"No {title.lower()} recorded", []))
@@ -597,16 +819,6 @@ elif selected_report == "Balance Sheet":
     else:
         st.error("Balance sheet is OUT OF BALANCE!")
 
-    gl_drill_down(
-        {account_id_lookup[e['account_number']]:
-             f"{e['account_number']} - {e['name']}"
-         for e in asset_lines + liability_lines + equity_lines
-         if e['account_number'] and e['account_number'] in account_id_lookup},
-        key="bs",
-        start_date=fiscal_year_bounds(bs_date, client.fiscal_year_end_month)[0],
-        end_date=bs_date,
-    )
-
     # Export
     st.divider()
     df = (
@@ -638,16 +850,7 @@ elif selected_report == "Balance Sheet":
 elif selected_report == "Cash Flow":
     st.subheader("Statement of Cash Flows")
 
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        cf_start = st.date_input(
-            "Start Date", value=current_fy_start,
-            key=report_key("cf_start")
-        )
-    with col2:
-        cf_end = st.date_input(
-            "End Date", value=date.today(), key=report_key("cf_end")
-        )
+    cf_start, cf_end = _period_selector("cf")
 
     if cf_start > cf_end:
         st.error("Cash flow statement start date cannot be after the end date.")
@@ -670,6 +873,12 @@ elif selected_report == "Cash Flow":
         st.caption("No prior-year book history is available for this period.")
 
     st.markdown(f"**{long_date(cf_start)} to {long_date(cf_end)}**")
+    st.caption(
+        "Click a single-account line to open its ledger. Use your browser's "
+        "Back button to return to this report."
+    )
+    accounts = Account.get_all(client_id, active_only=False)
+    account_by_id = {account.id: account for account in accounts}
 
     def _cf_amounts(item):
         if not compare_py:
@@ -686,28 +895,28 @@ elif selected_report == "Cash Flow":
             [line for line in section['lines'] if line['current'] != 0]
         )
         if lines:
-            rows.extend(
-                ("item", line['name'], _cf_amounts(line)) for line in lines
-            )
+            for line in lines:
+                account_id = line.get('account_id')
+                account_ids = line.get('account_ids') or []
+                if not account_id and len(account_ids) == 1:
+                    account_id = account_ids[0]
+                href = None
+                if account_id in account_by_id:
+                    href = _drill_href(
+                        account_id, cf_start, cf_end, "Cash Flow",
+                        return_start=cf_start, return_end=cf_end,
+                    )
+                rows.append((
+                    "item", line['name'], _cf_amounts(line), None, href
+                ))
         else:
             rows.append(("note", f"No {title.lower()} recorded", []))
         rows.append(("subtotal", total_label, _cf_amounts(section['total'])))
         return rows
 
-    statement_rows = (
-        _cf_section(
-            "Operating Activities", report['operating'],
-            "Net Cash Provided by Operating Activities",
-        )
-        + _cf_section(
-            "Investing Activities", report['investing'],
-            "Net Cash Provided by Investing Activities",
-        )
-        + _cf_section(
-            "Financing Activities", report['financing'],
-            "Net Cash Provided by Financing Activities",
-        )
-    )
+    statement_rows = []
+    for title, key, total_label in CASH_FLOW_STATEMENT_SECTIONS:
+        statement_rows += _cf_section(title, report[key], total_label)
     show_unclassified = bool(
         report['unclassified']['lines']
         or report['unclassified']['current_entries']
@@ -774,7 +983,8 @@ elif selected_report == "Cash Flow":
             for item in report['unclassified']['current_entries']:
                 accounts_text = ", ".join(item['account_numbers']) or "none"
                 st.write(
-                    f"{item['entry_date']} · Entry #{item['entry_id']} · "
+                    f"{display_date(item['entry_date'], date_format)} · "
+                    f"Entry #{item['entry_id']} · "
                     f"{item['reason']} · "
                     f"{item['description'] or 'No description'} · "
                     f"Accounts {accounts_text} · ${item['amount']:,.2f}"
@@ -788,7 +998,8 @@ elif selected_report == "Cash Flow":
             for item in report['unclassified']['prior_entries']:
                 accounts_text = ", ".join(item['account_numbers']) or "none"
                 st.write(
-                    f"{item['entry_date']} · Entry #{item['entry_id']} · "
+                    f"{display_date(item['entry_date'], date_format)} · "
+                    f"Entry #{item['entry_id']} · "
                     f"{item['reason']} · "
                     f"{item['description'] or 'No description'} · "
                     f"Accounts {accounts_text} · ${item['amount']:,.2f}"
@@ -802,7 +1013,8 @@ elif selected_report == "Cash Flow":
             for item in report['current_noncash_items']:
                 accounts_text = ", ".join(item['accounts'])
                 st.write(
-                    f"{item['entry_date']} · Entry #{item['entry_id']} · "
+                    f"{display_date(item['entry_date'], date_format)} · "
+                    f"Entry #{item['entry_id']} · "
                     f"{item['description'] or 'No description'} · "
                     f"Accounts {accounts_text} · ${item['amount']:,.2f}"
                 )
@@ -815,25 +1027,11 @@ elif selected_report == "Cash Flow":
             for item in report['prior_noncash_items']:
                 accounts_text = ", ".join(item['accounts'])
                 st.write(
-                    f"{item['entry_date']} · Entry #{item['entry_id']} · "
+                    f"{display_date(item['entry_date'], date_format)} · "
+                    f"Entry #{item['entry_id']} · "
                     f"{item['description'] or 'No description'} · "
                     f"Accounts {accounts_text} · ${item['amount']:,.2f}"
                 )
-
-    accounts = Account.get_all(client_id, active_only=False)
-    account_by_id = {account.id: account for account in accounts}
-    drill_options = {}
-    for section_name in ('operating', 'investing', 'financing', 'unclassified'):
-        for line in report[section_name]['lines']:
-            account_id = line.get('account_id')
-            account_ids = line.get('account_ids') or []
-            if not account_id and len(account_ids) == 1:
-                account_id = account_ids[0]
-            if account_id in account_by_id:
-                drill_options[account_id] = account_by_id[account_id].display_name()
-    gl_drill_down(
-        drill_options, key="cf", start_date=cf_start, end_date=cf_end
-    )
 
     st.divider()
     if compare_py:
@@ -862,6 +1060,26 @@ elif selected_report == "Cash Flow":
 elif selected_report == "General Ledger":
     st.subheader("General Ledger")
 
+    return_route = st.session_state.get(report_key("return_route"))
+    if isinstance(return_route, dict) and return_route.get("report") in report_options:
+        return_params = {
+            "report": return_route["report"], "client_id": client_id,
+        }
+        if return_route.get("start"):
+            return_params["start"] = return_route["start"].isoformat()
+        if return_route.get("end"):
+            return_params["end"] = return_route["end"].isoformat()
+        if return_route.get("as_of"):
+            return_params["as_of"] = return_route["as_of"].isoformat()
+        ui_token = authorized_ui_token()
+        if ui_token:
+            return_params["t"] = ui_token
+        st.page_link(
+            "pages/5_Reports.py",
+            label=f"← Back to {return_route['report']}",
+            query_params=return_params,
+        )
+
     # Account selection
     accounts = Account.get_all(client_id, active_only=False)
     account_options = {
@@ -869,49 +1087,40 @@ elif selected_report == "General Ledger":
         for a in accounts
     }
 
-    # Check for drill-down from another report
-    default_account = st.session_state.get('gl_account_id', None)
-    default_start = st.session_state.get('gl_start_date', current_fy_start)
-    default_end = st.session_state.get('gl_end_date', date.today())
+    # A report link or sidebar intent seeds the actual keyed widgets once. The
+    # account widget then owns its value independently of the dates, so changing
+    # the period cannot fall back to All accounts.
+    account_filter_key = report_key("gl_account_filter")
+    pending_account = st.session_state.pop("gl_account_id", None)
+    pending_start = st.session_state.pop("gl_start_date", None)
+    pending_end = st.session_state.pop("gl_end_date", None)
+    if pending_account is not None:
+        st.session_state[account_filter_key] = (
+            pending_account if pending_account in account_options else None
+        )
+    if pending_start is not None or pending_end is not None:
+        st.session_state[report_key("gl_date_preset")] = "Custom"
+        if pending_start is not None:
+            st.session_state[report_key("gl_start")] = pending_start
+        if pending_end is not None:
+            st.session_state[report_key("gl_end")] = pending_end
 
-    # Clear the session state after using it
-    if 'gl_account_id' in st.session_state:
-        del st.session_state.gl_account_id
-    if 'gl_start_date' in st.session_state:
-        del st.session_state.gl_start_date
-    if 'gl_end_date' in st.session_state:
-        del st.session_state.gl_end_date
+    gl_start, gl_end = _period_selector("gl")
 
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
+    account_col, _ = st.columns([1.5, 2.5])
+    with account_col:
         if account_options:
-            # The full book is the default; the picker narrows to one account
-            # (and drill-downs from other reports land on theirs).
-            option_ids = list(account_options.keys())
-            default_idx = (option_ids.index(default_account)
-                           if default_account in account_options else None)
             selected_account = st.selectbox(
                 "Account filter",
-                options=option_ids,
+                options=list(account_options.keys()),
                 format_func=lambda x: account_options[x],
-                index=default_idx,
+                index=None,
                 placeholder="All accounts",
-                key=report_key("gl_account_filter"),
+                key=account_filter_key,
             )
         else:
             st.warning("No accounts available")
             selected_account = None
-
-    with col2:
-        gl_start = st.date_input(
-            "Start Date", value=default_start, key=report_key("gl_start")
-        )
-
-    with col3:
-        gl_end = st.date_input(
-            "End Date", value=default_end, key=report_key("gl_end")
-        )
 
     if gl_start > gl_end:
         st.error("General ledger start date cannot be after the end date.")
@@ -983,7 +1192,8 @@ elif selected_report == "General Ledger":
             )
         elif not selected_account:
             st.caption(f"{len(displayed)} accounts with activity or balances · "
-                       f"{gl_start} – {gl_end}")
+                       f"{display_date(gl_start, date_format)} – "
+                       f"{display_date(gl_end, date_format)}")
 
         open_options = {}
         for account, entries in displayed:
@@ -998,7 +1208,7 @@ elif selected_report == "General Ledger":
                          "Reference",
                          "Debit", "Credit", "Balance"],
                 rows=[
-                    [e.entry_date.isoformat(),
+                    [display_date(e.entry_date, date_format),
                      f"#{e.entry_id}" if e.entry_id else "",
                      (e.description or "")[:48],
                      e.import_correction_label,
@@ -1018,7 +1228,8 @@ elif selected_report == "General Ledger":
                 ],
             )
             open_options.update({
-                e.entry_id: (f"#{e.entry_id} · {e.entry_date} · "
+                e.entry_id: (f"#{e.entry_id} · "
+                             f"{display_date(e.entry_date, date_format)} · "
                              f"{(e.description or '')[:34]}"
                              f"{' · ' + e.import_correction_label if e.import_correction_label else ''}")
                 for e in entries if e.entry_id
@@ -1043,7 +1254,17 @@ elif selected_report == "General Ledger":
                     set_client_intent(
                         st.session_state,
                         "journal",
-                        {"entry_id": picked_entry, "view": "New Entry"},
+                        {
+                            "entry_id": picked_entry,
+                            "view": "New Entry",
+                            "return_report": {
+                                "report": "General Ledger",
+                                "account_id": selected_account,
+                                "start_date": gl_start,
+                                "end_date": gl_end,
+                                "return_route": return_route,
+                            },
+                        },
                         client_id,
                         dbconn.DATABASE_PATH,
                     )

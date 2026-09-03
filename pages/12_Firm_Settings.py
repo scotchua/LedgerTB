@@ -18,7 +18,14 @@ from services.branding import (
     save_client_branding,
 )
 from services.ar_ap import SMTP_SECRET_NAMES
+from services.preferences import (
+    DATE_FORMAT_LABELS,
+    get_preferences,
+    save_date_format,
+)
+from database import connection as dbconn
 from utils import secure_store
+from utils.client_context import book_scoped_key
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 from utils import icons
@@ -59,6 +66,25 @@ if st.button("Save SMTP settings"):
 
 st.divider()
 
+st.subheader("Display preferences")
+st.caption(
+    "Choose how dates appear in LedgerTB. This preference is stored inside "
+    "the encrypted book and applies to every client in it."
+)
+preferences = get_preferences()
+date_format_options = list(DATE_FORMAT_LABELS)
+date_format = st.selectbox(
+    "Date format",
+    options=date_format_options,
+    index=date_format_options.index(preferences.date_format),
+    format_func=lambda value: DATE_FORMAT_LABELS[value],
+    key=book_scoped_key("firm_date_format", dbconn.DATABASE_PATH),
+)
+if st.button("Save display preferences", key="save_display_preferences"):
+    save_date_format(date_format)
+    st.success("Display preferences saved.")
+
+st.divider()
 st.subheader("Document branding")
 st.caption(
     "Your firm's identity on generated deliverables — the close package PDF "
@@ -259,9 +285,11 @@ st.subheader("AI categorization")
 st.caption(
     "Powered by your own AI provider API key, stored in the system credential "
     "vault — never in a file. When suggestions run, transaction dates, "
-    "descriptions, amounts, and your account names/numbers are sent to "
-    "the selected provider. Changing providers changes which third party "
-    "receives this client data. Suggestions only; nothing posts without review."
+    "descriptions, amounts, account names/numbers, client entity and business "
+    "types, and the client's optional AI business context are sent to the "
+    "selected provider. General client Notes are not sent. Changing providers "
+    "changes which third party receives this client data. Suggestions only; "
+    "nothing posts without review."
 )
 
 from services.categorization import (
