@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import uuid
 from collections import defaultdict
 from datetime import date
 from typing import Dict, List, Optional
@@ -233,6 +234,93 @@ def post_pay_run(pay_run_id: int, wage_accounts: Dict[str, int],
     finally:
         conn.close()
     return entry
+
+
+def discard_pay_run(pay_run_id: int) -> dict:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT * FROM pay_runs WHERE id = ?", (pay_run_id,))
+        pay_run = cursor.fetchone()
+        if not pay_run:
+            raise ValueError("Pay run not found.")
+        if pay_run["status"] != "draft" or pay_run["journal_entry_id"] is not None:
+            raise ValueError("Only an unposted draft pay run can be discarded.")
+
+        cursor.execute(
+            "SELECT * FROM pay_stubs WHERE pay_run_id = ? ORDER BY id",
+            (pay_run_id,),
+        )
+        stubs = cursor.fetchall()
+        cursor.execute(
+            "SELECT r.id FROM payroll_import_rows r "
+            "JOIN payroll_import_batches b ON b.id = r.batch_id "
+            "WHERE r.pay_run_id = ? AND r.status = 'accepted' "
+            "AND b.client_id = ? ORDER BY r.id",
+            (pay_run_id, pay_run["client_id"]),
+        )
+        import_row_ids = [row["id"] for row in cursor.fetchall()]
+        operation_id = uuid.uuid4().hex
+
+        for row_id in import_row_ids:
+            cursor.execute(
+                "UPDATE payroll_import_rows SET status = 'pending', pay_run_id = NULL "
+                "WHERE id = ? AND pay_run_id = ? AND status = 'accepted'",
+                (row_id, pay_run_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "An import row changed during discard. Nothing was changed."
+                )
+            AuditLog.write(
+                cursor, pay_run["client_id"], "payroll_import_rows", row_id, "UPDATE",
+                old_values={"status": "accepted", "pay_run_id": pay_run_id},
+                new_values={"status": "pending", "pay_run_id": None,
+                            "reason": "pay run discarded",
+                            "operation_id": operation_id},
+            )
+
+        for stub in stubs:
+            cursor.execute("DELETE FROM pay_stubs WHERE id = ?", (stub["id"],))
+            AuditLog.write(
+                cursor, pay_run["client_id"], "pay_stubs", stub["id"], "DELETE",
+                old_values={"employee_id": stub["employee_id"],
+                            "gross_pay_cents": stub["gross_pay_cents"],
+                            "net_pay_cents": stub["net_pay_cents"],
+                            "deductions": json.loads(stub["deductions"])},
+                new_values={"operation_id": operation_id},
+            )
+
+        cursor.execute("DELETE FROM pay_runs WHERE id = ?", (pay_run_id,))
+        AuditLog.write(
+            cursor, pay_run["client_id"], "pay_runs", pay_run_id, "DELETE",
+            old_values={"pay_period_start": pay_run["pay_period_start"],
+                        "pay_period_end": pay_run["pay_period_end"],
+                        "pay_date": pay_run["pay_date"], "status": pay_run["status"],
+                        "stub_count": len(stubs),
+                        "reverted_import_rows": import_row_ids},
+            new_values={"operation_id": operation_id},
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"pay_run_id": pay_run_id, "stubs_deleted": len(stubs),
+            "import_rows_reverted": len(import_row_ids)}
+
+
+def linked_import_row_count(pay_run_id: int) -> int:
+    conn = get_connection()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM payroll_import_rows "
+            "WHERE pay_run_id = ? AND status = 'accepted'", (pay_run_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
 
 
 def parse_canonical_payroll_csv(content: str) -> List[dict]:
@@ -484,8 +572,8 @@ def accept_payroll_batch(batch_id: int) -> PayRun:
                         new_values={"department_id": row["matched_department_id"]},
                     )
             cursor.execute(
-                "UPDATE payroll_import_rows SET status = 'accepted' "
-                "WHERE id = ? AND status = 'pending'", (row["id"],),
+                "UPDATE payroll_import_rows SET status = 'accepted', pay_run_id = ? "
+                "WHERE id = ? AND status = 'pending'", (pay_run_id, row["id"]),
             )
             if cursor.rowcount != 1:
                 raise ValueError("This payroll import batch has already been accepted.")

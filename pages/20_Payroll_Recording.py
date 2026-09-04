@@ -12,9 +12,9 @@ from models.department import Department
 from models.payroll import Employee, PayRun, PayStub
 from money import to_cents
 from services.payroll_recording import (
-    accept_payroll_batch, add_pay_stub, create_pay_run, dismiss_payroll_row,
-    get_payroll_import_rows, parse_canonical_payroll_csv, post_pay_run,
-    stage_payroll_rows, update_payroll_import_row,
+    accept_payroll_batch, add_pay_stub, create_pay_run, discard_pay_run,
+    dismiss_payroll_row, get_payroll_import_rows, parse_canonical_payroll_csv, post_pay_run,
+    linked_import_row_count, stage_payroll_rows, update_payroll_import_row,
 )
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
@@ -101,6 +101,9 @@ with employees_tab:
                 st.error(f"Could not add employee: {exc}")
 
 with runs_tab:
+    discard_message = st.session_state.pop("payroll_discard_message", None)
+    if discard_message:
+        st.success(discard_message)
     st.subheader("Pay Runs")
     st.caption("Enter only figures already provided by your payroll source.")
     with st.form("create_pay_run"):
@@ -222,6 +225,42 @@ with runs_tab:
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Could not post pay run: {exc}")
+
+        confirm_discard_id = st.session_state.get("confirm_discard_pay_run_id")
+        if confirm_discard_id != selected_id:
+            if st.button("Discard this draft", key=f"discard_pay_run_{selected_id}"):
+                st.session_state["confirm_discard_pay_run_id"] = selected_id
+                st.rerun()
+        else:
+            linked_import_rows = linked_import_row_count(selected_id)
+            warning = f"Discard this draft and its {len(stubs)} recorded pay stubs?"
+            if linked_import_rows:
+                warning += (
+                    f" Its {linked_import_rows} imported payroll rows return to the "
+                    "Import tab for review."
+                )
+            st.warning(warning)
+            confirm_col, cancel_col = st.columns(2)
+            with confirm_col:
+                if st.button("Confirm", key=f"confirm_discard_pay_run_{selected_id}"):
+                    try:
+                        result = discard_pay_run(selected_id)
+                        st.session_state.pop("confirm_discard_pay_run_id", None)
+                        if st.session_state.get("payroll_run_id") == selected_id:
+                            st.session_state.pop("payroll_run_id", None)
+                        st.session_state.pop("payroll_run_selection", None)
+                        st.session_state["payroll_discard_message"] = (
+                            f"Discarded draft with {result['stubs_deleted']} pay stubs. "
+                            f"Returned {result['import_rows_reverted']} imported payroll "
+                            "rows for review."
+                        )
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+            with cancel_col:
+                if st.button("Cancel", key=f"cancel_discard_pay_run_{selected_id}"):
+                    st.session_state.pop("confirm_discard_pay_run_id", None)
+                    st.rerun()
     else:
         st.success(f"Posted as journal entry {selected_run.journal_entry_id}.")
 
