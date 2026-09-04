@@ -91,7 +91,7 @@ _ASSISTANT_INSERT_TABLES = {
                           # chooses in the app, so it is not grantable here.
                           # "employees" is deliberately absent: adding a
                           # person to the book is a human decision.
-                          "pay_runs", "pay_stubs"}),
+                          "pay_runs", "pay_stubs", "import_suggestions"}),
     "post": frozenset({"draft_entries", "imported_transactions", "audit_log",
                        "document_audits",
                        "clients", "accounts", "fiscal_periods",
@@ -99,7 +99,7 @@ _ASSISTANT_INSERT_TABLES = {
                        "client_branding_proposals", "bank_connections",
                        "bank_connection_accounts", "bank_connection_syncs",
                        "depreciation_draft_links",
-                       "pay_runs", "pay_stubs",
+                       "pay_runs", "pay_stubs", "import_suggestions",
                        "journal_entries", "journal_entry_lines"}),
 }
 

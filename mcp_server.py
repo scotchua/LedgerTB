@@ -544,6 +544,18 @@ def list_staged_imports(client_id: int) -> list:
 @server.tool()
 @_serialized
 @_mutating
+def suggest_categories(client_id: int, suggestions: list,
+                       request_id: str = None) -> dict:
+    """Suggest Revenue or Expense accounts for pending staged transactions.
+    A person still chooses each account in Import Transactions. Needs access
+    level "propose" or higher."""
+    _require_level("propose")
+    return mcp_tools.suggest_categories(client_id, suggestions, request_id)
+
+
+@server.tool()
+@_serialized
+@_mutating
 def sync_bank_feed(client_id: int, bank_account_id: int) -> dict:
     """Fetch a linked SimpleFIN account and stage new transactions for human
     review. Nothing posts to the ledger. Needs assistant access level

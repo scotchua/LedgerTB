@@ -368,11 +368,18 @@ class Account:
                 blockers["categorization rules"] = rules
             imp = count(
                 "SELECT COUNT(*) FROM imported_transactions "
-                "WHERE bank_account_id = ? OR suggested_account_id = ?",
-                account_id, account_id,
+                "WHERE bank_account_id = ? OR suggested_account_id = ? "
+                "OR decided_account_id = ?",
+                account_id, account_id, account_id,
             )
             if imp:
                 blockers["imported transactions"] = imp
+            suggestions = count(
+                "SELECT COUNT(*) FROM import_suggestions WHERE suggested_account_id = ?",
+                account_id,
+            )
+            if suggestions:
+                blockers["import suggestions"] = suggestions
             close_map = count(
                 "SELECT COUNT(*) FROM account_close_mappings WHERE account_id = ?",
                 account_id,

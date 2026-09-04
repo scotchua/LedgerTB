@@ -54,7 +54,7 @@ def test_create_tables_records_migrations(db):
         # sequence can never collide with ours again. account_grouping was
         # already renumbered once (020 -> 022) and crashed every launch.
         "900_account_grouping", "901_cash_flow_section",
-        "902_document_audits", "904_payroll_import_row_pay_run",
+        "902_document_audits", "903_import_suggestions", "904_payroll_import_row_pay_run",
         "905_journal_entry_reversal_kind"]
     conn.close()
 
@@ -68,7 +68,7 @@ def test_create_tables_is_idempotent(db):
 
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM schema_migrations")
-    assert cur.fetchone()[0] == 47
+    assert cur.fetchone()[0] == 48
     conn.close()
 
 
@@ -104,6 +104,21 @@ def test_actor_columns_exist(db):
         cur.execute(f"PRAGMA table_info({table})")
         columns = {row[1] for row in cur.fetchall()}
         assert column in columns, f"{table} missing {column}"
+    conn.close()
+
+
+def test_import_suggestion_schema_exists(db):
+    conn = get_connection()
+    columns = {row[1] for row in conn.execute(
+        "PRAGMA table_info(imported_transactions)"
+    ).fetchall()}
+    assert {"decided_account_id", "decided_at", "decided_by",
+            "decided_suggestion_id"}.issubset(columns)
+    triggers = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+        "AND name LIKE 'import_suggestions_%'"
+    ).fetchall()}
+    assert triggers == {"import_suggestions_same_client", "import_suggestions_undecided"}
     conn.close()
 
 

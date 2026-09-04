@@ -465,6 +465,23 @@ class ImportedTransaction:
             row = cursor.fetchone()
             if not row:
                 raise ValueError("Imported transaction not found.")
+            cursor.execute(
+                "SELECT * FROM import_suggestions WHERE imported_transaction_id = ?",
+                (transaction_id,),
+            )
+            suggestions = cursor.fetchall()
+            cursor.execute(
+                "UPDATE imported_transactions SET decided_suggestion_id = NULL WHERE id = ?",
+                (transaction_id,),
+            )
+            for suggestion in suggestions:
+                cursor.execute("DELETE FROM import_suggestions WHERE id = ?", (suggestion["id"],))
+                AuditLog.write(
+                    cursor, row["client_id"], "import_suggestions", suggestion["id"], "DELETE",
+                    old_values={key: suggestion[key] for key in (
+                        "suggested_account_id", "confidence", "reason", "source", "created_by"
+                    )},
+                )
             cursor.execute("DELETE FROM imported_transactions WHERE id = ?", (transaction_id,))
             AuditLog.write(
                 cursor, row["client_id"], "imported_transactions", transaction_id, "DELETE",
@@ -473,6 +490,10 @@ class ImportedTransaction:
                     "description": row["description"], "amount": to_dollars(row["amount"]),
                     "bank_account_id": row["bank_account_id"], "status": row["status"],
                     "journal_entry_id": row["journal_entry_id"],
+                    "decided_account_id": row["decided_account_id"],
+                    "decided_at": row["decided_at"],
+                    "decided_by": row["decided_by"],
+                    "decided_suggestion_id": row["decided_suggestion_id"],
                 },
             )
 
@@ -489,6 +510,23 @@ class ImportedTransaction:
             cursor.execute(query, params)
             rows = cursor.fetchall()
             for row in rows:
+                cursor.execute(
+                    "SELECT * FROM import_suggestions WHERE imported_transaction_id = ?",
+                    (row["id"],),
+                )
+                suggestions = cursor.fetchall()
+                cursor.execute(
+                    "UPDATE imported_transactions SET decided_suggestion_id = NULL WHERE id = ?",
+                    (row["id"],),
+                )
+                for suggestion in suggestions:
+                    cursor.execute("DELETE FROM import_suggestions WHERE id = ?", (suggestion["id"],))
+                    AuditLog.write(
+                        cursor, row["client_id"], "import_suggestions", suggestion["id"], "DELETE",
+                        old_values={key: suggestion[key] for key in (
+                            "suggested_account_id", "confidence", "reason", "source", "created_by"
+                        )},
+                    )
                 cursor.execute("DELETE FROM imported_transactions WHERE id = ?", (row["id"],))
                 AuditLog.write(
                     cursor, row["client_id"], "imported_transactions", row["id"], "DELETE",
@@ -497,7 +535,13 @@ class ImportedTransaction:
                         "transaction_date": row["transaction_date"],
                         "description": row["description"],
                         "amount": to_dollars(row["amount"]),
+                        "bank_account_id": row["bank_account_id"],
                         "status": row["status"],
+                        "journal_entry_id": row["journal_entry_id"],
+                        "decided_account_id": row["decided_account_id"],
+                        "decided_at": row["decided_at"],
+                        "decided_by": row["decided_by"],
+                        "decided_suggestion_id": row["decided_suggestion_id"],
                     },
                 )
 

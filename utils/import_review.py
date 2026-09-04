@@ -110,6 +110,7 @@ _CLIENT_IMPORT_STATE_KEYS = {
     "import_complete_msg",
     "confirm_dismiss_staged",
     "ai_categorization_result",
+    "confirm_accept_high_suggestions",
     "bulk_result",
     "bulk_account_select",
     "sort_by",
@@ -129,6 +130,7 @@ _CLIENT_IMPORT_STATE_KEYS = {
 
 _CLIENT_IMPORT_STATE_PREFIXES = (
     "cat_",
+    "use_sugg_",
     "include_",
     "xfer_",
     "duplicate_override_",

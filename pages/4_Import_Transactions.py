@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from datetime import date
 import pandas as pd
+import uuid
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -16,6 +17,8 @@ from models.import_profile import (
     ImportProfile,
 )
 from models.transaction import ImportedTransaction
+from models.import_coding import effective_coding, record_decision, record_decisions
+from models.import_suggestion import ImportSuggestion
 from services.csv_import import (
     CSVImporter, SIGN_CONVENTIONS, apply_sign_convention, default_sign_convention,
     summarize_import_amounts,
@@ -37,6 +40,7 @@ from constants import AccountSubtype
 from database import init_database
 from database import connection as dbconn
 from utils.client_selector import render_client_selector
+from utils.client_context import book_scoped_key
 from utils.unlock import require_unlock
 from utils.ui import apply_default_on_change, is_parking_account, view_switcher
 from utils import icons
@@ -109,6 +113,8 @@ def apply_duplicate_checks(transactions):
 
 def prepare_staged_for_review(staged_transactions):
     """Turn durable pending rows into the page's normal review-row shape."""
+    coding = effective_coding(client_id)
+    book_token = book_scoped_key("book", dbconn.DATABASE_PATH).rsplit("_", 1)[-1]
     staged_rows = [{
         "staged_id": transaction.id,
         "batch_id": transaction.import_batch,
@@ -125,6 +131,8 @@ def prepare_staged_for_review(staged_transactions):
         "suggested_account_id": transaction.suggested_account_id,
         "replaces_transaction_id": transaction.replaces_transaction_id,
         "source_account": bool(transaction.replaces_transaction_id),
+        "uid": f"s{book_token}_{transaction.id}",
+        "coding": coding[transaction.id],
     } for transaction in staged_transactions]
     duplicate_count = classify_import_duplicates(
         staged_rows, client_id,
@@ -133,8 +141,8 @@ def prepare_staged_for_review(staged_transactions):
     ensure_row_ids(staged_rows)
     for row in staged_rows:
         row["include"] = not row.get("is_duplicate", False)
-        if row.get("suggested_account_id"):
-            st.session_state[row_key("cat", row)] = row["suggested_account_id"]
+        if row["coding"].state == "human_coded":
+            st.session_state[row_key("cat", row)] = row["coding"].account_id
     return staged_rows, duplicate_count
 
 # Initialize session state
@@ -1499,6 +1507,7 @@ elif selected_tab == "Review & Categorize":
         # its label becomes the search text, so typing an account number appends
         # to it and matches nothing. Unset is selectbox index=None instead.
         all_accounts = Account.get_all(client_id, active_only=True)
+        account_by_id = {a.id: a for a in all_accounts}
         account_options = {a.id: a.display_name() for a in all_accounts}
 
         # "Add new account" lives inside the dropdown itself: picking it opens
@@ -1628,6 +1637,45 @@ elif selected_tab == "Review & Categorize":
                 st.metric("Duplicates", duplicate_count, delta="Review", delta_color="inverse")
             else:
                 st.metric("Duplicates", 0)
+
+        high_suggestions = [
+            t for t in transactions
+            if t.get("staged_id")
+            and getattr(t.get("coding"), "state", None) == "assistant"
+            and t["coding"].confidence == "high"
+            and not st.session_state.get(row_key("cat", t))
+        ]
+        if high_suggestions:
+            if st.button("Accept all high-confidence suggestions",
+                         key="accept_high_suggestions"):
+                st.session_state.confirm_accept_high_suggestions = True
+                st.rerun()
+            if st.session_state.get("confirm_accept_high_suggestions"):
+                st.warning(
+                    f"Use the suggested account for {len(high_suggestions)} "
+                    "high-confidence transactions?"
+                )
+                confirm_col, cancel_col, _ = st.columns([1, 1, 3])
+                with confirm_col:
+                    if st.button("Confirm", key="confirm_accept_high_suggestions_button"):
+                        record_decisions([
+                            {"transaction_id": t["staged_id"],
+                             "account_id": t["coding"].account_id,
+                             "suggestion_id": t["coding"].suggestion_id}
+                            for t in high_suggestions
+                        ], client_id)
+                        for t in high_suggestions:
+                            st.session_state[row_key("cat", t)] = t["coding"].account_id
+                            t["coding"] = effective_coding(client_id)[t["staged_id"]]
+                        st.session_state.confirm_accept_high_suggestions = False
+                        st.session_state.bulk_result = (
+                            f"Accepted {len(high_suggestions)} high-confidence suggestions"
+                        )
+                        st.rerun()
+                with cancel_col:
+                    if st.button("Cancel", key="cancel_accept_high_suggestions_button"):
+                        st.session_state.confirm_accept_high_suggestions = False
+                        st.rerun()
         with col5:
             subcol1, subcol2 = st.columns(2)
             with subcol1:
@@ -1693,9 +1741,21 @@ elif selected_tab == "Review & Categorize":
             if result.get('error'):
                 st.error(f"AI categorization error: {result['error']}")
             elif result.get('matched', 0) > 0:
-                st.success(f"AI categorization complete! Matched {result['matched']} of {result['total']} transactions.")
+                message = (
+                    f"AI categorization complete! Matched {result['matched']} "
+                    f"of {result['total']} transactions."
+                )
+                if result.get('decided'):
+                    message += f" {result['decided']} left as you decided."
+                st.success(message)
             else:
-                st.warning(f"AI processed {result.get('total', 0)} transactions but none matched your accounts.")
+                message = (
+                    f"AI processed {result.get('total', 0)} transactions "
+                    "but none matched your accounts."
+                )
+                if result.get('decided'):
+                    message += f" {result['decided']} left as you decided."
+                st.warning(message)
             # Clear the message after showing
             st.session_state.ai_categorization_result = None
 
@@ -1705,7 +1765,15 @@ elif selected_tab == "Review & Categorize":
             uncategorized = [
                 t for t in transactions
                 if not st.session_state.get(row_key("cat", t))
+                and getattr(t.get("coding"), "state", None)
+                not in ("human_cleared", "human_coded")
             ]
+            decided_count = sum(
+                1 for t in transactions
+                if not st.session_state.get(row_key("cat", t))
+                and getattr(t.get("coding"), "state", None)
+                in ("human_cleared", "human_coded")
+            )
 
             if uncategorized:
                 col1, col2 = st.columns([2, 2])
@@ -1730,14 +1798,26 @@ elif selected_tab == "Review & Categorize":
                             st.session_state.ai_categorization_result = {
                                 'matched': getattr(categorization_service, 'last_matched', 0),
                                 'total': getattr(categorization_service, 'last_total', 0),
+                                'decided': decided_count,
                             }
 
-                        # Update the selectbox session state keys to match AI suggestions.
-                        # Only the transactions that were just categorized (uncategorized
-                        # holds references to the same dicts, now mutated by the AI call),
-                        # so manual selections the user already made are preserved.
+                        request_id = uuid.uuid4().hex
+                        with dbconn.get_cursor(commit=True) as cursor:
+                            for t in uncategorized:
+                                if t.get('staged_id') and t.get('suggested_account_id'):
+                                    suggestion_id = ImportSuggestion.insert(
+                                        cursor, t['staged_id'], t['suggested_account_id'],
+                                        (t.get('confidence') if t.get('confidence')
+                                         in ('high', 'medium', 'low') else 'medium'),
+                                        t.get('reason', ''),
+                                        'in_app', request_id,
+                                    )
+                                    t['coding'] = effective_coding(client_id, cursor)[t['staged_id']]
+                                    t['suggestion_id'] = suggestion_id
+
+                        # Fresh CSV rows retain the existing in-memory behavior.
                         for t in uncategorized:
-                            if 'suggested_account_id' in t and t['suggested_account_id']:
+                            if (not t.get('staged_id') and t.get('suggested_account_id')):
                                 st.session_state[row_key("cat", t)] = t['suggested_account_id']
 
                         # Save updated transactions to session state
@@ -1802,6 +1882,7 @@ elif selected_tab == "Review & Categorize":
                     st.warning("Please select an account first")
                 else:
                     applied_count = 0
+                    durable_decisions = []
                     for t in transactions:
                         # Check session state for checkbox value
                         is_selected = st.session_state.get(row_key("include", t), True)
@@ -1810,7 +1891,12 @@ elif selected_tab == "Review & Categorize":
                             t['suggested_account_id'] = bulk_account
                             # Update the selectbox session state
                             st.session_state[row_key("cat", t)] = bulk_account
+                            if t.get("staged_id"):
+                                durable_decisions.append({"transaction_id": t["staged_id"],
+                                                          "account_id": bulk_account})
                             applied_count += 1
+                    if durable_decisions:
+                        record_decisions(durable_decisions, client_id)
                     # Deselect all checkboxes after applying
                     for t in transactions:
                         st.session_state[row_key("include", t)] = False
@@ -1828,6 +1914,7 @@ elif selected_tab == "Review & Categorize":
                     st.warning("Please select an account first")
                 else:
                     applied_count = 0
+                    durable_decisions = []
                     for t in transactions:
                         is_selected = st.session_state.get(row_key("include", t), True)
                         # None/0/absent all mean uncategorized
@@ -1837,7 +1924,12 @@ elif selected_tab == "Review & Categorize":
                             t['suggested_account_id'] = bulk_account
                             # Update the selectbox session state
                             st.session_state[row_key("cat", t)] = bulk_account
+                            if t.get("staged_id"):
+                                durable_decisions.append({"transaction_id": t["staged_id"],
+                                                          "account_id": bulk_account})
                             applied_count += 1
+                    if durable_decisions:
+                        record_decisions(durable_decisions, client_id)
                     # Deselect all checkboxes after applying
                     for t in transactions:
                         st.session_state[row_key("include", t)] = False
@@ -1990,7 +2082,7 @@ elif selected_tab == "Review & Categorize":
                         st.text(_desc)
                 # Show source account if from multi-account import
                 if t.get('source_account'):
-                    source_acct = Account.get_by_id(t.get('bank_account_id'), client_id=client_id)
+                    source_acct = account_by_id.get(t.get('bank_account_id'))
                     if source_acct:
                         st.caption(f"From: {source_acct.display_name()}")
                 if t.get('reason'):
@@ -2014,7 +2106,24 @@ elif selected_tab == "Review & Categorize":
                 # Initialize session state for this selectbox if not already set
                 cat_key = row_key("cat", t)
                 if cat_key not in st.session_state:
-                    st.session_state[cat_key] = t.get('suggested_account_id') or None
+                    coding = t.get("coding")
+                    st.session_state[cat_key] = (
+                        coding.account_id
+                        if coding and coding.state == "human_coded"
+                        else (t.get('suggested_account_id') or None
+                              if not t.get("staged_id") else None)
+                    )
+
+                def _persist_category(transaction=t, key=cat_key):
+                    selected_account = st.session_state.get(key)
+                    if selected_account == ADD_NEW_ACCOUNT:
+                        return
+                    if transaction.get("staged_id"):
+                        with dbconn.get_cursor(commit=True) as cursor:
+                            record_decision(
+                                transaction["staged_id"], client_id,
+                                selected_account or None, None, cursor,
+                            )
 
                 if is_transfer:
                     # For transfers, show only bank/liability accounts
@@ -2028,7 +2137,8 @@ elif selected_tab == "Review & Categorize":
                         key=cat_key,
                         index=None,
                         placeholder="Type an account number or name",
-                        label_visibility="collapsed"
+                        label_visibility="collapsed",
+                        on_change=_persist_category,
                     )
                 else:
                     # For regular transactions, show all accounts
@@ -2043,8 +2153,26 @@ elif selected_tab == "Review & Categorize":
                         key=cat_key,
                         index=None,
                         placeholder="Type an account number or name",
-                        label_visibility="collapsed"
+                        label_visibility="collapsed",
+                        on_change=_persist_category,
                     )
+                coding = t.get("coding")
+                if not is_transfer and coding and coding.state == "assistant":
+                    suggested = account_by_id[coding.account_id]
+                    st.caption(
+                        f"AI suggests {suggested.display_name()} "
+                        f"({coding.confidence}): {coding.reason}"
+                    )
+                    if st.button("Use suggestion", key=f"use_sugg_{t['uid']}"):
+                        with dbconn.get_cursor(commit=True) as cursor:
+                            record_decision(
+                                t["staged_id"], client_id, coding.account_id,
+                                coding.suggestion_id, cursor,
+                            )
+                        st.session_state[cat_key] = coding.account_id
+                        st.rerun()
+                elif not is_transfer and coding and coding.state == "stale":
+                    st.caption("Earlier suggestion no longer valid")
                 # Row dicts keep 0 for "unset" so posting validation is
                 # unchanged; the add-new sentinel must never leak into a post.
                 transactions[i]['selected_account_id'] = (

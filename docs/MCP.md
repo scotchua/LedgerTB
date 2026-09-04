@@ -69,7 +69,10 @@ from an already-running MCP process.
   `staged_clean` and `flagged_as_possible_duplicates` divide the staged rows,
   while `skipped_already_known` counts exact retries. A person can dismiss
   unwanted staged rows; their identity and audit history remain, but they
-  leave the queue.
+  leave the queue. `suggest_categories` stores Revenue or Expense candidates
+  for pending staged transactions. `list_staged_imports` includes each row's
+  current `coding` state and candidate details. The assistant never picks the
+  account; a person does in Import Transactions.
 - **Client setup includes its period calendar.** `create_client` creates the
   fiscal year containing today unless `initial_fiscal_year` names another
   year. `ensure_fiscal_year` idempotently adds another year when Close Map or

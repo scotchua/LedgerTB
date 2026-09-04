@@ -12,6 +12,7 @@ ledger arithmetic (the ledger itself stores integer cents).
 import functools as _functools
 import os
 import tempfile
+import uuid
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -958,10 +959,15 @@ def propose_import(client_id: int, bank_account_number: str, rows: list,
 
 
 def list_staged_imports(client_id: int) -> list:
-    """Assistant-staged transactions still awaiting review (status Pending)."""
+    """Pending staged transactions for the client, whatever their origin, with the current coding state."""
+    from models.import_coding import effective_coding
     from models.transaction import ImportedTransaction
 
     _require_client(client_id)
+    coding = effective_coding(client_id)
+    accounts = {
+        account.id: account for account in Account.get_all(client_id, active_only=False)
+    }
     return [
         {
             "id": t.id,
@@ -971,9 +977,100 @@ def list_staged_imports(client_id: int) -> list:
             "description": t.description,
             "amount": t.amount,
             "source": t.source_filename or "",
+            "coding": {
+                "state": coding[t.id].state,
+                "account_number": (
+                    accounts[coding[t.id].account_id].account_number
+                    if coding[t.id].account_id else None
+                ),
+                "confidence": coding[t.id].confidence,
+                "reason": coding[t.id].reason,
+                "source": coding[t.id].source,
+            },
         }
         for t in ImportedTransaction.get_by_status(client_id, "Pending")
     ]
+
+
+@mutating
+def suggest_categories(client_id: int, suggestions: list,
+                       request_id: Optional[str] = None) -> dict:
+    """Store category candidates for pending imported transactions."""
+    from database.connection import get_connection
+    from models.audit_log import AuditLog
+    from models.import_suggestion import ImportSuggestion
+    from utils.actor import current_actor
+
+    _require_client(client_id)
+    if not isinstance(suggestions, list) or not 1 <= len(suggestions) <= 500:
+        raise ValueError("suggestions must contain 1 to 500 items.")
+    transaction_ids = []
+    validated = []
+    for index, item in enumerate(suggestions, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"suggestions[{index}] must be an object.")
+        try:
+            transaction_id = int(item["transaction_id"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"suggestions[{index}].transaction_id must be an integer.")
+        transaction_ids.append(transaction_id)
+        confidence = str(item.get("confidence", ""))
+        if confidence not in ("high", "medium", "low"):
+            raise ValueError(f"suggestions[{index}].confidence must be high, medium, or low.")
+        reason = str(item.get("reason", ""))
+        if len(reason) > 500:
+            raise ValueError(f"suggestions[{index}].reason must be at most 500 characters.")
+        account = _resolve_account(client_id, item.get("account_number", ""))
+        if account.type not in ("Revenue", "Expense"):
+            raise ValueError(f"suggestions[{index}] account must be Revenue or Expense.")
+        validated.append((transaction_id, account.id, confidence, reason))
+    if len(transaction_ids) != len(set(transaction_ids)):
+        raise ValueError("Duplicate transaction_ids are not allowed in one call.")
+
+    request_id = str(request_id or uuid.uuid4().hex)
+    accepted, rejected, skipped = [], [], []
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        for transaction_id, account_id, confidence, reason in validated:
+            row = cursor.execute(
+                "SELECT client_id, status, decided_at FROM imported_transactions WHERE id = ?",
+                (transaction_id,),
+            ).fetchone()
+            if row is None or row["client_id"] != client_id or row["status"] != "Pending":
+                rejected.append({"transaction_id": transaction_id, "why": "not a pending transaction for this client"})
+                continue
+            if row["decided_at"] is not None:
+                skipped.append({"transaction_id": transaction_id, "why": "already decided"})
+                continue
+            if cursor.execute(
+                "SELECT 1 FROM import_suggestions WHERE request_id = ? AND imported_transaction_id = ?",
+                (request_id, transaction_id),
+            ).fetchone():
+                skipped.append({"transaction_id": transaction_id, "why": "duplicate request"})
+                continue
+            suggestion_id = ImportSuggestion.insert(
+                cursor, transaction_id, account_id, confidence, reason,
+                "assistant", request_id, current_actor(),
+            )
+            accepted.append(suggestion_id)
+        AuditLog.write(
+            cursor, client_id, "import_suggestions", 0, "INSERT",
+            new_values={"request_id": request_id, "accepted_ids": accepted,
+                        "rejected": rejected, "skipped": skipped},
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {
+        "request_id": request_id, "accepted": accepted,
+        "rejected": rejected, "skipped": skipped,
+        "note": "Suggestions only. A person chooses each account in Import Transactions; nothing posts from here.",
+    }
 
 
 @mutating
