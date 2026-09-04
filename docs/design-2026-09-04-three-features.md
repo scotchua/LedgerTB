@@ -275,3 +275,18 @@ Accepted:
 [settled] Feature 1 hard-delete discard; Feature 2 Void in place of delete;
 Feature 3 with amended accept controls. Build order 1, 2, 3, Codex authors in
 the confined worktree, Claude reviews each diff before the next starts.
+
+---
+
+# Built
+
+2026-09-04. Codex authored in confined worktrees; Claude reviewed each diff
+and ran every suite independently; receipts in ~/.codex-bridge/receipts/.
+
+- Feature 1, Discard a draft pay run: 54fb2d1. One correction round.
+- Feature 2, Void: c9097e7. One correction round.
+- Feature 3, Category suggestions: 2e2ad79. Two correction rounds; one BLOCKER
+  found by a reviewer probe (circular FK on delete), fixed.
+
+Suite on main after all three: 978 passed, 5 skipped, 2 deselected
+(performance-marked). Migrations 903, 904, 905 in the fork band.
