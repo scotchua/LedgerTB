@@ -325,6 +325,59 @@ def render_entry_controls(entry: JournalEntry, import_link: dict | None):
             st.rerun()
         return
 
+    if entry.reversal_kind == "void":
+        st.caption("Voided entries cannot be reversed or voided again.")
+        return
+
+    void_error = st.session_state.get("void_error")
+    if void_error and void_error["entry_id"] == entry.id:
+        message = void_error["message"]
+        st.error(message)
+        if "closed" in message.lower():
+            if st.button(
+                "Use Reverse Entry", key=f"void_reverse_entry_{entry.id}",
+            ):
+                st.session_state.reversal_entry_id = entry.id
+                st.session_state.journal_active_tab = "Reverse Entry"
+                st.session_state.pop("void_error", None)
+                st.rerun()
+        if st.button("Dismiss", key=f"dismiss_void_error_{entry.id}"):
+            st.session_state.pop("void_error", None)
+            st.rerun()
+
+    if entry.reversed_by_journal_entry_id is None:
+        if st.session_state.get("confirm_void_entry_id") != entry.id:
+            if st.button("Void", key=f"void_entry_{entry.id}"):
+                st.session_state.confirm_void_entry_id = entry.id
+                st.rerun()
+        else:
+            st.warning(
+                f"This posts a reversing entry dated {entry.entry_date} and hides "
+                "both from this list. The original stays in the ledger and the audit "
+                "trail. Nothing is deleted."
+            )
+            confirm_col, cancel_col = st.columns(2)
+            with confirm_col:
+                if st.button("Confirm void", key=f"confirm_void_{entry.id}"):
+                    try:
+                        reversal = JournalEntry.void(entry.id, entry.client_id)
+                    except ValueError as exc:
+                        st.session_state["void_error"] = {
+                            "entry_id": entry.id, "message": str(exc),
+                        }
+                        st.session_state.pop("confirm_void_entry_id", None)
+                        st.rerun()
+                    else:
+                        st.session_state.pop("confirm_void_entry_id", None)
+                        st.session_state["void_message"] = (
+                            f"Voided. Reversing entry JE #{reversal.id} posted."
+                        )
+                        st.rerun()
+            with cancel_col:
+                if st.button("Cancel", key=f"cancel_void_{entry.id}"):
+                    st.session_state.pop("confirm_void_entry_id", None)
+                    st.rerun()
+
     if st.button("Reverse", key=f"reverse_entry_{entry.id}"):
         st.session_state.reversal_entry_id = entry.id
         st.session_state.journal_active_tab = "Reverse Entry"
@@ -808,6 +861,9 @@ if active_view == "New Entry":
 
 elif active_view == "View Entries":
     st.subheader("Journal Entry List")
+    void_message = st.session_state.pop("void_message", None)
+    if void_message:
+        st.success(void_message)
 
     # Quick search by Entry ID
     search_col1, search_col2 = st.columns([1, 3])
@@ -871,6 +927,9 @@ elif active_view == "View Entries":
             index=None,
             placeholder="All accounts",
         )
+        show_voided_entries = st.checkbox(
+            "Show voided entries", key="show_voided_entries", value=False,
+        )
 
     if filter_start > filter_end:
         st.error("Journal entry filter start date cannot be after the end date.")
@@ -879,7 +938,7 @@ elif active_view == "View Entries":
     entry_type_param = filter_type if filter_type != 'All' else None
     search_param = filter_search.strip() or None
     filter_signature = (filter_start, filter_end, entry_type_param,
-                        search_param, filter_account)
+                        search_param, filter_account, show_voided_entries)
     if st.session_state.get("journal_filter_signature") != filter_signature:
         st.session_state.journal_filter_signature = filter_signature
         st.session_state.journal_page = 1
@@ -889,6 +948,7 @@ elif active_view == "View Entries":
         client_id=client_id, start_date=filter_start, end_date=filter_end,
         entry_type=entry_type_param, search_term=search_param,
         account_id=filter_account,
+        include_voided=show_voided_entries,
     )
     page_count = max(1, (summary["total_count"] + page_size - 1) // page_size)
     current_page = min(max(1, st.session_state.get("journal_page", 1)), page_count)
@@ -928,6 +988,7 @@ elif active_view == "View Entries":
         account_id=filter_account,
         limit=page_size,
         offset=(current_page - 1) * page_size,
+        include_voided=show_voided_entries,
     )
     import_links = ImportedTransaction.get_links_for_journal_entries(
         client_id, [entry.id for entry in entries]
@@ -952,6 +1013,12 @@ elif active_view == "View Entries":
                 f"{entry.description or 'No description'} | "
                 f"${entry.total_debits():,.2f}"
             )
+
+            if entry.reversal_kind == "void":
+                if entry.reverses_journal_entry_id:
+                    st.caption(f"Void of JE #{entry.reverses_journal_entry_id}")
+                else:
+                    st.caption("Voided")
 
             if entry.reverses_journal_entry_id:
                 st.caption(

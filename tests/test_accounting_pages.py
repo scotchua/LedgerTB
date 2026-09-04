@@ -1235,6 +1235,73 @@ def test_journal_reverse_posts_linked_entry(client_id, accounts, monkeypatch):
     assert original.reversed_by_journal_entry_id is not None
 
 
+def test_journal_void_closed_period_recovers_into_reverse_entry(
+    client_id, accounts, monkeypatch,
+):
+    _select_client(monkeypatch, client_id)
+    entry = post_entry(
+        client_id, date(2025, 12, 31),
+        [(accounts["cash"], 40, 0), (accounts["revenue"], 0, 40)],
+    )
+    FiscalPeriod(
+        client_id=client_id, period_name="FY 2025", period_type="Year",
+        start_date=date(2025, 1, 1), end_date=date(2025, 12, 31), is_closed=True,
+    ).save()
+    journal = AppTest.from_file(
+        page_path("pages/2_Journal_Entries.py"), default_timeout=30
+    )
+    journal.session_state["journal_active_tab"] = "View Entries"
+    journal.session_state["filter_start"] = date(2025, 1, 1)
+    journal.run()
+
+    journal.button(key=f"void_entry_{entry.id}").click().run()
+    journal.button(key=f"confirm_void_{entry.id}").click().run()
+
+    assert not journal.exception
+    assert any("FY 2025 is closed" in item.value for item in journal.error)
+    journal.button(key=f"void_reverse_entry_{entry.id}").click().run()
+    assert journal.session_state["journal_active_tab"] == "Reverse Entry"
+    assert journal.session_state["reversal_entry_id"] == entry.id
+
+
+def test_journal_void_success_filters_pair_and_disables_controls(
+    client_id, accounts, monkeypatch,
+):
+    _select_client(monkeypatch, client_id)
+    entry = post_entry(
+        client_id, date(2026, 4, 2),
+        [(accounts["cash"], 40, 0), (accounts["revenue"], 0, 40)],
+    )
+    journal = AppTest.from_file(
+        page_path("pages/2_Journal_Entries.py"), default_timeout=30
+    )
+    journal.session_state["journal_active_tab"] = "View Entries"
+    journal.run()
+    journal.button(key=f"void_entry_{entry.id}").click().run()
+    journal.button(key=f"confirm_void_{entry.id}").click().run()
+
+    original = JournalEntry.get_by_id(entry.id, client_id)
+    reversal_id = original.reversed_by_journal_entry_id
+    assert not journal.exception
+    assert any(
+        item.value == f"Voided. Reversing entry JE #{reversal_id} posted."
+        for item in journal.success
+    )
+    body = " ".join(str(item.value) for item in journal.markdown)
+    assert f"**#{entry.id}**" not in body
+    assert f"**#{reversal_id}**" not in body
+
+    journal.checkbox(key="show_voided_entries").check().run()
+    captions = " ".join(str(item.value) for item in journal.caption)
+    assert "Voided" in captions
+    assert f"Void of JE #{entry.id}" in captions
+    widget_keys = {button.key for button in journal.button}
+    for voided_id in (entry.id, reversal_id):
+        assert f"void_entry_{voided_id}" not in widget_keys
+        assert f"reverse_entry_{voided_id}" not in widget_keys
+        assert f"reverse_correct_entry_{voided_id}" not in widget_keys
+
+
 def test_correction_draft_shows_original_and_retains_visible_chain(
     client_id, accounts, monkeypatch
 ):

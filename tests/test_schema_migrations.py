@@ -54,7 +54,8 @@ def test_create_tables_records_migrations(db):
         # sequence can never collide with ours again. account_grouping was
         # already renumbered once (020 -> 022) and crashed every launch.
         "900_account_grouping", "901_cash_flow_section",
-        "902_document_audits", "904_payroll_import_row_pay_run"]
+        "902_document_audits", "904_payroll_import_row_pay_run",
+        "905_journal_entry_reversal_kind"]
     conn.close()
 
 
@@ -67,7 +68,7 @@ def test_create_tables_is_idempotent(db):
 
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM schema_migrations")
-    assert cur.fetchone()[0] == 46
+    assert cur.fetchone()[0] == 47
     conn.close()
 
 

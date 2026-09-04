@@ -30,6 +30,7 @@ class JournalEntry:
     aje_reference: Optional[str] = None  # AJE-001, AJE-002, etc. for adjusting entries
     reverses_journal_entry_id: Optional[int] = None
     reversed_by_journal_entry_id: Optional[int] = None
+    reversal_kind: Optional[str] = None
     lines: List[JournalEntryLine] = field(default_factory=list)
 
     def is_balanced(self) -> bool:
@@ -134,13 +135,14 @@ class JournalEntry:
                 INSERT INTO journal_entries
                     (client_id, entry_date, description, source_reference,
                      entry_type, aje_reference, created_by,
-                     reverses_journal_entry_id, reversed_by_journal_entry_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     reverses_journal_entry_id, reversed_by_journal_entry_id,
+                     reversal_kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (self.client_id, self.entry_date.isoformat(), self.description,
                  self.source_reference, self.entry_type, self.aje_reference,
                  current_actor(), self.reverses_journal_entry_id,
-                 self.reversed_by_journal_entry_id)
+                 self.reversed_by_journal_entry_id, self.reversal_kind)
             )
             self.id = cursor.lastrowid
 
@@ -254,6 +256,9 @@ class JournalEntry:
                 row['reversed_by_journal_entry_id']
                 if 'reversed_by_journal_entry_id' in row.keys() else None
             ),
+            reversal_kind=(
+                row['reversal_kind'] if 'reversal_kind' in row.keys() else None
+            ),
         )
 
     @staticmethod
@@ -321,6 +326,7 @@ class JournalEntry:
         entry_type: Optional[str],
         search_term: Optional[str] = None,
         account_id: Optional[int] = None,
+        include_voided: bool = True,
     ):
         """Shared WHERE clauses so the list and its totals cannot disagree."""
         require_valid_range(start_date, end_date, "Journal entry filter")
@@ -367,6 +373,10 @@ class JournalEntry:
                 "AND al.account_id = ?)"
             )
             params.append(account_id)
+        if not include_voided:
+            clauses.append(
+                "COALESCE(journal_entries.reversal_kind, 'reversal') <> 'void'"
+            )
         return clauses, params
 
     @staticmethod
@@ -379,10 +389,12 @@ class JournalEntry:
         account_id: Optional[int] = None,
         limit: int = 100,
         offset: int = 0,
+        include_voided: bool = True,
     ) -> List['JournalEntry']:
         """Get journal entries for a client with optional filters."""
         clauses, params = JournalEntry._entry_filters(
-            client_id, start_date, end_date, entry_type, search_term, account_id
+            client_id, start_date, end_date, entry_type, search_term, account_id,
+            include_voided,
         )
         with get_cursor() as cursor:
             query = "SELECT * FROM journal_entries WHERE " + " AND ".join(clauses)
@@ -420,10 +432,12 @@ class JournalEntry:
         entry_type: Optional[str] = None,
         search_term: Optional[str] = None,
         account_id: Optional[int] = None,
+        include_voided: bool = True,
     ) -> dict:
         """Return SQL-backed counts and totals for all matching entries."""
         clauses, params = JournalEntry._entry_filters(
-            client_id, start_date, end_date, entry_type, search_term, account_id
+            client_id, start_date, end_date, entry_type, search_term, account_id,
+            include_voided,
         )
 
         with get_cursor() as cursor:
@@ -471,6 +485,7 @@ class JournalEntry:
     def reverse(
         entry_id: int, client_id: int, reversal_date: Optional[date] = None,
         memo: Optional[str] = None,
+        kind: str = "reversal",
         conn=None,
     ) -> 'JournalEntry':
         """Post an equal-and-opposite entry without altering accounting history.
@@ -492,6 +507,11 @@ class JournalEntry:
             row = cursor.fetchone()
             if not row:
                 raise ValueError("Journal entry not found for the selected client.")
+            if row["reversal_kind"] == "void":
+                raise ValueError(
+                    "A voided entry cannot be reversed or voided again. Enter it "
+                    "again if it was needed."
+                )
             if row["reversed_by_journal_entry_id"] is not None:
                 raise ValueError(
                     f"This entry was already reversed by JE "
@@ -545,6 +565,11 @@ class JournalEntry:
                         f"Reverse it from the {flow_name} flow."
                     )
 
+            if kind not in {"reversal", "void"}:
+                raise ValueError("Reversal kind must be 'reversal' or 'void'.")
+            if kind == "void" and reversal_date is not None:
+                raise ValueError("A void must use the original entry date.")
+
             from models.fiscal_period import FiscalPeriod
             original_date = date.fromisoformat(row["entry_date"])
             closed = FiscalPeriod.get_closed_period_for_date(client_id, original_date)
@@ -588,6 +613,7 @@ class JournalEntry:
                 source_reference=reference,
                 entry_type=row["entry_type"] or "Regular",
                 reverses_journal_entry_id=entry_id,
+                reversal_kind=kind,
                 lines=[
                     JournalEntryLine(
                         account_id=line["account_id"],
@@ -600,10 +626,11 @@ class JournalEntry:
             )
             reversal.save(conn=conn)
             cursor.execute(
-                """UPDATE journal_entries SET reversed_by_journal_entry_id = ?
+                """UPDATE journal_entries
+                   SET reversed_by_journal_entry_id = ?, reversal_kind = ?
                    WHERE id = ? AND client_id = ?
                      AND reversed_by_journal_entry_id IS NULL""",
-                (reversal.id, entry_id, client_id),
+                (reversal.id, kind, entry_id, client_id),
             )
             if cursor.rowcount != 1:
                 raise ValueError("This entry has already been reversed.")
@@ -614,6 +641,7 @@ class JournalEntry:
                     "reversed": True,
                     "reversal_entry_id": reversal.id,
                     "reversal_date": effective_date.isoformat(),
+                    "kind": kind,
                 },
             )
             if owns_conn:
@@ -626,6 +654,24 @@ class JournalEntry:
         finally:
             if owns_conn:
                 conn.close()
+
+    @classmethod
+    def void(cls, entry_id: int, client_id: int, conn=None) -> 'JournalEntry':
+        original = cls.get_by_id(entry_id, client_id=client_id)
+        if not original:
+            raise ValueError("Journal entry not found for the selected client.")
+
+        from models.fiscal_period import FiscalPeriod
+        closed = FiscalPeriod.get_closed_period_for_date(client_id, original.entry_date)
+        if closed:
+            raise ValueError(
+                f"{closed.period_name} is closed. Use Reverse Entry to choose a date "
+                "in an open period."
+            )
+        return cls.reverse(
+            entry_id, client_id, reversal_date=None,
+            memo=f"Void of JE #{entry_id}", kind="void", conn=conn,
+        )
 
     @staticmethod
     def get_next_aje_reference(
