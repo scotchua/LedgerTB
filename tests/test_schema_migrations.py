@@ -53,7 +53,10 @@ def test_create_tables_records_migrations(db):
         # Fork-only migrations live in a reserved 900+ band so upstream's
         # sequence can never collide with ours again. account_grouping was
         # already renumbered once (020 -> 022) and crashed every launch.
-        "900_account_grouping", "901_cash_flow_section", "902_document_audits", "903_import_suggestions", "904_payroll_import_row_pay_run", "905_journal_entry_reversal_kind", "906_report_legend", "908_pay_stub_employer_costs"]
+        "900_account_grouping", "901_cash_flow_section",
+        "902_document_audits", "903_import_suggestions",
+        "904_payroll_import_row_pay_run", "905_journal_entry_reversal_kind",
+        "906_report_legend", "908_pay_stub_employer_costs"]
     conn.close()
 
 
@@ -214,7 +217,7 @@ def test_migration_failure_is_atomic(tmp_path, monkeypatch):
 
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = '001_boom'")
-    assert cur.fetchone()[0] == 50  # not recorded
+    assert cur.fetchone()[0] == 0  # not recorded
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='will_rollback'")
     assert cur.fetchone() is None  # partial DDL rolled back
     conn.close()
