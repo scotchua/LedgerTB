@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 
@@ -560,23 +560,33 @@ def test_statement_pdf_downloads_match_report_totals_grouping_and_audit(
 
         assert excel_call["on_click"] is AuditLog.log_event
         assert pdf_call["on_click"] is AuditLog.log_event
-        assert excel_call["args"][:3] == pdf_call["args"][:3] == (
-            client_id, "EXPORT", export_name,
+        assert excel_call["args"][:3] == (client_id, "EXPORT", export_name)
+        assert pdf_call["args"][:3] == (
+            client_id, "EXPORT", export_name.replace("_export", "_pdf_export"),
         )
         excel_values = excel_call["args"][3]
         pdf_values = pdf_call["args"][3]
-        assert excel_values.keys() == pdf_values.keys()
         assert excel_values["format"] == "xlsx"
-        assert pdf_values == {**excel_values, "format": "pdf"}
+        assert pdf_values["format"] == "pdf"
+        assert pdf_values["file_name"] == pdf_call["file_name"]
+        assert pdf_values["sha256"] == __import__("hashlib").sha256(raw_pdf).hexdigest()
+        assert pdf_values["row_count"] > 0
+        assert pdf_values["params"]
+        assert pdf_values["generated_at"].tzinfo is not None
         audit_id = pdf_call["on_click"](*pdf_call["args"])
         audit = AuditLog.get_by_id(audit_id)
         assert audit.client_id == client_id
         assert audit.action == "EXPORT"
-        assert audit.table_name == export_name
-        assert audit.new_values == {
+        assert audit.table_name == export_name.replace("_export", "_pdf_export")
+        expected_values = {
             key: value.isoformat() if hasattr(value, "isoformat") else value
             for key, value in pdf_values.items()
         }
+        expected_values["params"] = {
+            key: value.isoformat() if hasattr(value, "isoformat") else value
+            for key, value in pdf_values["params"].items()
+        }
+        assert audit.new_values == expected_values
 
         if view == "Trial Balance":
             report = ReportGenerator.comparative_trial_balance(
@@ -637,6 +647,52 @@ def test_statement_pdf_downloads_match_report_totals_grouping_and_audit(
             assert group_labels
             assert all(label in pdf_text and label in screen_html
                        for label in group_labels)
+
+
+def test_income_statement_pdf_download_audit_fallback(client_id, accounts, monkeypatch):
+    from database.connection import get_cursor
+    from services.statement_pdf import StatementView, statement_pdf_audit_args
+
+    _select_client(monkeypatch, client_id)
+    post_entry(
+        client_id, date(2026, 1, 15),
+        [(accounts["cash"], 500, 0), (accounts["revenue"], 0, 500)],
+    )
+    page = AppTest.from_file(page_path("pages/5_Reports.py"), default_timeout=30)
+    page.session_state["active_report"] = "Income Statement"
+    page.run()
+
+    assert not page.exception
+    pdf_buttons = [
+        button for button in page.get("download_button")
+        if button.label == "Download PDF"
+    ]
+    assert len(pdf_buttons) == 1
+    assert "_pdf__" in pdf_buttons[0].key
+
+    with get_cursor() as cursor:
+        before = cursor.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE client_id = ? AND action = 'EXPORT'",
+            (client_id,),
+        ).fetchone()[0]
+    assert before == 0
+
+    view = StatementView(
+        client_id, "Income Statement", "For January 2026",
+        (("item", "Revenue", (500,)),),
+        report_slug="income_statement", params=(("end_date", date(2026, 1, 31)),),
+    )
+    payload = b"%PDF audit payload"
+    args = statement_pdf_audit_args(
+        client_id, view, "income_statement_client_2026-01-31.pdf", payload,
+        datetime(2026, 1, 31),
+    )
+    AuditLog.log_event(*args)
+
+    exports = AuditLog.get_all(client_id, action="EXPORT")
+    assert len(exports) == 1
+    assert exports[0].new_values["file_name"] == "income_statement_client_2026-01-31.pdf"
+    assert exports[0].new_values["sha256"] == __import__("hashlib").sha256(payload).hexdigest()
 
 
 def test_report_drilldown_preserves_authorized_desktop_token(

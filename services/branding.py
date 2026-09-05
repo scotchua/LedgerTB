@@ -17,6 +17,10 @@ _HEX_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
 
 MAX_LOGO_BYTES = 2 * 1024 * 1024
 ALLOWED_LOGO_MIME = {"image/png", "image/jpeg"}
+DEFAULT_REPORT_LEGEND = (
+    "No assurance is provided on these financial statements. Prepared for "
+    "management use from the client's books."
+)
 
 
 @dataclass
@@ -26,6 +30,7 @@ class FirmBranding:
     accent_hex: str = ""          # normalized "#RRGGBB" or "" for default
     logo: Optional[bytes] = None
     logo_mime: Optional[str] = None
+    report_legend: str = DEFAULT_REPORT_LEGEND
 
     @property
     def is_branded(self) -> bool:
@@ -83,6 +88,7 @@ def get_branding() -> FirmBranding:
         accent_hex=normalize_hex(row["accent_hex"]),
         logo=row["logo"],
         logo_mime=row["logo_mime"],
+        report_legend=(row["report_legend"] or "").strip() or DEFAULT_REPORT_LEGEND,
     )
 
 
@@ -93,6 +99,7 @@ def save_branding(
     logo: Optional[bytes] = None,
     logo_mime: Optional[str] = None,
     keep_existing_logo: bool = True,
+    report_legend: str = DEFAULT_REPORT_LEGEND,
 ) -> FirmBranding:
     """Persist branding. Without a new logo, the stored one is kept unless
     keep_existing_logo is False (explicit removal)."""
@@ -107,18 +114,20 @@ def save_branding(
         cursor.execute(
             """
             INSERT INTO firm_branding (id, firm_name, tagline, accent_hex,
-                                       logo, logo_mime, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?)
+                                       logo, logo_mime, report_legend, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 firm_name = excluded.firm_name,
                 tagline = excluded.tagline,
                 accent_hex = excluded.accent_hex,
                 logo = excluded.logo,
                 logo_mime = excluded.logo_mime,
+                report_legend = excluded.report_legend,
                 updated_at = excluded.updated_at
             """,
-            (firm_name.strip(), tagline.strip(), accent,
-             logo, logo_mime, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            (firm_name.strip(), tagline.strip(), accent, logo, logo_mime,
+             (report_legend or "").strip() or DEFAULT_REPORT_LEGEND,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
     return get_branding()
 

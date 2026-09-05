@@ -57,6 +57,16 @@ def test_branding_round_trip_with_logo(db):
     assert get_branding().logo is None
 
 
+def test_report_legend_round_trip_and_blank_fallback(db):
+    from services.branding import DEFAULT_REPORT_LEGEND
+
+    assert get_branding().report_legend == DEFAULT_REPORT_LEGEND
+    assert save_branding("Firm", report_legend="Custom report legend.").report_legend == (
+        "Custom report legend."
+    )
+    assert save_branding("Firm", report_legend="  ").report_legend == DEFAULT_REPORT_LEGEND
+
+
 def test_logo_validation(db):
     with pytest.raises(ValueError, match="PNG or JPEG"):
         save_branding("Firm", logo=_PNG, logo_mime="image/svg+xml")

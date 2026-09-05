@@ -105,6 +105,9 @@ with tagline_col:
     tagline = st.text_input("Tagline / address line", value=firm_branding.tagline,
                             placeholder="City, ST · yourfirm.com")
 
+report_legend = st.text_area("Report legend", value=firm_branding.report_legend)
+st.caption("Prints on every page of statement PDFs.")
+
 accent_col, logo_col = st.columns(2)
 with accent_col:
     accent = st.color_picker("Accent color (headings and rules)",
@@ -142,6 +145,7 @@ if st.button("Save branding", type="primary"):
             logo=logo_bytes,
             logo_mime=logo_mime,
             keep_existing_logo=not remove_logo,
+            report_legend=report_legend,
         )
         st.success("Branding saved. The next report you export will carry it.")
         if remove_logo and not uploaded_logo:

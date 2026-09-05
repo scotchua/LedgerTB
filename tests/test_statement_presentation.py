@@ -17,6 +17,7 @@ The defects, for whoever reads this after a regression:
 """
 
 import re
+from datetime import datetime, timezone
 
 import pytest
 
@@ -231,3 +232,149 @@ def test_both_renderers_format_the_same_negative_the_same_way():
             "change_percent": None}
     assert _pdf_comparison_values(item) == ["(18,124.00)", "", "–", ""]
     assert "(18,124.00)" in statement_html([("item", "x", [-18124.0])])
+
+
+def _statement_view(client_id, rows, **kwargs):
+    from services.statement_pdf import StatementView
+
+    return StatementView(
+        client_id, "Income Statement",
+        "For the period January 1, 2026 to January 31, 2026",
+        tuple(rows), report_slug="income_statement", **kwargs,
+    )
+
+
+def _statement_pdf_text(payload):
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(payload)
+    pages = []
+    try:
+        for index in range(len(document)):
+            page = document[index]
+            text_page = page.get_textpage()
+            try:
+                pages.append(text_page.get_text_range())
+            finally:
+                text_page.close()
+                page.close()
+    finally:
+        document.close()
+    return pages
+
+
+def test_statement_view_validates_amount_shapes(client_id):
+    from services.statement_pdf import StatementView
+
+    with pytest.raises(ValueError, match="headers are required"):
+        _statement_view(client_id, [("item", "x", [1, 2])])
+    with pytest.raises(ValueError, match="headers must match"):
+        _statement_view(
+            client_id, [("item", "x", [1, 2])], headers=("Amount",),
+        )
+    with pytest.raises(ValueError, match="formats must match"):
+        _statement_view(
+            client_id, [("item", "x", [1, 2])],
+            headers=("Current", "Prior"), formats=("money",),
+        )
+    assert StatementView(client_id, "Empty", "As of January 1, 2026", ()).amount_columns == 1
+
+
+@pytest.mark.parametrize("columns,portrait", [(1, True), (2, True), (3, False), (4, False)])
+def test_statement_pdf_orientation(client_id, columns, portrait):
+    import pypdfium2 as pdfium
+    from services.statement_pdf import build_statement_pdf
+
+    view = _statement_view(
+        client_id, [("item", "x", [1] * columns)],
+        headers=tuple(f"H{i}" for i in range(columns)),
+    )
+    document = pdfium.PdfDocument(build_statement_pdf(view, datetime.now(timezone.utc)))
+    page = document[0]
+    try:
+        width, height = page.get_size()
+        assert (height > width) is portrait
+    finally:
+        page.close()
+        document.close()
+
+
+def test_statement_pdf_row_grammar_escaping_and_amount_parity(client_id):
+    from services.statement_pdf import build_statement_pdf
+
+    rows = [
+        ("section", "Revenue", []),
+        ("group", "Operating", []),
+        ("item", "R&D <script>", [-18124.0, 0.0, 12.5], "note-slot", "?secret=1", "6000"),
+        ("subtotal", "Subtotal", [0.0, 0.0, 0.0]),
+        ("total", "Total", [-18124.0, 0.0, 12.5]),
+        ("note", "A statement note", []),
+    ]
+    view = _statement_view(
+        client_id, rows, headers=("Amount", "Zero", "Percent"),
+        formats=("money", "money", "percent"), show_numbers=False,
+    )
+    text = "\n".join(_statement_pdf_text(build_statement_pdf(view, datetime.now(timezone.utc))))
+    for expected in ("Revenue", "Operating", "R&D <script>", "Subtotal", "Total", "A statement note"):
+        assert expected in text
+    assert text.count("note-slot") == 1
+    assert "?secret=1" not in text
+    assert "6000" not in text
+    assert "(18,124.00)" in text and "0.0%" in text and "12.5%" in text
+
+
+def test_empty_statement_and_custom_legend_render(client_id):
+    from services.branding import save_branding
+    from services.statement_pdf import build_statement_pdf
+
+    save_branding("Firm", report_legend="Custom report legend.")
+    text = "\n".join(_statement_pdf_text(build_statement_pdf(
+        _statement_view(client_id, []), datetime.now(timezone.utc)
+    )))
+    assert "No activity for this period." in text
+    assert "Custom report legend." in text
+
+
+def test_statement_pdf_corrupt_client_logo_fails_soft(client_id, caplog):
+    from database.connection import get_cursor
+    from services.branding import save_client_branding
+    from services.statement_pdf import build_statement_pdf
+
+    save_client_branding(
+        client_id, logo=b"valid placeholder", logo_mime="image/png",
+    )
+    with get_cursor(commit=True) as cursor:
+        cursor.execute(
+            "UPDATE client_branding SET logo = ? WHERE client_id = ?",
+            (b"not an image", client_id),
+        )
+
+    with caplog.at_level("WARNING", logger="services.statement_pdf"):
+        payload = build_statement_pdf(
+            _statement_view(client_id, [("item", "x", [1])]),
+            datetime.now(timezone.utc),
+        )
+
+    assert payload.startswith(b"%PDF")
+    assert caplog.messages.count(
+        "Could not render client logo for statement PDF"
+    ) == 1
+
+
+def test_long_statement_footer_running_header_and_final_total(client_id):
+    from services.branding import save_branding
+    from services.statement_pdf import build_statement_pdf
+
+    save_branding("Invented Firm", report_legend="Every page legend.")
+    rows = [("section", "Details", [])]
+    rows.extend(("item", f"Line {index}", [index]) for index in range(200))
+    rows.append(("total", "Final Total", [19900]))
+    pages = _statement_pdf_text(build_statement_pdf(
+        _statement_view(client_id, rows), datetime.now(timezone.utc)
+    ))
+    assert len(pages) > 1
+    assert all("Every page legend." in page for page in pages)
+    assert all("Prepared by Invented Firm" in page and "as of" in page for page in pages)
+    assert all("Snapshot ID" not in page and "Document Audits" not in page for page in pages)
+    assert "Income Statement" in pages[1]
+    assert "Line 199" in pages[-1] and "Final Total" in pages[-1]

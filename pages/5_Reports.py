@@ -1,8 +1,12 @@
 import streamlit as st
 import sys
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
+from dataclasses import asdict
+from hashlib import sha256
 from io import BytesIO
+import json
+import re
 from urllib.parse import urlencode
 
 import pandas as pd
@@ -16,7 +20,8 @@ from models.audit_log import AuditLog
 from models.reports import CASH_FLOW_STATEMENT_SECTIONS, ReportGenerator
 from money import to_dollars
 from services.ar_ap import get_1099_summary, get_income_by_customer, get_sales_tax_report
-from services.close_package import build_statement_pdf
+from services.branding import get_branding, get_client_branding
+from services.statement_pdf import StatementView, build_statement_pdf, statement_pdf_audit_args
 from database import init_database
 from database import connection as dbconn
 from utils.client_context import (
@@ -61,9 +66,41 @@ def _numbers_toggle(key, grouped):
 
 
 def _statement_download_buttons(
-    client_id, export_name, audit_values, excel_data, excel_file_name,
-    pdf_data, pdf_file_name,
+    client_id, export_name, audit_values, excel_data, excel_file_name, view,
 ):
+    branding = get_branding()
+    client_branding = get_client_branding(client_id)
+    canonical = {
+        **asdict(view),
+        "branding": {
+            "firm_name": branding.firm_name,
+            "accent_hex": branding.accent_hex,
+            "report_legend": branding.report_legend,
+            "firm_logo": sha256(branding.logo or b"").hexdigest(),
+            "client_name": client_branding.display_name,
+            "client_accent": client_branding.accent_hex,
+            "client_logo": sha256(client_branding.logo or b"").hexdigest(),
+        },
+    }
+    cache_hash = sha256(json.dumps(canonical, sort_keys=True, default=str).encode()).hexdigest()
+    cache_key = report_key(f"{view.report_slug}_pdf_cache")
+    cached = st.session_state.get(cache_key)
+    if not cached or cached["hash"] != cache_hash:
+        generated_at = datetime.now().astimezone()
+        cached = {
+            "hash": cache_hash,
+            "generated_at": generated_at,
+            "bytes": build_statement_pdf(view, generated_at),
+        }
+        st.session_state[cache_key] = cached
+    client = Client.get_by_id(client_id)
+    client_part = client_branding.display_name or client.name
+    client_slug = re.sub(r"[^A-Za-z0-9]+", "-", client_part).strip("-")[:60] or "client"
+    date_part = dict(view.params).get("as_of_date") or dict(view.params).get("end_date")
+    pdf_file_name = f"{view.report_slug}_{client_slug}_{date_part}.pdf"
+    pdf_audit_args = statement_pdf_audit_args(
+        client_id, view, pdf_file_name, cached["bytes"], cached["generated_at"],
+    )
     excel_col, pdf_col, _ = st.columns([1, 1, 4])
     with excel_col:
         st.download_button(
@@ -75,17 +112,17 @@ def _statement_download_buttons(
             args=(client_id, "EXPORT", export_name, {
                 "format": "xlsx", **audit_values,
             }),
+            key=report_key(f"{view.report_slug}_xlsx"),
         )
     with pdf_col:
         st.download_button(
             label="Download PDF",
-            data=pdf_data,
+            data=cached["bytes"],
             file_name=pdf_file_name,
             mime="application/pdf",
             on_click=AuditLog.log_event,
-            args=(client_id, "EXPORT", export_name, {
-                "format": "pdf", **audit_values,
-            }),
+            args=pdf_audit_args,
+            key=report_key(f"{view.report_slug}_pdf"),
         )
 
 # Initialize database
@@ -525,15 +562,15 @@ elif selected_report == "Trial Balance":
             sanitize_df(df).to_excel(buffer, index=False, sheet_name="Trial Balance")
             buffer.seek(0)
 
-        pdf_buffer = build_statement_pdf(
-            client.name,
-            "Trial Balance",
-            f"As of {long_date(as_of_date)}",
-            statement_rows,
+        statement_view = StatementView(
+            client_id, "Trial Balance", f"As of {long_date(as_of_date)}",
+            tuple(statement_rows),
             headers=(
                 ["Current Dr", "Current Cr", "PY Dr", "PY Cr"]
                 if compare_py else ["Debit", "Credit"]
             ),
+            report_slug="trial_balance",
+            params=(("as_of_date", as_of_date), ("comparative", compare_py)),
         )
         _statement_download_buttons(
             client_id,
@@ -541,8 +578,7 @@ elif selected_report == "Trial Balance":
             {"as_of_date": as_of_date, "row_count": len(rows)},
             buffer,
             f"trial_balance_{client.name}_{as_of_date}.xlsx",
-            pdf_buffer,
-            f"trial_balance_{client.name}_{as_of_date}.pdf",
+            statement_view,
         )
 
 elif selected_report == "Income Statement":
@@ -711,14 +747,17 @@ elif selected_report == "Income Statement":
     sanitize_df(df).to_excel(buffer, index=False, sheet_name="Income Statement")
     buffer.seek(0)
 
-    pdf_buffer = build_statement_pdf(
-        client.name,
-        "Income Statement",
-        f"{long_date(is_start)} to {long_date(is_end)}",
-        statement_rows,
+    statement_view = StatementView(
+        client_id, "Income Statement",
+        f"For the period {long_date(is_start)} to {long_date(is_end)}",
+        tuple(statement_rows),
         headers=is_headers,
         formats=is_formats,
         show_numbers=is_show_numbers,
+        report_slug="income_statement",
+        params=(("start_date", is_start), ("end_date", is_end),
+                ("comparative", compare_py), ("grouped", group_is),
+                ("show_numbers", is_show_numbers)),
     )
     _statement_download_buttons(
         client_id,
@@ -729,8 +768,7 @@ elif selected_report == "Income Statement":
         },
         buffer,
         f"income_statement_{client.name}_{is_start}_to_{is_end}.xlsx",
-        pdf_buffer,
-        f"income_statement_{client.name}_{is_start}_to_{is_end}.pdf",
+        statement_view,
     )
 
 elif selected_report == "Balance Sheet":
@@ -906,14 +944,15 @@ elif selected_report == "Balance Sheet":
     sanitize_df(df).to_excel(buffer, index=False, sheet_name="Balance Sheet")
     buffer.seek(0)
 
-    pdf_buffer = build_statement_pdf(
-        client.name,
-        "Balance Sheet",
-        f"As of {long_date(bs_date)}",
-        statement_rows,
+    statement_view = StatementView(
+        client_id, "Balance Sheet", f"As of {long_date(bs_date)}",
+        tuple(statement_rows),
         headers=bs_headers,
         formats=bs_formats,
         show_numbers=bs_show_numbers,
+        report_slug="balance_sheet",
+        params=(("as_of_date", bs_date), ("comparative", compare_py),
+                ("grouped", group_bs), ("show_numbers", bs_show_numbers)),
     )
     _statement_download_buttons(
         client_id,
@@ -921,8 +960,7 @@ elif selected_report == "Balance Sheet":
         {"as_of_date": bs_date, "row_count": len(df)},
         buffer,
         f"balance_sheet_{client.name}_{bs_date}.xlsx",
-        pdf_buffer,
-        f"balance_sheet_{client.name}_{bs_date}.pdf",
+        statement_view,
     )
 
 elif selected_report == "Cash Flow":
@@ -1128,13 +1166,15 @@ elif selected_report == "Cash Flow":
     buffer = BytesIO()
     sanitize_df(df).to_excel(buffer, index=False, sheet_name="Cash Flow")
     buffer.seek(0)
-    pdf_buffer = build_statement_pdf(
-        client.name,
-        "Statement of Cash Flows",
-        f"{long_date(cf_start)} to {long_date(cf_end)}",
-        statement_rows,
+    statement_view = StatementView(
+        client_id, "Statement of Cash Flows",
+        f"For the period {long_date(cf_start)} to {long_date(cf_end)}",
+        tuple(statement_rows),
         headers=cf_headers,
         formats=cf_formats,
+        report_slug="cash_flow",
+        params=(("start_date", cf_start), ("end_date", cf_end),
+                ("comparative", compare_py), ("show_numbers", False)),
     )
     _statement_download_buttons(
         client_id,
@@ -1145,8 +1185,7 @@ elif selected_report == "Cash Flow":
         },
         buffer,
         f"cash_flow_{client.name}_{cf_start}_to_{cf_end}.xlsx",
-        pdf_buffer,
-        f"cash_flow_{client.name}_{cf_start}_to_{cf_end}.pdf",
+        statement_view,
     )
 
 elif selected_report == "General Ledger":
