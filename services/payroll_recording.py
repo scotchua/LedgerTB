@@ -70,12 +70,29 @@ def _validated_deductions(deductions: List[dict]) -> List[dict]:
     return normalized
 
 
+def _validated_employer_costs(employer_costs: List[dict]) -> List[dict]:
+    normalized = []
+    for employer_cost in employer_costs:
+        if set(employer_cost) != {"label", "amount_cents"}:
+            raise ValueError("Each employer cost requires a label and amount_cents.")
+        label = str(employer_cost["label"]).strip()
+        amount = employer_cost["amount_cents"]
+        if not label:
+            raise ValueError("Each employer cost requires a label.")
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+            raise ValueError("Employer cost amounts must be non-negative integer cents.")
+        normalized.append({"label": label, "amount_cents": amount})
+    return normalized
+
+
 def add_pay_stub(pay_run_id: int, employee_id: int, gross_pay_cents: int,
-                 deductions: List[dict], net_pay_cents: int, _conn=None) -> PayStub:
+                 deductions: List[dict], net_pay_cents: int, _conn=None,
+                 employer_costs: list = ()) -> PayStub:
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
            for value in (gross_pay_cents, net_pay_cents)):
         raise ValueError("Gross and net pay must be non-negative integer cents.")
     deductions = _validated_deductions(deductions)
+    employer_costs = _validated_employer_costs(employer_costs)
     if gross_pay_cents - sum(item["amount_cents"] for item in deductions) != net_pay_cents:
         raise ValueError("Gross pay minus deductions must equal net pay.")
 
@@ -96,18 +113,23 @@ def add_pay_stub(pay_run_id: int, employee_id: int, gross_pay_cents: int,
         if not cursor.fetchone():
             raise ValueError("Employee not found for this pay run's client.")
         encoded = json.dumps(deductions, separators=(",", ":"), sort_keys=True)
+        encoded_employer_costs = json.dumps(
+            employer_costs, separators=(",", ":"), sort_keys=True,
+        )
         cursor.execute(
             "INSERT INTO pay_stubs "
-            "(pay_run_id, employee_id, gross_pay_cents, deductions, net_pay_cents) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (pay_run_id, employee_id, gross_pay_cents, encoded, net_pay_cents),
+            "(pay_run_id, employee_id, gross_pay_cents, deductions, net_pay_cents, "
+            "employer_costs) VALUES (?, ?, ?, ?, ?, ?)",
+            (pay_run_id, employee_id, gross_pay_cents, encoded, net_pay_cents,
+             encoded_employer_costs),
         )
         stub_id = cursor.lastrowid
         AuditLog.write(
             cursor, pay_run["client_id"], "pay_stubs", stub_id, "INSERT",
             new_values={"pay_run_id": pay_run_id, "employee_id": employee_id,
                         "gross_pay_cents": gross_pay_cents, "deductions": deductions,
-                        "net_pay_cents": net_pay_cents},
+                        "net_pay_cents": net_pay_cents,
+                        "employer_costs": employer_costs},
         )
         if owns_conn:
             conn.commit()
@@ -119,7 +141,7 @@ def add_pay_stub(pay_run_id: int, employee_id: int, gross_pay_cents: int,
         if owns_conn:
             conn.close()
     return PayStub(stub_id, pay_run_id, employee_id, gross_pay_cents,
-                   deductions, net_pay_cents)
+                   deductions, net_pay_cents, employer_costs)
 
 
 def _assert_accounts(cursor, client_id: int, account_ids, allowed_types, label: str):
@@ -141,7 +163,9 @@ def _assert_accounts(cursor, client_id: int, account_ids, allowed_types, label: 
 
 def post_pay_run(pay_run_id: int, wage_accounts: Dict[str, int],
                  default_wages_account_id: Optional[int], cash_account_id: int,
-                 deduction_accounts: Dict[str, int]) -> JournalEntry:
+                 deduction_accounts: Dict[str, int],
+                 employer_cost_accounts: dict = None) -> JournalEntry:
+    employer_cost_accounts = employer_cost_accounts or {}
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -164,16 +188,35 @@ def post_pay_run(pay_run_id: int, wage_accounts: Dict[str, int],
         total_net = sum(row["net_pay_cents"] for row in rows)
         wage_totals = defaultdict(int)
         deduction_totals = defaultdict(int)
+        employer_cost_totals = defaultdict(int)
         for row in rows:
             deductions = _validated_deductions(json.loads(row["deductions"]))
+            employer_costs = _validated_employer_costs(json.loads(row["employer_costs"]))
             if row["gross_pay_cents"] - sum(item["amount_cents"] for item in deductions) != row["net_pay_cents"]:
                 raise ValueError("A stored pay stub is arithmetically inconsistent.")
             wage_totals[row["department_name"]] += row["gross_pay_cents"]
             for item in deductions:
                 deduction_totals[item["label"]] += item["amount_cents"]
+            for item in employer_costs:
+                employer_cost_totals[item["label"]] += item["amount_cents"]
         missing = sorted(set(deduction_totals) - set(deduction_accounts))
         if missing:
             raise ValueError("Account mapping required for: " + ", ".join(missing))
+        missing_employer_costs = sorted(
+            set(employer_cost_totals) - set(employer_cost_accounts)
+        )
+        if missing_employer_costs:
+            raise ValueError(
+                "Account mapping required for employer costs: "
+                + ", ".join(missing_employer_costs)
+            )
+        if any(
+            not isinstance(pair, (tuple, list)) or len(pair) != 2
+            for pair in employer_cost_accounts.values()
+        ):
+            raise ValueError(
+                "Employer cost account mappings require an expense and liability account."
+            )
 
         missing_departments = sorted(
             name for name in wage_totals
@@ -193,6 +236,16 @@ def post_pay_run(pay_run_id: int, wage_accounts: Dict[str, int],
                          {"Expense"}, "Wages")
         _assert_accounts(cursor, pay_run["client_id"], deduction_accounts.values(),
                          {"Liability"}, "Deduction")
+        _assert_accounts(
+            cursor, pay_run["client_id"],
+            (employer_cost_accounts[label][0] for label in employer_cost_totals),
+            {"Expense"}, "Employer cost expense",
+        )
+        _assert_accounts(
+            cursor, pay_run["client_id"],
+            (employer_cost_accounts[label][1] for label in employer_cost_totals),
+            {"Liability"}, "Employer cost liability",
+        )
 
         lines = [JournalEntryLine(
             account_id=cash_account_id, credit=to_dollars(total_net),
@@ -209,12 +262,26 @@ def post_pay_run(pay_run_id: int, wage_accounts: Dict[str, int],
             account_id=deduction_accounts[label], credit=to_dollars(amount),
             memo=label,
         ) for label, amount in sorted(deduction_totals.items()) if amount)
+        for label, amount in sorted(employer_cost_totals.items()):
+            if amount:
+                expense_account_id, liability_account_id = employer_cost_accounts[label]
+                lines.extend([
+                    JournalEntryLine(
+                        account_id=expense_account_id, debit=to_dollars(amount), memo=label,
+                    ),
+                    JournalEntryLine(
+                        account_id=liability_account_id, credit=to_dollars(amount),
+                        memo=label,
+                    ),
+                ])
         entry = JournalEntry(
             client_id=pay_run["client_id"],
             entry_date=date.fromisoformat(pay_run["pay_date"]),
             description=f"Recorded pay run for period ending {pay_run['pay_period_end']}",
             source_reference=f"Pay run {pay_run_id}", lines=lines,
         )
+        if not entry.is_balanced():
+            raise ValueError("Payroll journal entry is unbalanced; nothing was posted.")
         entry.save(conn=conn)
         cursor.execute(
             "UPDATE pay_runs SET status = 'posted', journal_entry_id = ? "
@@ -288,7 +355,8 @@ def discard_pay_run(pay_run_id: int) -> dict:
                 old_values={"employee_id": stub["employee_id"],
                             "gross_pay_cents": stub["gross_pay_cents"],
                             "net_pay_cents": stub["net_pay_cents"],
-                            "deductions": json.loads(stub["deductions"])},
+                            "deductions": json.loads(stub["deductions"]),
+                            "employer_costs": json.loads(stub["employer_costs"])},
                 new_values={"operation_id": operation_id},
             )
 
@@ -545,6 +613,7 @@ def accept_payroll_batch(batch_id: int) -> PayRun:
             add_pay_stub(
                 pay_run_id, row["matched_employee_id"], row["gross_pay_cents"],
                 json.loads(row["deductions"]), row["net_pay_cents"], _conn=conn,
+                employer_costs=json.loads(row["employer_costs"] or "[]"),
             )
             if row["matched_department_id"] is not None:
                 cursor.execute(

@@ -6,6 +6,7 @@ from database.connection import get_cursor
 from models.account import Account
 from models.department import Department
 from models.fiscal_period import FiscalPeriod
+from models.journal_entry import JournalEntry
 from models.payroll import Employee, PayStub
 from services.payroll_recording import (
     accept_payroll_batch, add_pay_stub, create_pay_run, parse_canonical_payroll_csv,
@@ -23,6 +24,13 @@ def _employee(client_id, name, department_id=None):
 def _liability(client_id, number, name):
     account = Account(client_id=client_id, account_number=number,
                       name=name, type="Liability")
+    account.save()
+    return account.id
+
+
+def _expense(client_id, number, name):
+    account = Account(client_id=client_id, account_number=number,
+                      name=name, type="Expense")
     account.save()
     return account.id
 
@@ -64,6 +72,81 @@ def test_multi_employee_pay_run_posts_hand_computed_balanced_entry(client_id, ac
     assert entry.is_balanced()
 
 
+def test_employer_costs_post_balanced_lines_without_changing_pay_lines(client_id,
+                                                                       accounts):
+    employee = _employee(client_id, "Skyler Field")
+    withholding = _liability(client_id, "2140", "Provider withholding")
+    fica_expense = _expense(client_id, "6030", "Employer FICA expense")
+    benefit_expense = _expense(client_id, "6040", "Employer benefit expense")
+    fica_payable = _liability(client_id, "2150", "Employer FICA payable")
+    benefit_payable = _liability(client_id, "2160", "Employer benefit payable")
+    run = create_pay_run(client_id, date(2026, 2, 1), date(2026, 2, 15),
+                         date(2026, 2, 20))
+    add_pay_stub(
+        run.id, employee.id, 100000,
+        [{"label": "Provider withholding", "amount_cents": 10000}], 90000,
+        employer_costs=[
+            {"label": "Employer FICA", "amount_cents": 7650},
+            {"label": "Employer benefit", "amount_cents": 5000},
+        ],
+    )
+
+    entry = post_pay_run(
+        run.id, {}, accounts["expense"], accounts["cash"],
+        {"Provider withholding": withholding},
+        {"Employer FICA": (fica_expense, fica_payable),
+         "Employer benefit": (benefit_expense, benefit_payable)},
+    )
+
+    with get_cursor() as cursor:
+        rows = cursor.execute(
+            "SELECT account_id, debit, credit FROM journal_entry_lines "
+            "WHERE journal_entry_id = ?", (entry.id,),
+        ).fetchall()
+        run_audit = cursor.execute(
+            "SELECT old_values, new_values FROM audit_log WHERE table_name = 'pay_runs' "
+            "AND record_id = ? AND action = 'UPDATE'", (run.id,),
+        ).fetchone()
+    lines = {(row["account_id"], row["debit"], row["credit"]) for row in rows}
+    assert {(accounts["expense"], 100000, 0), (accounts["cash"], 0, 90000),
+            (withholding, 0, 10000)}.issubset(lines)
+    assert {(fica_expense, 7650, 0), (fica_payable, 0, 7650),
+            (benefit_expense, 5000, 0), (benefit_payable, 0, 5000)}.issubset(lines)
+    assert entry.is_balanced()
+    assert set(__import__("json").loads(run_audit["old_values"])) == {
+        "status", "journal_entry_id"
+    }
+    assert set(__import__("json").loads(run_audit["new_values"])) == {
+        "status", "journal_entry_id"
+    }
+
+
+def test_employer_cost_mapping_and_account_types_are_enforced(client_id, accounts):
+    employee = _employee(client_id, "Avery Trail")
+    payable = _liability(client_id, "2170", "Payroll cost payable")
+    run = create_pay_run(client_id, date(2026, 3, 1), date(2026, 3, 15),
+                         date(2026, 3, 20))
+    add_pay_stub(
+        run.id, employee.id, 100000, [], 100000,
+        employer_costs=[{"label": "SUTA", "amount_cents": 1200}],
+    )
+
+    with pytest.raises(ValueError, match="Account mapping required for employer costs: SUTA"):
+        post_pay_run(run.id, {}, accounts["expense"], accounts["cash"], {})
+    with get_cursor() as cursor:
+        assert cursor.execute(
+            "SELECT COUNT(*) FROM journal_entries WHERE source_reference = ?",
+            (f"Pay run {run.id}",),
+        ).fetchone()[0] == 0
+
+    with pytest.raises(ValueError, match="expense accounts must be Expense"):
+        post_pay_run(run.id, {}, accounts["expense"], accounts["cash"], {},
+                     {"SUTA": (payable, payable)})
+    with pytest.raises(ValueError, match="liability accounts must be Liability"):
+        post_pay_run(run.id, {}, accounts["expense"], accounts["cash"], {},
+                     {"SUTA": (accounts["expense"], accounts["expense"])})
+
+
 def test_add_pay_stub_refuses_inconsistent_arithmetic(client_id):
     employee = _employee(client_id, "Taylor Reed")
     run = create_pay_run(client_id, date(2026, 3, 1), date(2026, 3, 15),
@@ -89,6 +172,25 @@ def test_post_pay_run_refuses_empty_run(client_id, accounts):
                          date(2026, 5, 20))
     with pytest.raises(ValueError, match="no pay stubs"):
         post_pay_run(run.id, {}, accounts["expense"], accounts["cash"], {})
+
+
+def test_post_pay_run_refuses_unbalanced_entry(monkeypatch, client_id, accounts):
+    employee = _employee(client_id, "Riley Stone")
+    run = create_pay_run(client_id, date(2026, 5, 1), date(2026, 5, 15),
+                         date(2026, 5, 20))
+    add_pay_stub(run.id, employee.id, 100000, [], 100000)
+    monkeypatch.setattr(JournalEntry, "is_balanced", lambda self: False)
+
+    with pytest.raises(
+        ValueError, match="Payroll journal entry is unbalanced; nothing was posted",
+    ):
+        post_pay_run(run.id, {}, accounts["expense"], accounts["cash"], {})
+
+    with get_cursor() as cursor:
+        assert cursor.execute(
+            "SELECT COUNT(*) FROM journal_entries WHERE source_reference = ?",
+            (f"Pay run {run.id}",),
+        ).fetchone()[0] == 0
 
 
 def test_payroll_mutations_are_audited_and_attributed(client_id, accounts):
@@ -243,6 +345,27 @@ def test_accept_payroll_batch_creates_exact_draft_and_refuses_duplicate(client_i
     ]
     with pytest.raises(ValueError, match="already been accepted"):
         accept_payroll_batch(batch_id)
+
+
+def test_accept_payroll_batch_preserves_employer_costs(client_id):
+    employee = _employee(client_id, "Import Cost Employee")
+    row = {**_staged_row("Import Cost Employee"), "employer_costs": [
+        {"label": "FUTA", "amount_cents": 600},
+    ]}
+    batch_id = stage_payroll_rows(
+        client_id, "gusto", "Payroll register", "costs.csv", [row],
+    )
+    with get_cursor() as cursor:
+        row_id = cursor.execute(
+            "SELECT id FROM payroll_import_rows WHERE batch_id = ?", (batch_id,),
+        ).fetchone()["id"]
+    update_payroll_import_row(row_id, employee.id, None)
+
+    run = accept_payroll_batch(batch_id)
+
+    assert PayStub.get_all(run.id)[0].employer_costs == [
+        {"label": "FUTA", "amount_cents": 600}
+    ]
 
 
 def test_canonical_csv_round_trips_through_posting(client_id, accounts):

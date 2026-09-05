@@ -76,6 +76,43 @@ def test_propose_pay_run_stages_a_draft_and_posts_nothing(client_id, accounts,
     ]
 
 
+def test_propose_and_list_pay_run_employer_costs(client_id, accounts, monkeypatch):
+    employee = _employee(client_id, "Payroll Cost Employee")
+    monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", "propose")
+    stub = _stub(employee.id)
+    stub["employer_costs"] = [
+        {"label": "Employer FICA", "amount": 382.50},
+        {"label": "Benefits", "amount": 100.00},
+    ]
+
+    result = mcp_tools.propose_pay_run(client_id, *PERIOD, PAY_DATE, [stub])
+
+    stored = PayStub.get_all(result["pay_run_id"])[0]
+    assert stored.employer_costs == [
+        {"label": "Employer FICA", "amount_cents": 38250},
+        {"label": "Benefits", "amount_cents": 10000},
+    ]
+    assert mcp_tools.list_pay_runs(client_id)[0]["stubs"][0]["employer_costs"] == [
+        {"label": "Employer FICA", "amount": 382.50},
+        {"label": "Benefits", "amount": 100.00},
+    ]
+
+
+@pytest.mark.parametrize("cost", [
+    {"label": "", "amount": 10.00},
+    {"label": "SUTA", "amount": -1.00},
+])
+def test_propose_pay_run_rejects_invalid_employer_cost_naming_stub(
+        client_id, accounts, monkeypatch, cost):
+    employee = _employee(client_id, "Invalid Cost Employee")
+    monkeypatch.setattr(dbconn, "ASSISTANT_ACCESS_LEVEL", "propose")
+    stub = _stub(employee.id)
+    stub["employer_costs"] = [cost]
+
+    with pytest.raises(ValueError, match="Stub 1"):
+        mcp_tools.propose_pay_run(client_id, *PERIOD, PAY_DATE, [stub])
+
+
 def test_a_stub_that_does_not_foot_is_refused_by_stub_number(client_id,
                                                              accounts,
                                                              monkeypatch):

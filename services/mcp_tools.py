@@ -1477,6 +1477,7 @@ def list_pay_runs(client_id: int, status: str = "draft") -> list:
         for run in runs:
             cursor.execute(
                 "SELECT ps.gross_pay_cents, ps.net_pay_cents, ps.deductions, "
+                "ps.employer_costs, "
                 "e.name AS employee_name "
                 "FROM pay_stubs ps JOIN employees e ON e.id = ps.employee_id "
                 "WHERE ps.pay_run_id = ? ORDER BY ps.id",
@@ -1503,6 +1504,11 @@ def list_pay_runs(client_id: int, status: str = "draft") -> list:
                             {"label": d["label"],
                              "amount": round(d["amount_cents"] / 100, 2)}
                             for d in _json.loads(s["deductions"])
+                        ],
+                        "employer_costs": [
+                            {"label": cost["label"],
+                             "amount": round(cost["amount_cents"] / 100, 2)}
+                            for cost in _json.loads(s["employer_costs"])
                         ],
                     }
                     for s in stubs
@@ -1565,6 +1571,29 @@ def propose_pay_run(client_id: int, period_start: str, period_end: str,
                 "label": str(item["label"]).strip(),
                 "amount_cents": to_cents(item.get("amount")),
             })
+        supplied_employer_costs = stub.get("employer_costs") or []
+        if not isinstance(supplied_employer_costs, list):
+            raise ValueError(f"Stub {index}: employer_costs must be a list.")
+        employer_costs = []
+        for item in supplied_employer_costs:
+            if not isinstance(item, dict) or not str(item.get("label", "")).strip():
+                raise ValueError(
+                    f"Stub {index}: each employer cost needs a label and amount."
+                )
+            try:
+                amount_cents = to_cents(item.get("amount"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Stub {index}: each employer cost needs a label and amount."
+                ) from exc
+            if amount_cents < 0:
+                raise ValueError(
+                    f"Stub {index}: employer cost amounts must be non-negative."
+                )
+            employer_costs.append({
+                "label": str(item["label"]).strip(),
+                "amount_cents": amount_cents,
+            })
         # Arithmetic is the caller's to get right; say which stub is wrong
         # rather than letting the service report an anonymous mismatch.
         if gross - sum(d["amount_cents"] for d in deductions) != net:
@@ -1574,16 +1603,16 @@ def propose_pay_run(client_id: int, period_start: str, period_end: str,
                 f"{sum(d['amount_cents'] for d in deductions) / 100:.2f}, "
                 f"net {net / 100:.2f})."
             )
-        prepared.append((employee_id, gross, deductions, net))
+        prepared.append((employee_id, gross, deductions, net, employer_costs))
 
     # One transaction: a partially built pay run is worse than none, because a
     # reviewer would see a run whose stubs do not represent the whole payroll.
     conn = get_connection()
     try:
         pay_run = create_pay_run(client_id, start, end, paid, _conn=conn)
-        for employee_id, gross, deductions, net in prepared:
+        for employee_id, gross, deductions, net, employer_costs in prepared:
             add_pay_stub(pay_run.id, employee_id, gross, deductions, net,
-                         _conn=conn)
+                         _conn=conn, employer_costs=employer_costs)
         if rationale.strip():
             AuditLog.write(
                 conn.cursor(), client_id, "pay_runs", pay_run.id, "INSERT",
@@ -1600,8 +1629,8 @@ def propose_pay_run(client_id: int, period_start: str, period_end: str,
         "pay_run_id": pay_run.id,
         "status": "draft",
         "stubs": len(prepared),
-        "total_gross": round(sum(g for _, g, _, _ in prepared) / 100, 2),
-        "total_net": round(sum(n for _, _, _, n in prepared) / 100, 2),
+        "total_gross": round(sum(item[1] for item in prepared) / 100, 2),
+        "total_net": round(sum(item[3] for item in prepared) / 100, 2),
         "posted": False,
         "note": ("Draft only — no account was touched. A person reviews this "
                  "run in LedgerTB → Payroll Recording and chooses the wage and "

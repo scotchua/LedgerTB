@@ -116,10 +116,9 @@ from an already-running MCP process.
   add an employee: `employees` is deliberately outside its insert surface,
   because putting a person on a client's book is a human decision.
 
-  **Employer-side payroll taxes are not part of a pay run.** A pay run posts
-  gross wages, the withholding liabilities, and net cash — there is no place
-  in the model for employer FICA, FUTA, or SUTA expense and its matching
-  liability. Record those as a separate entry (`propose_entry`).
+  Employer costs are recorded from the provider's report, never computed here.
+  A pay run posts gross wages, withholding liabilities, net cash, and recorded
+  employer-cost expenses and liabilities.
 
 - **Shared/custom book files are read-only.** The separate MCP process does
   not yet participate in firm mode's one-writer sidecar lock, so books outside

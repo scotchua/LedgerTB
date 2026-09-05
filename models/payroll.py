@@ -153,6 +153,7 @@ class PayStub:
     gross_pay_cents: int = 0
     deductions: List[dict] = field(default_factory=list)
     net_pay_cents: int = 0
+    employer_costs: List[dict] = field(default_factory=list)
 
     @staticmethod
     def get_all(pay_run_id: int) -> List["PayStub"]:
@@ -166,4 +167,5 @@ class PayStub:
             id=row["id"], pay_run_id=row["pay_run_id"],
             employee_id=row["employee_id"], gross_pay_cents=row["gross_pay_cents"],
             deductions=json.loads(row["deductions"]), net_pay_cents=row["net_pay_cents"],
+            employer_costs=json.loads(row["employer_costs"]),
         ) for row in rows]

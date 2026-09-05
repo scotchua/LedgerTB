@@ -297,6 +297,27 @@ def test_discard_leaves_dismissed_row_untouched(client_id):
     assert (dismissed["status"], dismissed["pay_run_id"]) == ("dismissed", None)
 
 
+def test_discard_stub_audit_snapshot_includes_employer_costs(client_id):
+    employee = _employee(client_id, "Audit Cost Employee")
+    run = create_pay_run(client_id, date(2026, 9, 1), date(2026, 9, 15),
+                         date(2026, 9, 20))
+    add_pay_stub(
+        run.id, employee.id, 100000, [], 100000,
+        employer_costs=[{"label": "Employer FICA", "amount_cents": 7650}],
+    )
+
+    discard_pay_run(run.id)
+
+    with get_cursor() as cursor:
+        row = cursor.execute(
+            "SELECT old_values FROM audit_log WHERE table_name = 'pay_stubs' "
+            "AND action = 'DELETE' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert json.loads(row["old_values"])["employer_costs"] == [
+        {"label": "Employer FICA", "amount_cents": 7650}
+    ]
+
+
 def test_migration_backfills_newest_existing_run_and_ignores_deleted_run(db, client_id):
     conn = get_connection()
     conn.execute("PRAGMA foreign_keys = OFF")

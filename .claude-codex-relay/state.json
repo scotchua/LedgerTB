@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "owner": "idle",
+  "active_tools": {
+    "9e2c63ca-f3ec-479d-9425-5be2957f5b61:toolu_01CbwptxjF2MfiMf7uT4xLjR": {
+      "session_id": "9e2c63ca-f3ec-479d-9425-5be2957f5b61",
+      "tool": "Bash",
+      "started": 1788627986.592129
+    }
+  },
+  "agents": {},
+  "background": {
+    "9e2c63ca-f3ec-479d-9425-5be2957f5b61:bavj934f2": "Write the PDF-delta correction brief and launch all four correction rounds in parallel",
+    "9e2c63ca-f3ec-479d-9425-5be2957f5b61:bcq0tfsls": "Move Escalate-if inside the fenced block and relaunch the three correction rounds",
+    "9e2c63ca-f3ec-479d-9425-5be2957f5b61:toolu_01BFUH2zoN8J9yL1n9rLppxd": "Background process reported by Claude.",
+    "9e2c63ca-f3ec-479d-9425-5be2957f5b61:toolu_01N2oPzSQxAPu5s384pcLyq2": "Background process reported by Claude."
+  },
+  "sessions": {
+    "9e2c63ca-f3ec-479d-9425-5be2957f5b61": {
+      "seen": 1788627986.592129,
+      "event": "PreToolUse"
+    }
+  },
+  "last_session_id": "9e2c63ca-f3ec-479d-9425-5be2957f5b61",
+  "plan_mode": false
+}

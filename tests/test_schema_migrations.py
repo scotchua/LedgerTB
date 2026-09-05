@@ -53,9 +53,7 @@ def test_create_tables_records_migrations(db):
         # Fork-only migrations live in a reserved 900+ band so upstream's
         # sequence can never collide with ours again. account_grouping was
         # already renumbered once (020 -> 022) and crashed every launch.
-        "900_account_grouping", "901_cash_flow_section",
-        "902_document_audits", "903_import_suggestions", "904_payroll_import_row_pay_run",
-        "905_journal_entry_reversal_kind", "906_report_legend"]
+        "900_account_grouping", "901_cash_flow_section", "902_document_audits", "903_import_suggestions", "904_payroll_import_row_pay_run", "905_journal_entry_reversal_kind", "906_report_legend", "908_pay_stub_employer_costs"]
     conn.close()
 
 
@@ -68,7 +66,31 @@ def test_create_tables_is_idempotent(db):
 
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM schema_migrations")
-    assert cur.fetchone()[0] == 49
+    assert cur.fetchone()[0] == 50
+    conn.close()
+
+
+def test_employer_cost_migration_defaults_existing_stubs_to_empty_list():
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE pay_stubs ("
+        "id INTEGER PRIMARY KEY, pay_run_id INTEGER NOT NULL, "
+        "employee_id INTEGER NOT NULL, gross_pay_cents INTEGER NOT NULL, "
+        "deductions TEXT NOT NULL, net_pay_cents INTEGER NOT NULL);"
+        "INSERT INTO pay_stubs VALUES (1, 1, 1, 10000, '[]', 10000);"
+    )
+
+    conn.executescript(
+        (MIGRATIONS_DIR / "908_pay_stub_employer_costs.sql").read_text()
+    )
+
+    row = conn.execute(
+        "SELECT employer_costs FROM pay_stubs WHERE id = 1"
+    ).fetchone()
+    assert row["employer_costs"] == "[]"
     conn.close()
 
 
@@ -192,7 +214,7 @@ def test_migration_failure_is_atomic(tmp_path, monkeypatch):
 
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = '001_boom'")
-    assert cur.fetchone()[0] == 0  # not recorded
+    assert cur.fetchone()[0] == 50  # not recorded
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='will_rollback'")
     assert cur.fetchone() is None  # partial DDL rolled back
     conn.close()
