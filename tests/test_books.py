@@ -3,6 +3,7 @@ import json
 import os
 import getpass
 import socket
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -140,6 +141,23 @@ def test_missing_sidecar_fences_owner(settings, tmp_path):
 
     with pytest.raises(RuntimeError, match="Another computer took over this book"):
         book_lock.verify_and_refresh(book)
+
+
+def test_idle_lease_heartbeat_advances_and_stops_on_release(
+        settings, tmp_path, monkeypatch):
+    book = tmp_path / "shared.db"
+    monkeypatch.setattr(book_lock, "HEARTBEAT_SECONDS", 0.6)
+    book_lock.acquire(book)
+    first = book_lock.read_lock(book)["heartbeat_at"]
+
+    time.sleep(book_lock.HEARTBEAT_SECONDS * 2)
+    deadline = time.monotonic() + 1
+    while book_lock.read_lock(book)["heartbeat_at"] == first:
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    book_lock.release(book)
+    assert str(book_lock.lock_path(book)) not in book_lock._heartbeat_stops
 
 
 def test_keyed_non_local_session_without_owned_token_passes_gate(

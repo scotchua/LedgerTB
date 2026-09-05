@@ -37,6 +37,9 @@ def start_streamlit(port: int, ui_token: str) -> subprocess.Popen:
 
     The UI token goes in the environment rather than argv: other users on the
     machine can read another process's command line, but not its environment.
+    The parent PID lets the child detect SIGKILL, Force Quit, a second-instance
+    exit, or a crash in ``webview.start`` -- paths that can skip both the normal
+    ``stop_streamlit`` call and the parent's atexit cleanup.
     """
     cmd = [
         sys.executable, "-m", "streamlit", "run", str(APP_DIR / "app.py"),
@@ -46,8 +49,14 @@ def start_streamlit(port: int, ui_token: str) -> subprocess.Popen:
         "--server.runOnSave=false",
         "--browser.gatherUsageStats=false",
     ]
-    kwargs = {"cwd": str(APP_DIR),
-              "env": dict(os.environ, LEDGERTB_UI_TOKEN=ui_token)}
+    kwargs = {
+        "cwd": str(APP_DIR),
+        "env": dict(
+            os.environ,
+            LEDGERTB_UI_TOKEN=ui_token,
+            LEDGERTB_PARENT_PID=str(os.getpid()),
+        ),
+    }
     if os.name == "posix":
         kwargs["start_new_session"] = True  # own process group for clean shutdown
     return subprocess.Popen(cmd, **kwargs)
@@ -141,6 +150,8 @@ def main() -> int:
 
     proc = start_streamlit(port, ui_token)
     atexit.register(stop_streamlit, proc)
+    # Do not install Python signal handlers: Cocoa's run loop starves them.
+    # The child's parent watchdog covers hard exits from the desktop shell.
 
     if not wait_until_ready(url):
         stop_streamlit(proc)

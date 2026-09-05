@@ -10,15 +10,19 @@ import getpass
 import json
 import os
 import socket
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 STALE_AFTER_SECONDS = 10 * 60
+HEARTBEAT_SECONDS = 30
 TAKEN_OVER_MESSAGE = "Another computer took over this book"
 
 _leases = {}
+_heartbeat_stops = {}
+_lease_lock = threading.RLock()
 
 
 def lock_path(book) -> Path:
@@ -60,34 +64,75 @@ def _write_handle(fd, holder: dict) -> None:
 
 def _remember(book, token: str, fd: int) -> None:
     key = str(lock_path(book))
-    previous = _leases.pop(key, None)
-    if previous:
-        os.close(previous[1])
-    _leases[key] = (token, fd)
+    with _lease_lock:
+        previous = _leases.pop(key, None)
+        if previous:
+            os.close(previous[1])
+        _leases[key] = (token, fd)
+    _start_heartbeat(book)
 
 
 def _forget(book) -> None:
-    lease = _leases.pop(str(lock_path(book)), None)
-    if lease:
-        try:
-            os.close(lease[1])
-        except OSError:
-            pass
+    key = str(lock_path(book))
+    with _lease_lock:
+        heartbeat_stop = _heartbeat_stops.pop(key, None)
+        if heartbeat_stop:
+            heartbeat_stop.set()
+        lease = _leases.pop(key, None)
+        if lease:
+            try:
+                os.close(lease[1])
+            except OSError:
+                pass
 
 
 def _reset() -> None:
     """Close and forget all process-held leases."""
-    for _token, fd in list(_leases.values()):
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    _leases.clear()
+    for book in held_books():
+        _forget(book)
 
 
 def _owned_token(book):
-    lease = _leases.get(str(lock_path(book)))
-    return lease[0] if lease else None
+    with _lease_lock:
+        lease = _leases.get(str(lock_path(book)))
+        return lease[0] if lease else None
+
+
+def held_books():
+    """Return the books whose leases are currently held by this process."""
+    with _lease_lock:
+        return [Path(path).with_name(Path(path).name.removesuffix(".lock"))
+                for path in list(_leases)]
+
+
+def _heartbeat(book, stop: threading.Event) -> None:
+    """Refresh an idle lease independently of Streamlit request handling.
+
+    Previously only ``require_unlock`` called ``verify_and_refresh``. Streamlit
+    runs that path during a request or rerun, so an orphaned server with no
+    browser connected kept its acquisition timestamp forever.
+    """
+    while not stop.wait(HEARTBEAT_SECONDS):
+        try:
+            verify_and_refresh(book)
+        except (OSError, RuntimeError):
+            return
+
+
+def _start_heartbeat(book) -> None:
+    key = str(lock_path(book))
+    with _lease_lock:
+        current = _heartbeat_stops.get(key)
+        if current and not current.is_set():
+            return
+        stop = threading.Event()
+        _heartbeat_stops[key] = stop
+    threading.Thread(
+        target=_heartbeat,
+        args=(Path(book), stop),
+        name="ledgertb-book-heartbeat",
+        daemon=True,
+    ).start()
 
 
 def is_stale(holder: dict, now=None) -> bool:
@@ -148,28 +193,30 @@ def takeover(book) -> dict:
 
 def verify_and_refresh(book) -> bool:
     """Fence a former owner and refresh the current owner's heartbeat."""
-    token = _owned_token(book)
-    if not token:
-        return
-    holder = read_lock(book)
-    if not holder or holder.get("token") != token:
-        _forget(book)
-        raise RuntimeError(TAKEN_OVER_MESSAGE)
-    holder["heartbeat_at"] = _now().isoformat(timespec="seconds")
-    _write_handle(_leases[str(lock_path(book))][1], holder)
-    return True
+    with _lease_lock:
+        token = _owned_token(book)
+        if not token:
+            return
+        holder = read_lock(book)
+        if not holder or holder.get("token") != token:
+            _forget(book)
+            raise RuntimeError(TAKEN_OVER_MESSAGE)
+        holder["heartbeat_at"] = _now().isoformat(timespec="seconds")
+        _write_handle(_leases[str(lock_path(book))][1], holder)
+        return True
 
 
 def release(book) -> None:
     """Remove the sidecar only while its token is still ours."""
-    path = lock_path(book)
-    token = _owned_token(book)
-    try:
-        holder = read_lock(book)
-        if token and holder and holder.get("token") == token:
-            path.unlink(missing_ok=True)
-    finally:
-        _forget(book)
+    with _lease_lock:
+        path = lock_path(book)
+        token = _owned_token(book)
+        try:
+            holder = read_lock(book)
+            if token and holder and holder.get("token") == token:
+                path.unlink(missing_ok=True)
+        finally:
+            _forget(book)
 
 
 def describe(holder: dict) -> str:

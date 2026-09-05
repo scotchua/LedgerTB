@@ -17,9 +17,10 @@ Configuration:
         ANTHROPIC_API_KEY=your-api-key-here
 """
 
-import streamlit as st
 import sys
 from pathlib import Path
+
+import streamlit as st
 
 # Add current directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -32,6 +33,9 @@ from models.journal_entry import JournalEntry
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 from utils import icons
+from utils.parent_watchdog import start_parent_watchdog
+
+start_parent_watchdog()
 
 # Initialize database on startup
 
