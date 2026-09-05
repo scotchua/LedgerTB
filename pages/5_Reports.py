@@ -16,6 +16,7 @@ from models.audit_log import AuditLog
 from models.reports import CASH_FLOW_STATEMENT_SECTIONS, ReportGenerator
 from money import to_dollars
 from services.ar_ap import get_1099_summary, get_income_by_customer, get_sales_tax_report
+from services.close_package import build_statement_pdf
 from database import init_database
 from database import connection as dbconn
 from utils.client_context import (
@@ -57,6 +58,35 @@ def _numbers_toggle(key, grouped):
         "Show account numbers", key=key,
         help="Numbers sit in their own column so captions remain aligned.",
     )
+
+
+def _statement_download_buttons(
+    client_id, export_name, audit_values, excel_data, excel_file_name,
+    pdf_data, pdf_file_name,
+):
+    excel_col, pdf_col, _ = st.columns([1, 1, 4])
+    with excel_col:
+        st.download_button(
+            label="Download Excel",
+            data=excel_data,
+            file_name=excel_file_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            on_click=AuditLog.log_event,
+            args=(client_id, "EXPORT", export_name, {
+                "format": "xlsx", **audit_values,
+            }),
+        )
+    with pdf_col:
+        st.download_button(
+            label="Download PDF",
+            data=pdf_data,
+            file_name=pdf_file_name,
+            mime="application/pdf",
+            on_click=AuditLog.log_event,
+            args=(client_id, "EXPORT", export_name, {
+                "format": "pdf", **audit_values,
+            }),
+        )
 
 # Initialize database
 
@@ -495,15 +525,24 @@ elif selected_report == "Trial Balance":
             sanitize_df(df).to_excel(buffer, index=False, sheet_name="Trial Balance")
             buffer.seek(0)
 
-        st.download_button(
-            label="Download Excel",
-            data=buffer,
-            file_name=f"trial_balance_{client.name}_{as_of_date}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            on_click=AuditLog.log_event,
-            args=(client_id, "EXPORT", "trial_balance_export", {
-                "format": "xlsx", "as_of_date": as_of_date, "row_count": len(rows),
-            }),
+        pdf_buffer = build_statement_pdf(
+            client.name,
+            "Trial Balance",
+            f"As of {long_date(as_of_date)}",
+            statement_rows,
+            headers=(
+                ["Current Dr", "Current Cr", "PY Dr", "PY Cr"]
+                if compare_py else ["Debit", "Credit"]
+            ),
+        )
+        _statement_download_buttons(
+            client_id,
+            "trial_balance_export",
+            {"as_of_date": as_of_date, "row_count": len(rows)},
+            buffer,
+            f"trial_balance_{client.name}_{as_of_date}.xlsx",
+            pdf_buffer,
+            f"trial_balance_{client.name}_{as_of_date}.pdf",
         )
 
 elif selected_report == "Income Statement":
@@ -632,15 +671,20 @@ elif selected_report == "Income Statement":
             number,
         ))
 
-    financial_statement(
-        statement_rows,
-        headers=_comparative_headers(
+    is_headers = (
+        _comparative_headers(
             f"{short_date(is_start)} to {short_date(is_end)}",
             (f"{short_date(report['prior_period']['start'])} to "
              f"{short_date(report['prior_period']['end'])}"),
-        ) if compare_py else None,
-        formats=["money", "money", "money", "percent"]
-        if compare_py else None,
+        ) if compare_py else ["Amount"]
+    )
+    is_formats = (
+        ["money", "money", "money", "percent"] if compare_py else None
+    )
+    financial_statement(
+        statement_rows,
+        headers=is_headers if compare_py else None,
+        formats=is_formats,
         show_numbers=is_show_numbers,
     )
     if compare_py:
@@ -667,16 +711,26 @@ elif selected_report == "Income Statement":
     sanitize_df(df).to_excel(buffer, index=False, sheet_name="Income Statement")
     buffer.seek(0)
 
-    st.download_button(
-        label="Download Excel",
-        data=buffer,
-        file_name=f"income_statement_{client.name}_{is_start}_to_{is_end}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        on_click=AuditLog.log_event,
-        args=(client_id, "EXPORT", "income_statement_export", {
-            "format": "xlsx", "start_date": is_start, "end_date": is_end,
+    pdf_buffer = build_statement_pdf(
+        client.name,
+        "Income Statement",
+        f"{long_date(is_start)} to {long_date(is_end)}",
+        statement_rows,
+        headers=is_headers,
+        formats=is_formats,
+        show_numbers=is_show_numbers,
+    )
+    _statement_download_buttons(
+        client_id,
+        "income_statement_export",
+        {
+            "start_date": is_start, "end_date": is_end,
             "row_count": len(df),
-        }),
+        },
+        buffer,
+        f"income_statement_{client.name}_{is_start}_to_{is_end}.xlsx",
+        pdf_buffer,
+        f"income_statement_{client.name}_{is_start}_to_{is_end}.pdf",
     )
 
 elif selected_report == "Balance Sheet":
@@ -812,15 +866,20 @@ elif selected_report == "Balance Sheet":
         + [("total", "Total Liabilities & Equity",
             _bs_amounts(report['total_liabilities_equity']))]
     )
-    financial_statement(
-        statement_rows,
-        headers=_comparative_headers(
+    bs_headers = (
+        _comparative_headers(
             f"As of {short_date(bs_date)}",
             f"As of {short_date(report['prior_as_of'])}",
-        ) if compare_py else None,
+        ) if compare_py else ["Amount"]
+    )
+    bs_formats = (
+        ["money", "money", "money", "percent"] if compare_py else None
+    )
+    financial_statement(
+        statement_rows,
+        headers=bs_headers if compare_py else None,
         show_numbers=bs_show_numbers,
-        formats=["money", "money", "money", "percent"]
-        if compare_py else None,
+        formats=bs_formats,
     )
     if compare_py:
         st.caption(f"Prior year as of {long_date(report['prior_as_of'])}")
@@ -847,15 +906,23 @@ elif selected_report == "Balance Sheet":
     sanitize_df(df).to_excel(buffer, index=False, sheet_name="Balance Sheet")
     buffer.seek(0)
 
-    st.download_button(
-        label="Download Excel",
-        data=buffer,
-        file_name=f"balance_sheet_{client.name}_{bs_date}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        on_click=AuditLog.log_event,
-        args=(client_id, "EXPORT", "balance_sheet_export", {
-            "format": "xlsx", "as_of_date": bs_date, "row_count": len(df),
-        }),
+    pdf_buffer = build_statement_pdf(
+        client.name,
+        "Balance Sheet",
+        f"As of {long_date(bs_date)}",
+        statement_rows,
+        headers=bs_headers,
+        formats=bs_formats,
+        show_numbers=bs_show_numbers,
+    )
+    _statement_download_buttons(
+        client_id,
+        "balance_sheet_export",
+        {"as_of_date": bs_date, "row_count": len(df)},
+        buffer,
+        f"balance_sheet_{client.name}_{bs_date}.xlsx",
+        pdf_buffer,
+        f"balance_sheet_{client.name}_{bs_date}.pdf",
     )
 
 elif selected_report == "Cash Flow":
@@ -951,12 +1018,17 @@ elif selected_report == "Cash Flow":
         ("item", "Cash at Beginning of Period", _cf_amounts(report['cash_beginning'])),
         ("total", "Cash at End of Period", _cf_amounts(report['cash_ending'])),
     ])
+    cf_headers = (
+        ["Current", "Prior Year", "$ Change", "% Change"]
+        if compare_py else ["Amount"]
+    )
+    cf_formats = (
+        ["money", "money", "money", "percent"] if compare_py else None
+    )
     financial_statement(
         statement_rows,
-        headers=["Current", "Prior Year", "$ Change", "% Change"]
-        if compare_py else None,
-        formats=["money", "money", "money", "percent"]
-        if compare_py else None,
+        headers=cf_headers if compare_py else None,
+        formats=cf_formats,
     )
 
     if report['current_ready']:
@@ -1056,16 +1128,25 @@ elif selected_report == "Cash Flow":
     buffer = BytesIO()
     sanitize_df(df).to_excel(buffer, index=False, sheet_name="Cash Flow")
     buffer.seek(0)
-    st.download_button(
-        label="Download Excel",
-        data=buffer,
-        file_name=f"cash_flow_{client.name}_{cf_start}_to_{cf_end}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        on_click=AuditLog.log_event,
-        args=(client_id, "EXPORT", "cash_flow_export", {
-            "format": "xlsx", "start_date": cf_start, "end_date": cf_end,
+    pdf_buffer = build_statement_pdf(
+        client.name,
+        "Statement of Cash Flows",
+        f"{long_date(cf_start)} to {long_date(cf_end)}",
+        statement_rows,
+        headers=cf_headers,
+        formats=cf_formats,
+    )
+    _statement_download_buttons(
+        client_id,
+        "cash_flow_export",
+        {
+            "start_date": cf_start, "end_date": cf_end,
             "row_count": len(df),
-        }),
+        },
+        buffer,
+        f"cash_flow_{client.name}_{cf_start}_to_{cf_end}.xlsx",
+        pdf_buffer,
+        f"cash_flow_{client.name}_{cf_start}_to_{cf_end}.pdf",
     )
 
 elif selected_report == "General Ledger":

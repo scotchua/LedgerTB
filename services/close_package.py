@@ -54,7 +54,12 @@ from services.branding import (
 )
 from utils.dates import long_date, long_datetime
 from utils.fiscal_dates import fiscal_year_bounds
-from utils.statement_format import statement_amount
+from utils.statement_format import (
+    DOUBLE_RULE_BELOW,
+    LEAD_DOLLAR,
+    RULE_ABOVE,
+    statement_amount,
+)
 from utils.export import set_excel_literal
 
 _HEADER_FONT = Font(bold=True)
@@ -1174,7 +1179,8 @@ def _safe_paragraph(text: str, style: ParagraphStyle) -> Paragraph:
 def _pdf_table(headers, data_rows, col_widths, money_from: Optional[int],
                totals_row=None, bold_data_rows=None,
                ruled_data_rows=None, no_split_data_ranges=None,
-               statement: bool = False, grand_total: bool = False) -> Table:
+               statement: bool = False, grand_total: bool = False,
+               double_ruled_data_rows=None) -> Table:
     """A report table: bold repeating header, right-aligned money columns."""
     rows = [headers] + data_rows
     if totals_row is not None:
@@ -1215,12 +1221,130 @@ def _pdf_table(headers, data_rows, col_widths, money_from: Optional[int],
             "LINEABOVE", (rule_from, table_row), (-1, table_row),
             0.5, colors.HexColor("#777777"),
         ))
+    for data_index in double_ruled_data_rows or ():
+        table_row = data_index + 1
+        rule_from = money_from if statement and money_from is not None else 0
+        style.append((
+            "LINEBELOW", (rule_from, table_row), (-1, table_row), 0.75,
+            colors.black, None, None, None, 2, 1.2,
+        ))
     for start_index, end_index in no_split_data_ranges or ():
         style.append((
             "NOSPLIT", (0, start_index + 1), (-1, end_index + 1)
         ))
     table.setStyle(TableStyle(style))
     return table
+
+
+def _pdf_statement_table(rows, headers=None, formats=None,
+                         show_numbers: bool = False) -> Table:
+    """Render the same statement-row contract used by the on-screen table."""
+    amount_columns = max(
+        (len(row[2]) for row in rows if len(row) > 2 and row[2]),
+        default=1,
+    )
+    amount_headers = list(headers or ["Amount"] * amount_columns)
+    amount_formats = list(formats or []) + ["money"] * amount_columns
+    data_rows = []
+    bold_rows = []
+    ruled_rows = []
+    double_ruled_rows = []
+
+    for row in rows:
+        kind, label = row[0], row[1]
+        amounts = row[2] if len(row) > 2 and row[2] is not None else []
+        number = row[5] if len(row) > 5 else None
+        values = list(amounts) + [None] * (amount_columns - len(amounts))
+        cells = ([_wrap(str(number or "")), _wrap(str(label))]
+                 if show_numbers and kind == "item" else
+                 (["", _wrap(str(label))] if show_numbers else [_wrap(str(label))]))
+        cells.extend(
+            statement_amount(
+                value,
+                lead_dollar=kind in LEAD_DOLLAR,
+                value_format=amount_formats[index],
+            )
+            for index, value in enumerate(values)
+        )
+        data_rows.append(cells)
+        data_index = len(data_rows) - 1
+        if kind in {"section", "group", "subtotal", "total"}:
+            bold_rows.append(data_index)
+        if kind in RULE_ABOVE:
+            ruled_rows.append(data_index)
+        if kind in DOUBLE_RULE_BELOW:
+            double_ruled_rows.append(data_index)
+
+    label_width = 4.4 * inch if amount_columns >= 4 else 6.2 * inch
+    amount_width = 1.35 * inch if amount_columns >= 4 else 1.8 * inch
+    if show_numbers:
+        number_width = 0.8 * inch
+        col_widths = [number_width, label_width - number_width]
+        table_headers = ["Acct #", "Account", *amount_headers]
+        money_from = 2
+    else:
+        col_widths = [label_width]
+        table_headers = ["Account", *amount_headers]
+        money_from = 1
+    col_widths.extend([amount_width] * amount_columns)
+
+    return _pdf_table(
+        table_headers,
+        data_rows,
+        col_widths,
+        money_from=money_from,
+        bold_data_rows=bold_rows,
+        ruled_data_rows=ruled_rows,
+        statement=True,
+        double_ruled_data_rows=double_ruled_rows,
+    )
+
+
+def build_statement_pdf(client_name: str, title: str, period_label: str,
+                        rows, *, headers=None, formats=None,
+                        show_numbers: bool = False) -> BytesIO:
+    """Build one on-screen financial statement as an in-memory PDF."""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(letter),
+        leftMargin=0.5 * inch,
+        rightMargin=0.5 * inch,
+        topMargin=0.6 * inch,
+        bottomMargin=0.55 * inch,
+        title=f"{title} - {client_name}",
+        author="LedgerTB",
+    )
+
+    def _footer(canvas, _doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(colors.HexColor("#666666"))
+        canvas.drawString(
+            0.5 * inch, 0.3 * inch, f"{client_name} - {period_label}"
+        )
+        canvas.drawRightString(
+            doc.pagesize[0] - 0.5 * inch,
+            0.3 * inch,
+            f"Page {canvas.getPageNumber()}",
+        )
+        canvas.restoreState()
+
+    story = [
+        _safe_paragraph(client_name, _PDF_H1),
+        _safe_paragraph(title, _PDF_H2),
+        _safe_paragraph(period_label, _PDF_META),
+        Spacer(1, 12),
+        _pdf_statement_table(
+            rows,
+            headers=headers,
+            formats=formats,
+            show_numbers=show_numbers,
+        ),
+    ]
+    doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+    buffer.seek(0)
+    return buffer
 
 
 def _pdf_income_statement_table(report: Dict) -> Table:

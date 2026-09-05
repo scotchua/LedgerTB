@@ -1,6 +1,9 @@
 from datetime import date, timedelta
+from io import BytesIO
 from pathlib import Path
 
+import pandas as pd
+import pypdfium2 as pdfium
 from constants import AccountSubtype
 from streamlit.testing.v1 import AppTest
 import streamlit as st
@@ -15,11 +18,13 @@ from models.recurring_entry import (
     RecurringSchedule,
     TemplateLine,
 )
+from models.reports import ReportGenerator
 from models.fiscal_period import FiscalPeriod
 from models.transaction import ImportedTransaction
 from services.posting import post_transaction
 from services import mcp_tools
 from tests.conftest import page_path, post_entry
+from utils.statement_format import statement_amount
 
 
 def _select_client(monkeypatch, client_id):
@@ -30,6 +35,17 @@ def _select_client(monkeypatch, client_id):
     pick = client_id if callable(client_id) else (lambda: client_id)
     monkeypatch.setattr(selector, "render_client_selector", pick)
     monkeypatch.setattr(st, "page_link", lambda *args, **kwargs: None)
+
+
+def _pdf_text(payload):
+    document = pdfium.PdfDocument(payload)
+    try:
+        return "\n".join(
+            document[index].get_textpage().get_text_range()
+            for index in range(len(document))
+        )
+    finally:
+        document.close()
 
 
 def test_paginated_accounting_pages_render(client_id, accounts, monkeypatch):
@@ -454,6 +470,173 @@ def test_report_statements_render_with_balance_checks(client_id, accounts, monke
         assert not any(
             box.label == "Drill into general ledger" for box in page.selectbox
         ), view
+
+
+def test_statement_pdf_downloads_match_report_totals_grouping_and_audit(
+    client_id, accounts, monkeypatch
+):
+    _select_client(monkeypatch, client_id)
+    for account_key, subtype in [
+        ("equity", AccountSubtype.OWNER_CONTRIBUTION),
+        ("revenue", AccountSubtype.OPERATING_REVENUE),
+        ("expense", AccountSubtype.OPERATING_EXPENSE),
+    ]:
+        account = Account.get_by_id(accounts[account_key], client_id)
+        account.subtype = subtype
+        account.save()
+    post_entry(
+        client_id, date(2025, 1, 15),
+        [(accounts["cash"], 200, 0), (accounts["revenue"], 0, 200)],
+    )
+    post_entry(
+        client_id, date(2025, 2, 3),
+        [(accounts["expense"], 50, 0), (accounts["cash"], 0, 50)],
+    )
+    post_entry(
+        client_id, date(2026, 1, 15),
+        [(accounts["cash"], 250, 0), (accounts["revenue"], 0, 250)],
+    )
+    post_entry(
+        client_id, date(2026, 2, 3),
+        [(accounts["expense"], 60, 0), (accounts["cash"], 0, 60)],
+    )
+
+    captured = []
+    original_download_button = st.download_button
+
+    def capture_download(*args, **kwargs):
+        captured.append(kwargs.copy())
+        return original_download_button(*args, **kwargs)
+
+    monkeypatch.setattr(st, "download_button", capture_download)
+    report_path = page_path("pages/5_Reports.py")
+    period = (date(2026, 1, 1), date(2026, 3, 31))
+    specs = [
+        (
+            "Trial Balance", {"as_of": period[1].isoformat()},
+            "trial_balance_export",
+        ),
+        (
+            "Income Statement",
+            {"start": period[0].isoformat(), "end": period[1].isoformat()},
+            "income_statement_export",
+        ),
+        (
+            "Balance Sheet", {"as_of": period[1].isoformat()},
+            "balance_sheet_export",
+        ),
+        (
+            "Cash Flow",
+            {"start": period[0].isoformat(), "end": period[1].isoformat()},
+            "cash_flow_export",
+        ),
+    ]
+
+    for view, dates, export_name in specs:
+        captured.clear()
+        page = AppTest.from_file(report_path, default_timeout=30)
+        page.query_params.update({
+            "report": view, "client_id": str(client_id), **dates,
+        })
+        page.run()
+        assert not page.exception, view
+        if view in {"Income Statement", "Balance Sheet"}:
+            prefix = "is" if view == "Income Statement" else "bs"
+            page.toggle(key=f"{prefix}_group_accounts__reports_g0").set_value(True)
+            captured.clear()
+            page.run()
+            assert not page.exception, view
+
+        calls = {call["label"]: call for call in captured}
+        assert set(calls) == {"Download Excel", "Download PDF"}, view
+        excel_call = calls["Download Excel"]
+        pdf_call = calls["Download PDF"]
+        assert pdf_call["mime"] == "application/pdf"
+        assert pdf_call["file_name"].endswith(".pdf")
+        payload = pdf_call["data"]
+        raw_pdf = payload.getvalue() if isinstance(payload, BytesIO) else payload
+        assert raw_pdf.startswith(b"%PDF")
+        pdf_text = _pdf_text(raw_pdf)
+
+        assert excel_call["on_click"] is AuditLog.log_event
+        assert pdf_call["on_click"] is AuditLog.log_event
+        assert excel_call["args"][:3] == pdf_call["args"][:3] == (
+            client_id, "EXPORT", export_name,
+        )
+        excel_values = excel_call["args"][3]
+        pdf_values = pdf_call["args"][3]
+        assert excel_values.keys() == pdf_values.keys()
+        assert excel_values["format"] == "xlsx"
+        assert pdf_values == {**excel_values, "format": "pdf"}
+        audit_id = pdf_call["on_click"](*pdf_call["args"])
+        audit = AuditLog.get_by_id(audit_id)
+        assert audit.client_id == client_id
+        assert audit.action == "EXPORT"
+        assert audit.table_name == export_name
+        assert audit.new_values == {
+            key: value.isoformat() if hasattr(value, "isoformat") else value
+            for key, value in pdf_values.items()
+        }
+
+        if view == "Trial Balance":
+            report = ReportGenerator.comparative_trial_balance(
+                client_id, period[1]
+            )
+            totals = [
+                report["current_total_debits"],
+                report["current_total_credits"],
+                report["prior_total_debits"],
+                report["prior_total_credits"],
+            ]
+        elif view == "Income Statement":
+            report = ReportGenerator.comparative_income_statement(
+                client_id, *period, group_accounts=True
+            )
+            totals = [
+                report[key][period_key]
+                for key in ("total_revenue", "total_expenses", "net_income")
+                for period_key in ("current", "prior")
+            ]
+        elif view == "Balance Sheet":
+            report = ReportGenerator.comparative_balance_sheet(
+                client_id, period[1], group_accounts=True
+            )
+            totals = [
+                report[key][period_key]
+                for key in ("total_assets", "total_liabilities_equity")
+                for period_key in ("current", "prior")
+            ]
+        else:
+            report = ReportGenerator.comparative_cash_flow_statement(
+                client_id, *period
+            )
+            totals = [
+                report[key][period_key]
+                for key in ("computed_cash_change", "cash_ending")
+                for period_key in ("current", "prior")
+            ]
+        for total in totals:
+            assert statement_amount(total, lead_dollar=True) in pdf_text
+
+        if view in {"Income Statement", "Balance Sheet"}:
+            group_keys = (
+                ("revenue_groups", "expense_groups")
+                if view == "Income Statement" else
+                ("asset_groups", "liability_groups", "equity_groups")
+            )
+            group_labels = [
+                group["group"]
+                for key in group_keys
+                for group in report[key]
+                if group["accounts"]
+            ]
+            screen_html = "\n".join(
+                str(item.body) for item in page.get("html")
+                if hasattr(item, "body")
+            )
+            assert group_labels
+            assert all(label in pdf_text and label in screen_html
+                       for label in group_labels)
 
 
 def test_report_drilldown_preserves_authorized_desktop_token(
@@ -1531,6 +1714,65 @@ def test_import_history_reverses_batch_into_review_queue(
     )
     reports.checkbox(key="gl_hide_reversed_imports__reports_g0").uncheck().run()
     assert not reports.exception
+
+
+def test_import_history_entry_number_column_has_one_text_dtype(
+    client_id, accounts, monkeypatch, caplog
+):
+    _select_client(monkeypatch, client_id)
+    post_transaction(
+        client_id=client_id,
+        transaction={
+            "date": date(2026, 1, 10),
+            "description": "Posted import row",
+            "amount": -55,
+            "source_id": "dtype-source",
+            "source_filename": "dtype.csv",
+            "source_row_number": 2,
+        },
+        target_account_id=accounts["expense"],
+        bank_account_id=accounts["cash"],
+        batch_id="dtype-batch",
+        learn=False,
+    )
+    ImportedTransaction.bulk_insert([
+        ImportedTransaction(
+            client_id=client_id,
+            import_batch="dtype-batch",
+            transaction_date=date(2026, 1, 11),
+            description="Pending import row",
+            amount=-25,
+            bank_account_id=accounts["cash"],
+            source_id="dtype-source",
+            source_filename="dtype.csv",
+            source_row_number=3,
+        )
+    ])
+
+    captured = []
+    original_dataframe = st.dataframe
+
+    def capture_dataframe(data, *args, **kwargs):
+        if isinstance(data, pd.DataFrame) and "Entry #" in data.columns:
+            captured.append(data.copy())
+        return original_dataframe(data, *args, **kwargs)
+
+    monkeypatch.setattr(st, "dataframe", capture_dataframe)
+    page = AppTest.from_file(
+        page_path("pages/4_Import_Transactions.py"), default_timeout=30
+    )
+    page.session_state["import_active_tab"] = "Import History"
+    page.run()
+
+    assert not page.exception
+    assert len(captured) == 1
+    entry_numbers = captured[0]["Entry #"]
+    assert pd.api.types.is_string_dtype(entry_numbers.dtype)
+    assert all(isinstance(value, str) for value in entry_numbers)
+    assert not any(
+        "Arrow" in record.getMessage() or "mixed" in record.getMessage().lower()
+        for record in caplog.records
+    )
 
 
 def test_editing_a_second_account_does_not_inherit_the_first_ones_grouping(

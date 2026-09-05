@@ -2610,7 +2610,7 @@ elif selected_tab == "Import History":
             "Amount": f"{r.amount:,.2f}",
             "Account": r.bank_account_name or "—",
             "Status": r.status,
-            "Entry #": r.journal_entry_id if r.journal_entry_id else "—",
+            "Entry #": str(r.journal_entry_id) if r.journal_entry_id else "—",
         } for r in rows]), width="stretch", hide_index=True)
 
 elif selected_tab == "Learned Patterns":
