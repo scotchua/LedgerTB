@@ -1,6 +1,8 @@
 from datetime import date
 
 import pytest
+import streamlit as st
+from streamlit.testing.v1 import AppTest
 
 from database.connection import get_cursor
 from models.account import Account
@@ -12,6 +14,7 @@ from services.payroll_recording import (
     accept_payroll_batch, add_pay_stub, create_pay_run, parse_canonical_payroll_csv,
     post_pay_run, stage_payroll_rows, update_payroll_import_row,
 )
+from tests.conftest import page_path
 
 
 def _employee(client_id, name, department_id=None):
@@ -297,6 +300,40 @@ def _staged_row(employee_name="Staged Employee", pay_date="2026-09-20"):
         "deductions": [{"label": "Tax", "amount_cents": 10000}],
         "net_pay_cents": 90000,
     }
+
+
+def test_payroll_import_page_uses_canonical_provider_and_hides_it_for_gusto(
+    client_id, monkeypatch,
+):
+    import utils.client_selector as selector
+
+    monkeypatch.setattr(selector, "render_client_selector", lambda: client_id)
+    monkeypatch.setattr(st, "page_link", lambda *args, **kwargs: None)
+    create_pay_run(client_id, date(2026, 9, 1), date(2026, 9, 15),
+                   date(2026, 9, 20))
+    content = (
+        "employee_name,department,pay_period_start,pay_period_end,pay_date,"
+        "gross_pay,deductions_json,net_pay\n"
+        "CSV Employee,,2026-10-01,2026-10-15,2026-10-20,1000.00,[],1000.00\n"
+    ).encode()
+    page = AppTest.from_file(
+        page_path("pages/20_Payroll_Recording.py"), default_timeout=30
+    ).run()
+
+    page.selectbox(key="payroll_source_provider").set_value("quickbooks")
+    page.file_uploader[0].upload("canonical.csv", content).run()
+    next(button for button in page.button
+         if button.label == "Stage payroll rows").click().run()
+
+    assert not page.exception
+    with get_cursor() as cursor:
+        batch = cursor.execute(
+            "SELECT provider FROM payroll_import_batches ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert batch["provider"] == "quickbooks"
+
+    page.selectbox(key="payroll_import_format").set_value("Gusto").run()
+    assert not any(box.key == "payroll_source_provider" for box in page.selectbox)
 
 
 def test_stage_payroll_rows_is_atomic_and_rejects_closed_period(client_id):

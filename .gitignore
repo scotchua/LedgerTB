@@ -61,3 +61,7 @@ req-win.txt
 
 # Wrangler (Cloudflare Pages) local state
 .wrangler/
+
+# Synthetic payroll parser fixtures (invented names, round amounts) are the
+# one CSV set that belongs in the repo. Real exports stay ignored above.
+!tests/fixtures/payroll/*.csv

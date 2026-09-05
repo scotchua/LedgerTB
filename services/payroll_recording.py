@@ -451,7 +451,10 @@ def _validated_staged_row(client_id: int, row: dict) -> dict:
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
            for value in (gross, net)):
         raise ValueError("Gross and net pay must be non-negative integer cents.")
-    deductions = _validated_deductions(row["deductions"])
+    deductions_value = row["deductions"]
+    if isinstance(deductions_value, str):
+        deductions_value = json.loads(deductions_value)
+    deductions = _validated_deductions(deductions_value or [])
     if gross - sum(item["amount_cents"] for item in deductions) != net:
         raise ValueError("Gross pay minus deductions must equal net pay.")
     return {
@@ -502,8 +505,12 @@ def stage_payroll_rows(client_id: int, provider: str, source_report: str,
                  row["department_raw"], row["matched_department_id"],
                  row["pay_period_start"], row["pay_period_end"], row["pay_date"],
                  row["gross_pay_cents"], json.dumps(row["deductions"]),
-                 json.dumps(row["employer_costs"]) if row["employer_costs"] is not None else None,
-                 row["net_pay_cents"], json.dumps(row["raw_row"], default=str)),
+                 (row["employer_costs"] if isinstance(row["employer_costs"], str)
+                  else json.dumps(row["employer_costs"]))
+                 if row["employer_costs"] is not None else None,
+                 row["net_pay_cents"],
+                 (row["raw_row"] if isinstance(row["raw_row"], str)
+                  else json.dumps(row["raw_row"], default=str))),
             )
             row_id = cursor.lastrowid
             AuditLog.write(

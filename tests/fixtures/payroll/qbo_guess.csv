@@ -1,0 +1,3 @@
+Employee Name,Class,Pay Period Start,Pay Period End,Pay Date,Gross Pay,Employee Deductions,Company Contributions,Net Pay,Type
+Comet Fiction,Design,2026-01-13,2026-01-31,2026-02-06,100.00,10.00,2.00,90.00,employee
+TOTAL,,,,,100.00,10.00,2.00,90.00,total

@@ -16,6 +16,9 @@ from services.payroll_recording import (
     dismiss_payroll_row, get_payroll_import_rows, parse_canonical_payroll_csv, post_pay_run,
     linked_import_row_count, stage_payroll_rows, update_payroll_import_row,
 )
+from services.payroll_parsers import (
+    ParserRefusal, parse_gusto_payroll_journal, parse_qbo_payroll_summary,
+)
 from utils.client_selector import render_client_selector
 from utils.unlock import require_unlock
 
@@ -310,26 +313,43 @@ with runs_tab:
 
 with import_tab:
     st.subheader("Import provider payroll")
-    st.caption(
-        "Gusto and QuickBooks parsers arrive next after real sample exports are "
-        "available. For now, upload the canonical pre-parsed CSV."
-    )
+    st.caption("Upload a canonical CSV or a provider payroll export for strict parsing.")
     st.code(
         "employee_name,department,pay_period_start,pay_period_end,pay_date,"
         "gross_pay,deductions_json,net_pay"
     )
-    upload = st.file_uploader("Canonical payroll CSV", type=["csv"])
-    provider = st.selectbox("Source provider", ["gusto", "quickbooks"])
+    import_format = st.selectbox(
+        "Import format", ["Canonical CSV", "Gusto", "QuickBooks"],
+        key="payroll_import_format",
+    )
+    provider = None
+    if import_format == "Canonical CSV":
+        provider = st.selectbox(
+            "Source provider", ["gusto", "quickbooks"],
+            key="payroll_source_provider",
+        )
+    upload = st.file_uploader("Payroll CSV", type=["csv"])
     source_report = st.text_input("Source report", value="Canonical payroll export")
     if upload and st.button("Stage payroll rows", type="primary"):
         try:
-            parsed_rows = parse_canonical_payroll_csv(upload.getvalue().decode("utf-8-sig"))
+            content = upload.getvalue().decode("utf-8")
+            if import_format == "Canonical CSV":
+                parsed_rows = parse_canonical_payroll_csv(content.lstrip("\ufeff"))
+            else:
+                parser = (parse_gusto_payroll_journal if import_format == "Gusto"
+                          else parse_qbo_payroll_summary)
+                parsed = parser(content)
+                parsed_rows = parsed.rows
+                provider = parsed.provider
+                source_report = parsed.source_report
             batch_id = stage_payroll_rows(
                 client_id, provider, source_report, upload.name, parsed_rows,
             )
             st.session_state["payroll_import_batch_id"] = batch_id
             st.success(f"Staged payroll batch {batch_id}.")
             st.rerun()
+        except ParserRefusal as exc:
+            st.error(str(exc))
         except Exception as exc:
             st.error(f"Could not stage payroll import: {exc}")
 
