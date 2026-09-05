@@ -78,6 +78,7 @@ from an already-running MCP process.
   year. `ensure_fiscal_year` idempotently adds another year when Close Map or
   comparative work needs it; it may insert setup periods but can never close,
   reopen, edit, or delete them.
+  An optional human-declared `accounting_basis` (`cash` or `accrual`) is returned by `list_clients`.
 - **Chart imports are typed and reviewable.** `import_accounts` accepts
   `number` (optional), `name`, `type`, `subtype` (optional), and `description`
   (optional). QuickBooks types imply a reporting subtype, while an explicit

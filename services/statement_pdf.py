@@ -51,6 +51,7 @@ class StatementView:
     show_numbers: bool = False
     report_slug: str = "statement"
     params: tuple = ()
+    basis: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "rows", tuple(tuple(row) for row in self.rows))
@@ -232,8 +233,9 @@ def build_statement_pdf(view: StatementView, generated_at: datetime) -> bytes:
         _safe_paragraph(entity, heading_1),
         _safe_paragraph(view.title, heading_2),
         _safe_paragraph(view.period_text, _PDF_META),
-        Spacer(1, 10),
-        _statement_table(view, page_size[0]),
     ])
+    if view.basis:
+        story.append(_safe_paragraph(f"{view.basis.title()} basis", _PDF_META))
+    story.extend([Spacer(1, 10), _statement_table(view, page_size[0])])
     doc.build(story, canvasmaker=lambda *args, **kwargs: NumberedCanvas(*args, footer=footer, **kwargs))
     return buffer.getvalue()

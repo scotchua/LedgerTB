@@ -8,6 +8,8 @@ container, so the description must track the current selection.
 
 import pytest
 
+from models.client import Client
+
 
 def _run_clients_page(monkeypatch, view="Add Client"):
     # Neutralize the sidebar nav (st.page_link) so AppTest can run this one page.
@@ -62,6 +64,22 @@ def test_add_client_has_dedicated_ai_business_context(db, monkeypatch):
 
     context = at.text_area(key="add_business_context")
     assert "AI categorization" in context.label
+
+
+def test_edit_client_accounting_basis_persists_and_can_be_unset(db, monkeypatch):
+    client_id = Client(name="Basis Form").save(seed_accounts=False)
+    at = _run_clients_page(monkeypatch, view="View Clients")
+    at.button(key=f"edit_{client_id}").click().run()
+
+    at.selectbox(key="edit_accounting_basis").set_value("Accrual")
+    at.button(key="edit_save").click().run()
+    assert Client.get_by_id(client_id).accounting_basis == "accrual"
+
+    at.button(key=f"edit_{client_id}").click().run()
+    assert at.selectbox(key="edit_accounting_basis").value == "Accrual"
+    at.selectbox(key="edit_accounting_basis").set_value("Not set")
+    at.button(key="edit_save").click().run()
+    assert Client.get_by_id(client_id).accounting_basis is None
 
 
 def test_view_switcher_deep_link_and_default(db, monkeypatch):

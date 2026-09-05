@@ -11,6 +11,7 @@ class Client:
     entity_type: Optional[str] = None
     business_type: Optional[str] = None
     business_context: Optional[str] = None
+    accounting_basis: Optional[str] = None
     fiscal_year_end_month: int = 12
     is_active: bool = True
     # Extended client info (migration 003)
@@ -36,6 +37,7 @@ class Client:
             entity_type=row['entity_type'],
             business_type=g('business_type'),
             business_context=g('business_context'),
+            accounting_basis=g('accounting_basis'),
             fiscal_year_end_month=row['fiscal_year_end_month'],
             is_active=bool(row['is_active']),
             tax_id=g('tax_id'),
@@ -94,6 +96,7 @@ class Client:
                 "entity_type": values.get("entity_type"),
                 "business_type": values.get("business_type"),
                 "business_context": values.get("business_context"),
+                "accounting_basis": values.get("accounting_basis"),
                 "fiscal_year_end_month": values.get("fiscal_year_end_month"),
                 "is_active": bool(values.get("is_active")),
                 "tax_id_present": bool(tax_id),
@@ -115,7 +118,7 @@ class Client:
                 self.tax_id, self.dba_name, self.address_line1, self.address_city,
                 self.address_state, self.address_zip, self.contact_name,
                 self.contact_email, self.contact_phone, self.notes,
-                self.business_context,
+                self.business_context, self.accounting_basis,
             )
             if is_new:
                 cursor.execute(
@@ -124,8 +127,8 @@ class Client:
                         (name, entity_type, business_type, fiscal_year_end_month, is_active,
                          tax_id, dba_name, address_line1, address_city, address_state,
                          address_zip, contact_name, contact_email, contact_phone, notes,
-                         business_context)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         business_context, accounting_basis)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (self.name, self.entity_type, self.business_type,
                      self.fiscal_year_end_month, int(self.is_active)) + extended
@@ -142,7 +145,7 @@ class Client:
                     SET name = ?, entity_type = ?, business_type = ?, fiscal_year_end_month = ?, is_active = ?,
                         tax_id = ?, dba_name = ?, address_line1 = ?, address_city = ?, address_state = ?,
                         address_zip = ?, contact_name = ?, contact_email = ?, contact_phone = ?, notes = ?,
-                        business_context = ?
+                        business_context = ?, accounting_basis = ?
                     WHERE id = ?
                     """,
                     (self.name, self.entity_type, self.business_type,
@@ -161,6 +164,7 @@ class Client:
                 "name": self.name, "entity_type": self.entity_type,
                 "business_type": self.business_type,
                 "business_context": self.business_context,
+                "accounting_basis": self.accounting_basis,
                 "fiscal_year_end_month": self.fiscal_year_end_month,
                 "is_active": self.is_active, "tax_id": self.tax_id,
                 "dba_name": self.dba_name, "address_line1": self.address_line1,

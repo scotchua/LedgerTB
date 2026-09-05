@@ -570,6 +570,7 @@ elif selected_report == "Trial Balance":
                 if compare_py else ["Debit", "Credit"]
             ),
             report_slug="trial_balance",
+            basis=client.accounting_basis,
             params=(("as_of_date", as_of_date), ("comparative", compare_py)),
         )
         _statement_download_buttons(
@@ -754,6 +755,7 @@ elif selected_report == "Income Statement":
         headers=is_headers,
         formats=is_formats,
         show_numbers=is_show_numbers,
+        basis=client.accounting_basis,
         report_slug="income_statement",
         params=(("start_date", is_start), ("end_date", is_end),
                 ("comparative", compare_py), ("grouped", group_is),
@@ -950,6 +952,7 @@ elif selected_report == "Balance Sheet":
         headers=bs_headers,
         formats=bs_formats,
         show_numbers=bs_show_numbers,
+        basis=client.accounting_basis,
         report_slug="balance_sheet",
         params=(("as_of_date", bs_date), ("comparative", compare_py),
                 ("grouped", group_bs), ("show_numbers", bs_show_numbers)),
@@ -1172,6 +1175,7 @@ elif selected_report == "Cash Flow":
         tuple(statement_rows),
         headers=cf_headers,
         formats=cf_formats,
+        basis=client.accounting_basis,
         report_slug="cash_flow",
         params=(("start_date", cf_start), ("end_date", cf_end),
                 ("comparative", compare_py), ("show_numbers", False)),

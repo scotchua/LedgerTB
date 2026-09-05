@@ -40,7 +40,7 @@ ADD_FORM_KEYS = [
     "add_client_name", "add_dba_name", "add_tax_id", "add_entity_type",
     "add_business_type", "add_fiscal_month", "add_address_line1", "add_address_city",
     "add_address_state", "add_address_zip", "add_contact_name", "add_contact_email",
-    "add_contact_phone", "add_notes", "add_business_context",
+    "add_contact_phone", "add_notes", "add_business_context", "add_accounting_basis",
     "add_seed_accounts",
 ]
 
@@ -148,6 +148,9 @@ if view == "View Clients":
                     st.session_state['edit_business_context'] = (
                         client.business_context or ""
                     )
+                    st.session_state['edit_accounting_basis'] = {
+                        None: "Not set", "cash": "Cash", "accrual": "Accrual",
+                    }.get(client.accounting_basis, "Not set")
 
                 with st.container():
                     new_name = st.text_input("Legal Name", key="edit_name")
@@ -185,6 +188,13 @@ if view == "View Clients":
                             "General Notes are not sent."
                         ),
                     )
+
+                    new_accounting_basis = st.selectbox(
+                        "Accounting basis",
+                        options=["Not set", "Cash", "Accrual"],
+                        key="edit_accounting_basis",
+                    )
+                    st.caption("Prints on statement PDFs. Leave unset if you have not decided.")
 
                     new_fiscal_month = st.selectbox(
                         "Fiscal Year End Month",
@@ -235,6 +245,9 @@ if view == "View Clients":
                             client.business_context = (
                                 new_business_context.strip() or None
                             )
+                            client.accounting_basis = {
+                                "Not set": None, "Cash": "cash", "Accrual": "accrual",
+                            }[new_accounting_basis]
 
                             try:
                                 client.save(seed_accounts=False)
@@ -389,6 +402,13 @@ else:
             ),
         )
 
+        accounting_basis = st.selectbox(
+            "Accounting basis",
+            options=["Not set", "Cash", "Accrual"],
+            key="add_accounting_basis",
+        )
+        st.caption("Prints on statement PDFs. Leave unset if you have not decided.")
+
         st.divider()
 
         fiscal_month = st.selectbox(
@@ -448,6 +468,9 @@ else:
                     contact_phone=contact_phone or None,
                     notes=notes or None,
                     business_context=business_context.strip() or None,
+                    accounting_basis={
+                        "Not set": None, "Cash": "cash", "Accrual": "accrual",
+                    }[accounting_basis],
                 )
 
                 try:

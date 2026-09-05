@@ -131,7 +131,10 @@ def _resolve_account(client_id: int, account_number: str) -> Account:
 
 
 def list_clients() -> list:
-    return [{"client_id": c.id, "name": c.name} for c in Client.get_all()]
+    return [
+        {"client_id": c.id, "name": c.name, "accounting_basis": c.accounting_basis}
+        for c in Client.get_all()
+    ]
 
 
 def list_accounts(client_id: int, account_number: Optional[str] = None) -> list:
@@ -1279,7 +1282,8 @@ def export_close_package(client_id: int, period_start: str, period_end: str,
 def create_client(name: str, entity_type: str = "",
                   fiscal_year_end_month: int = 12,
                   seed_default_chart: bool = True,
-                  initial_fiscal_year: int = 0) -> dict:
+                  initial_fiscal_year: int = 0,
+                  accounting_basis: Optional[str] = None) -> dict:
     """Create a new client (set of books), optionally seeded with the default
     chart of accounts. Available at access level 'propose' and above."""
     from models.client import Client
@@ -1293,6 +1297,8 @@ def create_client(name: str, entity_type: str = "",
         raise ValueError("fiscal_year_end_month must be 1-12.")
     if not 1 <= fiscal_end_month <= 12:
         raise ValueError("fiscal_year_end_month must be 1-12.")
+    if accounting_basis not in (None, "cash", "accrual"):
+        raise ValueError("accounting_basis must be 'cash', 'accrual', or None.")
     if initial_fiscal_year:
         fiscal_year = _validated_fiscal_year(initial_fiscal_year)
     else:
@@ -1309,6 +1315,7 @@ def create_client(name: str, entity_type: str = "",
         name=name,
         entity_type=(entity_type or "").strip() or None,
         fiscal_year_end_month=fiscal_end_month,
+        accounting_basis=accounting_basis,
     )
     from database.connection import get_connection
     from models.fiscal_period import FiscalPeriod

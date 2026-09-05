@@ -68,6 +68,14 @@ def test_client_minimal_still_works(db):
     assert c.business_context is None
 
 
+@pytest.mark.parametrize("basis", [None, "cash", "accrual"])
+def test_client_accounting_basis_roundtrip(db, basis):
+    cid = Client(name="Basis Roundtrip", accounting_basis=basis).save(
+        seed_accounts=False
+    )
+    assert Client.get_by_id(cid).accounting_basis == basis
+
+
 def test_client_and_seed_chart_are_atomic(db, monkeypatch):
     def fail_seeding(*args, **kwargs):
         raise RuntimeError("simulated seed failure")

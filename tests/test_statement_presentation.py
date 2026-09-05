@@ -335,6 +335,26 @@ def test_empty_statement_and_custom_legend_render(client_id):
     assert "Custom report legend." in text
 
 
+def test_statement_pdf_optional_accounting_basis(client_id):
+    from services.statement_pdf import build_statement_pdf
+
+    generated_at = datetime.now(timezone.utc)
+    period = "For the period January 1, 2026 to January 31, 2026"
+    cash_pages = _statement_pdf_text(build_statement_pdf(
+        _statement_view(client_id, [], basis="cash"), generated_at
+    ))
+    unset_pages = _statement_pdf_text(build_statement_pdf(
+        _statement_view(client_id, []), generated_at
+    ))
+
+    assert cash_pages[0].count("Cash basis") == 1
+    assert all("Cash basis" not in page and "Accrual basis" not in page
+               for page in unset_pages)
+    for expected in ("Test Co", "Income Statement", period):
+        assert expected in cash_pages[0]
+        assert expected in unset_pages[0]
+
+
 def test_statement_pdf_corrupt_client_logo_fails_soft(client_id, caplog):
     from database.connection import get_cursor
     from services.branding import save_client_branding

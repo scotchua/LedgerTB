@@ -24,7 +24,8 @@ def test_clients_accounts_and_trial_balance_tie(client_id, accounts):
     _seed(client_id, accounts)
 
     clients = mcp_tools.list_clients()
-    assert any(c["client_id"] == client_id for c in clients)
+    assert any(c["client_id"] == client_id and "accounting_basis" in c
+               for c in clients)
 
     chart = mcp_tools.list_accounts(client_id)
     assert any(a["type"] == "Revenue" for a in chart)
@@ -34,6 +35,18 @@ def test_clients_accounts_and_trial_balance_tie(client_id, accounts):
     assert tb["total_debits"] == tb["total_credits"] > 0
     cash_row = next(r for r in tb["accounts"] if "Cash" in r["name"])
     assert cash_row["debit"] == 380.0  # 500 in - 120 out
+
+
+def test_create_client_validates_accounting_basis(db):
+    with pytest.raises(ValueError, match="accounting_basis"):
+        mcp_tools.create_client("Invalid Basis", accounting_basis="hourly")
+
+    result = mcp_tools.create_client(
+        "Cash Basis", accounting_basis="cash", seed_default_chart=False
+    )
+    listed = next(c for c in mcp_tools.list_clients()
+                  if c["client_id"] == result["client_id"])
+    assert listed["accounting_basis"] == "cash"
 
 
 def test_client_branding_tool_proposes_but_does_not_apply(client_id):

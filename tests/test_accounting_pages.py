@@ -695,6 +695,32 @@ def test_income_statement_pdf_download_audit_fallback(client_id, accounts, monke
     assert exports[0].new_values["sha256"] == __import__("hashlib").sha256(payload).hexdigest()
 
 
+def test_income_statement_view_receives_client_accounting_basis(
+    client_id, accounts, monkeypatch
+):
+    from models.client import Client
+    import services.statement_pdf as statement_pdf
+
+    client = Client.get_by_id(client_id)
+    client.accounting_basis = "accrual"
+    client.save(seed_accounts=False)
+    _select_client(monkeypatch, client_id)
+    captured = []
+    monkeypatch.setattr(
+        statement_pdf, "build_statement_pdf",
+        lambda view, generated_at: captured.append(view) or b"%PDF",
+    )
+    page = AppTest.from_file(page_path("pages/5_Reports.py"), default_timeout=30)
+    page.session_state["active_report"] = "Income Statement"
+    page.run()
+
+    assert not page.exception
+    cached = [value for key, value in page.session_state.filtered_state.items()
+              if str(key).endswith("income_statement_pdf_cache__reports_g0")]
+    assert cached
+    assert captured and captured[0].basis == "accrual"
+
+
 def test_report_drilldown_preserves_authorized_desktop_token(
     client_id, accounts, monkeypatch
 ):
