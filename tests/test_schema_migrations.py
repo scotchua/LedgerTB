@@ -50,11 +50,9 @@ def test_create_tables_records_migrations(db):
         "037_payroll_import_staging", "038_invoice_inventory",
         "039_sales_tax_credit_memos", "040_email_log", "041_immutable_journal_entries",
         "042_ar_ap_chronology",
-        # Fork-only migrations live in a reserved 900+ band so upstream's
-        # sequence can never collide with ours again. account_grouping was
-        # already renumbered once (020 -> 022) and crashed every launch.
-        "900_account_grouping", "901_cash_flow_section",
-        "902_document_audits", "903_import_suggestions",
+        # Option A renumbers only these three; new fork migrations stay 900+.
+        "043_account_grouping", "044_cash_flow_section",
+        "045_document_audits", "903_import_suggestions",
         "904_payroll_import_row_pay_run", "905_journal_entry_reversal_kind",
         "906_report_legend", "907_client_accounting_basis",
         "908_pay_stub_employer_costs"]
@@ -226,22 +224,22 @@ def test_migration_failure_is_atomic(tmp_path, monkeypatch):
 
 def test_a_migration_renumbered_after_a_book_applied_it_heals_instead_of_crashing(db):
     """Reproduces a real failure: account_grouping shipped as
-    020_account_grouping.sql, then that file was renamed to
-    900_account_grouping.sql before release. A book that already ran it
+    020_account_grouping.sql and was later renamed. Option A now calls it
+    043_account_grouping.sql. A book that already ran it
     under the old name has the column but no tracking row for the new
     filename, so create_tables tried to add the column again and crashed
     every launch with "duplicate column name: account_grouping".
     """
     conn = get_connection()
     conn.execute(
-        "DELETE FROM schema_migrations WHERE version = '900_account_grouping'"
+        "DELETE FROM schema_migrations WHERE version = '043_account_grouping'"
     )
     conn.commit()
 
     create_tables(conn)  # must not raise
 
     cur = conn.execute(
-        "SELECT version FROM schema_migrations WHERE version = '900_account_grouping'"
+        "SELECT version FROM schema_migrations WHERE version = '043_account_grouping'"
     )
     assert cur.fetchone() is not None
     cur = conn.execute("PRAGMA table_info(accounts)")

@@ -70,7 +70,10 @@ def _collapse_accounts(items: List[Dict], account_type: str,
         boundary = (subtype_to_key.get(subtype, 'unclassified'), caption)
         if boundary not in position_of:
             position_of[boundary] = len(collapsed)
-            collapsed.append({**item, 'account_number': '', 'name': caption})
+            collapsed.append({
+                **item, 'account_number': '', 'name': caption,
+                'statement_subtype': subtype, 'statement_group': boundary[0],
+            })
         else:
             collapsed[position_of[boundary]]['balance'] += item['balance']
     return (
@@ -221,18 +224,15 @@ class ReportGenerator:
     ) -> List[Dict]:
         """Merge statement lines without dropping accounts unique to a year.
 
-        The key carries the subtype as well as the number and name. Caption
-        lines share an empty account number, so a caption used in two
-        statement groups produces two lines whose only distinction is the
-        subtype they inherited from their first member; a two-field key
-        silently overwrote one of them and a group's balance disappeared from
-        the comparative view.
+        Caption lines carry their statement group: the first contributing
+        account and its subtype can differ between years without changing
+        the caption's section. Ordinary account lines retain their subtype.
         """
         def key(item):
             return (
                 item.get('account_number') or '',
                 item['name'],
-                item.get('subtype') or '',
+                item.get('statement_group', item.get('subtype') or ''),
             )
 
         current_by_key = {key(item): item for item in current}
@@ -251,6 +251,9 @@ class ReportGenerator:
             }
             if 'subtype' in source:
                 row['subtype'] = source.get('subtype')
+            for field in ('statement_subtype', 'statement_group'):
+                if field in source:
+                    row[field] = source[field]
             row.update(ReportGenerator._comparison_value(
                 current_item['balance'] if current_item else 0.0,
                 prior_item['balance'] if prior_item else 0.0,
@@ -261,6 +264,9 @@ class ReportGenerator:
 
     @staticmethod
     def _resolved_statement_subtype(item: Dict, account_type: str) -> Optional[str]:
+        # Resolve aliases against the account name before a caption replaces it.
+        if 'statement_subtype' in item:
+            return item['statement_subtype']
         # Balance-sheet earnings are synthetic rows, not chart accounts. They
         # belong in retained earnings without changing the established flat
         # line contract, where their raw subtype remains None.

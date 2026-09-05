@@ -31,6 +31,42 @@ def _added_column_if_sole_statement(migration_sql: str):
     return match.group(1) if match else None
 
 
+def _reconcile_document_audits(conn, migration_sql: str, version: str):
+    """Record the 902 -> 045 rename only for the complete shipped schema.
+
+    Compare stored DDL, including checks, foreign keys and every index, with
+    the unchanged migration in an empty in-memory database. A tracking row
+    alone cannot prove that this multi-statement migration finished.
+    """
+    def objects(connection):
+        return [tuple(row) for row in connection.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE tbl_name = 'document_audits' ORDER BY type, name"
+        )]
+
+    reference = sqlite3.connect(":memory:")
+    try:
+        reference.executescript(migration_sql)
+        expected = objects(reference)
+    finally:
+        reference.close()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if objects(conn) != expected:
+            raise RuntimeError(
+                "Cannot reconcile 902_document_audits to 045_document_audits: "
+                "the existing table and indexes do not match the shipped schema."
+            )
+        conn.execute(
+            "INSERT INTO schema_migrations (version) VALUES (?)", (version,)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def create_tables(conn: sqlite3.Connection):
     """Bring the database schema up to date by applying any migrations in
     database/migrations/ that haven't run yet, in filename order (numeric
@@ -56,6 +92,9 @@ def create_tables(conn: sqlite3.Connection):
         migration_sql = migration_path.read_text().strip()
         if not migration_sql.endswith(";"):
             migration_sql += ";"
+        if version == "045_document_audits" and "902_document_audits" in applied:
+            _reconcile_document_audits(conn, migration_sql, version)
+            continue
         # version is a filename stem (controlled), but quote-escape defensively.
         safe_version = version.replace("'", "''")
 

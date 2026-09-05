@@ -42,3 +42,35 @@ next number in the band and leave history alone.
 
 `tests/test_schema_migrations.py` asserts the exact ordered list. That is the
 guard; a new migration fails it until the list is updated deliberately.
+
+## Option A compatibility — 2026-09-05
+
+Scott selected Option A from `docs/upstream-sync-plan-2026-08-30.md` for this
+sync. This is a specific exception for the three shipped files, not a change
+to the rule for new fork migrations:
+
+| Shipped stem | Current stem |
+|---|---|
+| `900_account_grouping` | `043_account_grouping` |
+| `901_cash_flow_section` | `044_cash_flow_section` |
+| `902_document_audits` | `045_document_audits` |
+
+Their SQL bodies are unchanged. The fetched financial-statement branch ends
+at 021, and main's low sequence ends at 042, so 043--045 are free. Existing
+903--908 files retain their names; new fork migrations still use the 900+ band.
+
+The single-column recovery records 043/044 when their columns already exist.
+For 045, `database/schema.py` recognizes the recorded 902 stem and compares
+the complete stored `document_audits` DDL with the unchanged migration in an
+empty in-memory database. The table, constraints, foreign keys and all three
+indexes must match exactly, with no extra triggers or indexes. Verification
+and insertion of the 045 tracking row share a transaction; mismatches stop
+startup without recording 045 or modifying the audit objects. An existing
+table without the 902 tracking row is not reconciled automatically.
+
+Fresh books record 51 current stems. Upgraded books retain the three old
+stems as history and add the three new ones (54 total), with identical schema
+and preserved data. `tests/test_upstream_sync_schema.py` compares every table,
+index and trigger, column and foreign key, and checks integrity, data
+preservation and repeat startup. See `docs/upstream-sync-log.md` for upstream
+content provenance and validation results.

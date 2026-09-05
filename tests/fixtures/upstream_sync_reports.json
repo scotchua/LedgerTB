@@ -1,0 +1,58 @@
+{
+  "income_statement": {
+    "total_revenue": 130.0,
+    "total_expenses": 1050.0,
+    "gross_profit": 80.0,
+    "operating_income": -920.0,
+    "net_income": -920.0,
+    "revenue_groups": [
+      ["operating_revenue", "Workshop sales", 130.0]
+    ],
+    "expense_groups": [
+      ["cost_of_goods_sold", "Workshop costs", 50.0],
+      ["operating_expenses", "Workshop costs", 850.0],
+      ["depreciation_amortization", "Workshop costs", 150.0]
+    ],
+    "comparative_expense_groups": [
+      ["cost_of_goods_sold", "Workshop costs", 50.0, 0.0],
+      ["operating_expenses", "Workshop costs", 850.0, 100.0],
+      ["depreciation_amortization", "Workshop costs", 150.0, 0.0]
+    ]
+  },
+  "balance_sheet": {
+    "total_assets": 9173.0,
+    "total_liabilities": 193.0,
+    "total_equity": 8980.0,
+    "total_liabilities_equity": 9173.0,
+    "asset_groups": [
+      ["current_assets", "Operating balances", 7523.0],
+      ["property_equipment_net", "Operating balances", 1650.0]
+    ],
+    "liability_groups": [
+      ["current_liabilities", "Amounts payable", 193.0]
+    ],
+    "equity_groups": [
+      ["contributed_capital", "Workshop funding", 10000.0],
+      ["retained_earnings", "Retained Earnings", -100.0],
+      ["retained_earnings", "Current Year Earnings", -920.0]
+    ]
+  },
+  "cash_flow": {
+    "default": {"operating": -770.0, "investing": -1800.0, "financing": 0.0},
+    "financing": {"operating": -370.0, "investing": -1800.0, "financing": -400.0},
+    "cash_beginning": 9900.0,
+    "cash_ending": 7330.0,
+    "actual_cash_change": -2570.0,
+    "computed_cash_change": -2570.0,
+    "noncash_amounts": {"default": [], "financing": [500.0]},
+    "financing_lines": [["Accounts Payable", -400.0]],
+    "override_operating_lines": [
+      ["net_income", -920.0],
+      ["depreciation_amortization", 150.0],
+      ["accounts_receivable", -43.0],
+      ["inventory", -150.0],
+      ["other_current_liabilities", 93.0],
+      ["noncash_operating_activity", 500.0]
+    ]
+  }
+}
