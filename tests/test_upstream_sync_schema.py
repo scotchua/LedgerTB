@@ -119,7 +119,7 @@ def test_fresh_and_900_upgraded_books_have_identical_schema(
         for table, rows in before.items():
             assert after[table] == rows, table
         assert _versions(upgraded) == _versions(fresh) | set(RENAMED.values())
-        assert len(_versions(fresh)) == 52
+        assert len(_versions(fresh)) == 53
         for conn in (fresh, upgraded):
             assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
             assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]

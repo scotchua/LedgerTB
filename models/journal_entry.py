@@ -492,11 +492,13 @@ class JournalEntry:
         memo: Optional[str] = None,
         kind: str = "reversal",
         conn=None,
+        _depreciation_run_id: Optional[int] = None,
     ) -> 'JournalEntry':
         """Post an equal-and-opposite entry without altering accounting history.
 
         If ``conn`` is provided, participate in the caller's transaction without
         committing, rolling back, or closing the connection.
+        The private run ID admits the owning fixed-asset correction transaction.
         """
         from models.audit_log import AuditLog
 
@@ -565,6 +567,11 @@ class JournalEntry:
                 )
                 owner = cursor.fetchone()
                 if owner:
+                    if (table_name == "depreciation_runs"
+                            and owner["id"] == _depreciation_run_id
+                            and not owns_conn and conn.in_transaction
+                            and kind == "reversal"):
+                        continue
                     raise ValueError(
                         f"This entry is controlled by {flow_name} #{owner['id']}. "
                         f"Reverse it from the {flow_name} flow."

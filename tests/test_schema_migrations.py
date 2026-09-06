@@ -55,7 +55,8 @@ def test_create_tables_records_migrations(db):
         "045_document_audits", "903_import_suggestions",
         "904_payroll_import_row_pay_run", "905_journal_entry_reversal_kind",
         "906_report_legend", "907_client_accounting_basis",
-        "908_pay_stub_employer_costs", "909_counterparties"]
+        "908_pay_stub_employer_costs", "909_counterparties",
+        "910_fixed_asset_depreciation_corrections"]
     conn.close()
 
 
@@ -68,7 +69,7 @@ def test_create_tables_is_idempotent(db):
 
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM schema_migrations")
-    assert cur.fetchone()[0] == 52
+    assert cur.fetchone()[0] == 53
     conn.close()
 
 

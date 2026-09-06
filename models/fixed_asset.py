@@ -16,6 +16,8 @@ class FixedAssetType:
     method: str = "straight_line"
     effective_life_months: Optional[int] = None
     annual_rate: Optional[float] = None
+    convention: str = "full_month"
+    total_units: Optional[int] = None
 
     @staticmethod
     def _from_row(row) -> "FixedAssetType":
@@ -46,16 +48,27 @@ class FixedAssetType:
     def validate(self) -> None:
         if not self.name.strip():
             raise ValueError("Asset type name is required.")
+        if self.convention not in {"full_month", "mid_month", "half_year"}:
+            raise ValueError("Unsupported depreciation convention.")
+        if self.method != "units_of_production" and self.total_units is not None:
+            raise ValueError("Only units-of-production types can have total units.")
         if self.method == "straight_line":
             if not self.effective_life_months or self.effective_life_months <= 0:
                 raise ValueError("Straight-line types need a positive useful life.")
             if self.annual_rate is not None:
                 raise ValueError("Straight-line types cannot have an annual rate.")
+            if self.convention == "half_year" and self.effective_life_months % 12:
+                raise ValueError("Half-year straight-line types need whole years of useful life.")
         elif self.method == "declining_balance":
             if self.annual_rate is None or not 0 < self.annual_rate <= 1:
                 raise ValueError("Declining-balance annual rate must be between 0 and 1.")
             if self.effective_life_months is not None:
                 raise ValueError("Declining-balance types cannot have a useful life.")
+        elif self.method == "units_of_production":
+            if type(self.total_units) is not int or self.total_units <= 0:
+                raise ValueError("Units-of-production types need positive integer total units.")
+            if self.annual_rate is not None or self.effective_life_months is not None:
+                raise ValueError("Units-of-production types cannot have a rate or useful life.")
         else:
             raise ValueError("Unsupported depreciation method.")
 
@@ -80,12 +93,13 @@ class FixedAssetType:
                    (client_id, name, asset_account_id,
                     accumulated_depreciation_account_id,
                     depreciation_expense_account_id, method,
-                    effective_life_months, annual_rate)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    effective_life_months, annual_rate, convention, total_units)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (self.client_id, self.name.strip(), self.asset_account_id,
                  self.accumulated_depreciation_account_id,
                  self.depreciation_expense_account_id, self.method,
-                 self.effective_life_months, self.annual_rate),
+                 self.effective_life_months, self.annual_rate,
+                 self.convention, self.total_units),
             )
             self.id = cursor.lastrowid
             AuditLog.write(
@@ -145,7 +159,8 @@ class FixedAsset:
         with get_cursor() as cursor:
             cursor.execute(
                 "SELECT COALESCE(SUM(amount_cents), 0) total "
-                "FROM depreciation_runs WHERE fixed_asset_id = ?",
+                "FROM depreciation_runs WHERE fixed_asset_id = ? "
+                "AND superseded_by IS NULL",
                 (self.id,),
             )
             return int(cursor.fetchone()["total"])

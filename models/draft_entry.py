@@ -267,7 +267,7 @@ class DraftEntry:
 
             cursor.execute(
                 """SELECT ddl.fixed_asset_id, ddl.period_end, ddl.method,
-                          ddl.amount_cents, fa.client_id,
+                          ddl.amount_cents, ddl.run_seq, ddl.units_produced, fa.client_id,
                           fat.method current_method,
                           expense.account_number expense_account_number,
                           accumulated.account_number accumulated_account_number
@@ -310,6 +310,7 @@ class DraftEntry:
                     current_amount = _depreciation_amount_cents(
                         conn, depreciation["fixed_asset_id"],
                         _date.fromisoformat(depreciation["period_end"]),
+                        depreciation["run_seq"], depreciation["units_produced"],
                     )
                 except ValueError as exc:
                     raise ValueError(
@@ -387,38 +388,15 @@ class DraftEntry:
                     memo=line.memo or None,
                 ) for line in self.lines],
             )
-            entry_id = entry.save(conn=conn)
             if depreciation:
-                try:
-                    cursor.execute(
-                        """INSERT INTO depreciation_runs
-                           (fixed_asset_id, period_start, period_end, amount_cents,
-                            journal_entry_id) VALUES (?, ?, ?, ?, ?)""",
-                        (depreciation["fixed_asset_id"],
-                         _date.fromisoformat(depreciation["period_end"])
-                         .replace(day=1).isoformat(),
-                         depreciation["period_end"],
-                         depreciation["amount_cents"], entry_id),
-                    )
-                except Exception as exc:
-                    if "UNIQUE constraint failed" in str(exc):
-                        raise ValueError(
-                            "Depreciation has already been run for this asset and "
-                            "period; nothing was posted."
-                        ) from exc
-                    raise
-                run_id = cursor.lastrowid
-                AuditLog.write(
-                    cursor, self.client_id, "depreciation_runs", run_id, "INSERT",
-                    new_values={
-                        "fixed_asset_id": depreciation["fixed_asset_id"],
-                        "period_start": _date.fromisoformat(
-                            depreciation["period_end"]).replace(day=1),
-                        "period_end": _date.fromisoformat(depreciation["period_end"]),
-                        "amount_cents": depreciation["amount_cents"],
-                        "journal_entry_id": entry_id,
-                    },
+                from services.fixed_assets import _post_depreciation_run
+                _, entry_id = _post_depreciation_run(
+                    conn, depreciation["fixed_asset_id"], entry_date,
+                    depreciation["amount_cents"], entry,
+                    depreciation["run_seq"], depreciation["units_produced"],
                 )
+            else:
+                entry_id = entry.save(conn=conn)
             cursor.execute(
                 """UPDATE draft_entries SET posted_entry_id = ?
                    WHERE id = ? AND client_id = ? AND status = 'approved'""",

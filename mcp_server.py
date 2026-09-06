@@ -450,12 +450,14 @@ def propose_correction(client_id: int, original_entry_id: int,
 @_serialized
 @_mutating
 def propose_depreciation_run(client_id: int, fixed_asset_id: int,
-                             period_end: str, rationale: str = "") -> dict:
+                             period_end: str, rationale: str = "", run_seq: int = 0,
+                             units_produced: int | None = None) -> dict:
     """File a reviewable depreciation draft. This never posts depreciation;
-    a person must review it in LedgerTB. Needs access level "propose"."""
+    a person must review it in LedgerTB. Corrections use the prior run_seq + 1;
+    production runs require units_produced. Needs access level "propose"."""
     _require_level("propose")
     return mcp_tools.propose_depreciation_run(
-        client_id, fixed_asset_id, period_end, rationale
+        client_id, fixed_asset_id, period_end, rationale, run_seq, units_produced
     )
 
 
