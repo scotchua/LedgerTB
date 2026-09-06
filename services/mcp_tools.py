@@ -137,6 +137,19 @@ def list_clients() -> list:
     ]
 
 
+@mutating
+def propose_duplicates(client_id: int, amount_tolerance_cents: int = 1,
+                       date_window_days: int = 3) -> dict:
+    """Return duplicate review proposals without changing the book."""
+    from database import connection as dbconn
+    from services.duplicate_detection import propose_duplicates as _propose
+
+    if dbconn.ASSISTANT_ACCESS_LEVEL == "read":
+        raise PermissionError("Duplicate proposals need assistant access level 'propose'.")
+    _require_client(client_id)
+    return _propose(client_id, amount_tolerance_cents, date_window_days)
+
+
 def list_accounts(client_id: int, account_number: Optional[str] = None) -> list:
     _require_client(client_id)
     accounts = Account.get_all(client_id, active_only=False)

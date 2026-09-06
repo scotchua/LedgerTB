@@ -20,6 +20,7 @@ from models.payables import Bill, BillLine, Vendor
 from models.receivables import CreditMemo, CreditMemoLine, Customer, Invoice, InvoiceLine
 from money import to_dollars
 from services.branding import get_branding, get_client_branding
+from services.counterparties import attribute_lines
 from services.inventory import _record_movement
 from utils import secure_store
 
@@ -297,6 +298,8 @@ def _post_document(record_id: int, control_account_id: int, is_invoice: bool,
                 lines.append(JournalEntryLine(account_id=tax_account_id,
                                               debit=to_dollars(document.tax_amount_cents)))
             lines.append(JournalEntryLine(account_id=control_account_id, credit=to_dollars(total)))
+        attribute_lines(cursor, document.client_id, "customer" if is_invoice else "vendor",
+                        document.customer_id if is_invoice else document.vendor_id, lines)
         entry = JournalEntry(
             client_id=document.client_id, entry_date=getattr(document, date_field),
             description=f"Posted {table[:-1]} #{record_id}",
@@ -358,6 +361,8 @@ def _post_document(record_id: int, control_account_id: int, is_invoice: bool,
                                 memo=memo),
                         ])
                     movement_ids.append(result["movement_id"])
+                attribute_lines(cursor, document.client_id, "customer", document.customer_id,
+                                cogs_lines)
                 cogs_entry = JournalEntry(
                     client_id=document.client_id, entry_date=document.invoice_date,
                     description=f"Inventory sale: invoice #{record_id}",
@@ -529,6 +534,8 @@ def _record_payment(client_id: int, party_id: int, payment_date, amount_cents: i
             JournalEntryLine(account_id=control_account_id, debit=to_dollars(amount_cents)),
             JournalEntryLine(account_id=money_account_id, credit=to_dollars(amount_cents)),
         ]
+        attribute_lines(cursor, client_id, "customer" if is_invoice else "vendor",
+                        party_id, entry_lines)
         entry = JournalEntry(
             client_id=client_id, entry_date=date.fromisoformat(payment_date),
             description="Customer payment" if is_invoice else "Vendor payment",
@@ -736,6 +743,8 @@ def _refund_credit(payment_id: int, amount_cents: int, money_account_id: int,
             JournalEntryLine(account_id=money_account_id, debit=to_dollars(amount_cents)),
             JournalEntryLine(account_id=control_account_id, credit=to_dollars(amount_cents)),
         ]
+        attribute_lines(cursor, payment["client_id"], "customer" if is_invoice else "vendor",
+                        payment["customer_id" if is_invoice else "vendor_id"], lines)
         entry = JournalEntry(
             client_id=payment["client_id"], entry_date=date.fromisoformat(refund_date),
             description=f"Refund of payment #{payment_id}",
@@ -783,7 +792,8 @@ def _reversal_entry(cursor, client_id: int, original_entry_id: int, reversal_dat
     if reversal_date < original["entry_date"]:
         raise ValueError("Void date cannot precede the original transaction date.")
     cursor.execute(
-        "SELECT account_id, debit, credit, memo FROM journal_entry_lines WHERE journal_entry_id = ? ORDER BY id",
+        "SELECT account_id, debit, credit, memo, counterparty_id "
+        "FROM journal_entry_lines WHERE journal_entry_id = ? ORDER BY id",
         (original_entry_id,),
     )
     rows = cursor.fetchall()
@@ -793,7 +803,8 @@ def _reversal_entry(cursor, client_id: int, original_entry_id: int, reversal_dat
         client_id=client_id, entry_date=date.fromisoformat(reversal_date),
         description=description, source_reference=source_reference,
         lines=[JournalEntryLine(account_id=row["account_id"], debit=to_dollars(row["credit"]),
-                                credit=to_dollars(row["debit"]), memo=row["memo"])
+                                credit=to_dollars(row["debit"]), memo=row["memo"],
+                                counterparty_id=row["counterparty_id"])
                for row in rows],
     )
 
@@ -1079,6 +1090,7 @@ def post_credit_memo(memo_id: int, control_account_id: int,
                                           debit=to_dollars(memo.tax_amount_cents)))
         lines.append(JournalEntryLine(account_id=control_account_id,
                                       credit=to_dollars(memo.total_cents)))
+        attribute_lines(cursor, memo.client_id, "customer", memo.customer_id, lines)
         entry = JournalEntry(
             client_id=memo.client_id, entry_date=memo.memo_date,
             description=f"Posted credit memo #{memo_id}",

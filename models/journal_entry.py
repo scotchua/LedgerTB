@@ -17,6 +17,7 @@ class JournalEntryLine:
     memo: Optional[str] = None
     account_name: Optional[str] = None  # For display purposes
     account_number: Optional[str] = None  # For display purposes
+    counterparty_id: Optional[int] = None
 
 
 @dataclass
@@ -150,10 +151,12 @@ class JournalEntry:
             for line in self.lines:
                 cursor.execute(
                     """
-                    INSERT INTO journal_entry_lines (journal_entry_id, account_id, debit, credit, memo)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO journal_entry_lines
+                        (journal_entry_id, account_id, debit, credit, memo, counterparty_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (self.id, line.account_id, to_cents(line.debit), to_cents(line.credit), line.memo)
+                    (self.id, line.account_id, to_cents(line.debit), to_cents(line.credit),
+                     line.memo, line.counterparty_id)
                 )
                 line.id = cursor.lastrowid
                 line.journal_entry_id = self.id
@@ -172,6 +175,7 @@ class JournalEntry:
                         'debit': line.debit,
                         'credit': line.credit,
                         'memo': line.memo,
+                        'counterparty_id': line.counterparty_id,
                     }
                     for line in self.lines
                 ],
@@ -272,7 +276,8 @@ class JournalEntry:
             credit=to_dollars(row['credit']),
             memo=row['memo'],
             account_name=row['account_name'],
-            account_number=row['account_number']
+            account_number=row['account_number'],
+            counterparty_id=row['counterparty_id'],
         )
 
     _LINES_SQL = """
@@ -594,7 +599,7 @@ class JournalEntry:
             reference = f"Reversal of JE #{entry_id}"
             cursor.execute(
                 """
-                SELECT account_id, debit, credit, memo
+                SELECT account_id, debit, credit, memo, counterparty_id
                 FROM journal_entry_lines WHERE journal_entry_id = ? ORDER BY id
                 """,
                 (entry_id,),
@@ -620,6 +625,7 @@ class JournalEntry:
                         debit=to_dollars(line["credit"]),
                         credit=to_dollars(line["debit"]),
                         memo=memo or line["memo"] or f"Reversal of JE #{entry_id}",
+                        counterparty_id=line["counterparty_id"],
                     )
                     for line in source_lines
                 ],

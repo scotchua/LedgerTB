@@ -461,6 +461,19 @@ def propose_depreciation_run(client_id: int, fixed_asset_id: int,
 
 @server.tool()
 @_serialized
+@_mutating
+def propose_duplicates(client_id: int, amount_tolerance_cents: int = 1,
+                       date_window_days: int = 3) -> dict:
+    """Return duplicate journal proposals for human review. Amount tolerance
+    is integer cents; dates use an inclusive day window. Reversals and distinct
+    source occurrences are excluded. No merge or ledger change is performed.
+    Needs assistant access level 'propose' or higher."""
+    _require_level("propose")
+    return mcp_tools.propose_duplicates(client_id, amount_tolerance_cents, date_window_days)
+
+
+@server.tool()
+@_serialized
 def list_employees(client_id: int) -> list:
     """Employees on this book with their department, for propose_pay_run.
     LedgerTB does not calculate payroll; adding an employee is done in the
