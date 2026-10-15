@@ -3,6 +3,8 @@ from datetime import date
 
 from models.transaction import ImportedTransaction
 from services.import_verification import (
+    ContinuityReport,
+    _match_key,
     check_row_continuity,
     verify_against_source,
 )
@@ -19,6 +21,23 @@ def _imported(description, amount, day=5, row_number=None):
 
 def _source(description, amount, day=5):
     return {"date": date(2026, 1, day), "description": description, "amount": amount}
+
+
+# --- match key --------------------------------------------------------------
+
+def test_match_key_accepts_a_timestamp_string_as_a_calendar_date():
+    key = _match_key("2027-04-09T11:30:00", "  LANTERN   WORKS ", 12.34)
+
+    assert key == ("2027-04-09", "LANTERN WORKS", 1234)
+
+
+def test_match_key_uses_whole_cents_for_zero_and_positive_amounts():
+    assert _match_key(date(2027, 4, 9), "LANTERN WORKS", 0) == (
+        "2027-04-09", "LANTERN WORKS", 0,
+    )
+    assert _match_key(date(2027, 4, 9), "LANTERN WORKS", 1.01) == (
+        "2027-04-09", "LANTERN WORKS", 101,
+    )
 
 
 # --- continuity -------------------------------------------------------------
@@ -57,6 +76,19 @@ def test_continuity_of_an_empty_batch():
     assert report.is_clean
     assert report.present_count == 0
     assert report.first_row is None
+
+
+def test_expected_count_of_an_empty_batch_is_an_integer_zero():
+    report = check_row_continuity([])
+
+    assert type(report.expected_count) is int
+    assert report.expected_count == 0
+
+
+def test_expected_count_with_one_unknown_boundary_uses_present_count():
+    report = ContinuityReport(first_row=None, last_row=8, present_count=3)
+
+    assert report.expected_count == 3
 
 
 # --- source comparison ------------------------------------------------------
@@ -169,3 +201,49 @@ def test_verifying_an_empty_import_reports_every_source_row():
     assert len(report.missing_from_import) == 2
     assert report.imported_total == 0.0
     assert report.source_total == -20.00
+
+
+def test_duplicate_matches_preserve_import_order():
+    first = _imported("LANTERN WORKS", -6.25, row_number=2)
+    second = _imported("LANTERN WORKS", -6.25, row_number=3)
+    source = [_source("LANTERN WORKS", -6.25)]
+
+    report = verify_against_source([first, second], source)
+
+    assert report.matched[0]["imported"] is first
+    assert report.not_in_source == [second]
+
+
+def test_source_without_amount_matches_zero_amount_import():
+    source = [{"date": date(2026, 1, 9), "description": "PAPER ORBIT"}]
+    imported = [_imported("PAPER ORBIT", 0, day=9)]
+
+    report = verify_against_source(imported, source)
+
+    assert report.is_clean
+    assert report.matched[0]["imported"] is imported[0]
+
+
+def test_verification_totals_keep_zero_and_round_to_cents():
+    zero_source = [_source("PAPER ORBIT", 0)]
+    zero_imported = [_imported("PAPER ORBIT", 0)]
+    zero_report = verify_against_source(zero_imported, zero_source)
+
+    assert zero_report.source_total == 0
+    assert zero_report.imported_total == 0
+
+    source = [_source("PAPER ORBIT", 0.005)]
+    imported = [_imported("PAPER ORBIT", 0.005)]
+    report = verify_against_source(imported, source)
+
+    assert report.source_total == 0.01
+    assert report.imported_total == 0.01
+
+
+def test_difference_stays_rounded_to_cents_for_large_balances():
+    source = [_source("PAPER ORBIT", 100000000000000.00)]
+    imported = [_imported("PAPER ORBIT", 100000000000000.02)]
+
+    report = verify_against_source(imported, source)
+
+    assert report.difference == 0.02

@@ -17,6 +17,12 @@ def _make_plaintext_sqlite(path):
     conn.close()
 
 
+def test_active_plaintext_backup_uses_the_current_book(db):
+    assert migration_safety.active_plaintext_backup() == plaintext_backup_path(
+        dbconn.DATABASE_PATH
+    )
+
+
 def test_removal_verifies_live_encrypted_book_and_deletes_exact_copy(db):
     book = dbconn.DATABASE_PATH
     backup = plaintext_backup_path(book)
@@ -82,6 +88,71 @@ def test_removal_preserves_copy_when_integrity_check_fails(db, monkeypatch):
     with pytest.raises(
         migration_safety.PlaintextBackupRemovalError,
         match="failed its integrity check",
+    ):
+        migration_safety.remove_active_plaintext_backup()
+
+    assert backup.exists()
+
+
+def test_removal_reports_when_no_copy_exists(db):
+    with pytest.raises(
+        migration_safety.PlaintextBackupRemovalError,
+        match="No plaintext migration copy exists",
+    ):
+        migration_safety.remove_active_plaintext_backup()
+
+
+def test_removal_preserves_dangling_symlink(db, tmp_path):
+    backup = plaintext_backup_path(dbconn.DATABASE_PATH)
+    try:
+        backup.symlink_to(tmp_path / "invented_missing_book.db")
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(
+        migration_safety.PlaintextBackupRemovalError,
+        match="manual inspection",
+    ):
+        migration_safety.remove_active_plaintext_backup()
+
+    assert backup.is_symlink()
+
+
+def test_removal_closes_verified_connection(db, monkeypatch):
+    backup = plaintext_backup_path(dbconn.DATABASE_PATH)
+    _make_plaintext_sqlite(backup)
+    closed = []
+
+    class VerifiedConnection:
+        def execute(self, sql):
+            return self
+
+        def fetchone(self):
+            return ("ok",)
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(dbconn, "open_keyed", lambda path: VerifiedConnection())
+
+    migration_safety.remove_active_plaintext_backup()
+
+    assert closed == [True]
+    assert not backup.exists()
+
+
+def test_removal_preserves_copy_when_opening_live_book_fails(db, monkeypatch):
+    backup = plaintext_backup_path(dbconn.DATABASE_PATH)
+    _make_plaintext_sqlite(backup)
+
+    def fail_to_open(path):
+        raise RuntimeError("invented key failure")
+
+    monkeypatch.setattr(dbconn, "open_keyed", fail_to_open)
+
+    with pytest.raises(
+        migration_safety.PlaintextBackupRemovalError,
+        match="could not be verified",
     ):
         migration_safety.remove_active_plaintext_backup()
 

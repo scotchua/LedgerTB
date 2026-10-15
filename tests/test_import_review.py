@@ -37,6 +37,12 @@ def test_ensure_row_ids_preserves_preexisting_uid():
     assert txns[1]["uid"] and txns[1]["uid"] != "fixed"
 
 
+def test_ensure_row_ids_returns_input_list():
+    txns = [{"description": "Juniper Printing", "amount": -42.0}]
+    assert ensure_row_ids(txns) is txns
+    assert txns[0]["uid"]
+
+
 def test_row_key_is_prefixed_and_stable():
     t = {"uid": "abc123"}
     assert row_key("cat", t) == "cat_abc123"
@@ -115,6 +121,14 @@ def test_first_visit_records_identity_without_clearing():
     assert scope_import_state_to_client(state, 1, book="firm.db") is False
     assert state["_import_state_client_id"] == ("firm.db", 1)
     assert state["csv_content"] == "fresh"
+
+
+def test_client_switch_starts_missing_uploader_nonces_at_one():
+    state = {"_import_state_client_id": ("juniper-ledger.db", 1)}
+
+    assert scope_import_state_to_client(state, 2, book="juniper-ledger.db") is True
+    assert state["csv_uploader_nonce"] == 1
+    assert state["statement_uploader_nonce"] == 1
 
 
 def test_widget_state_follows_transaction_across_sort():
